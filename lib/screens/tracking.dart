@@ -194,6 +194,13 @@ class _TrackingScreenState extends State<TrackingScreen> {
                 onReset: () => setState(() => _mapZoom = 1.0),
               ),
             ),
+            // Compass rose: the map is north-up (world +y = north renders
+            // toward the top), so this is a fixed orientation reference.
+            const Positioned(
+              left: 8,
+              top: 8,
+              child: _CompassRose(),
+            ),
           ],
         );
       },
@@ -851,6 +858,26 @@ class _TrackingMapPainter extends CustomPainter {
       canvas.drawCircle(p, 5, Paint()..color = Colors.white);
       _label(canvas, 'TRACK', p + const Offset(16, 6),
           SentryColors.amber);
+      // Heading arrow — points along the track's compass heading
+      // (0° = N = screen-up). Drawn only once the target has moved
+      // enough for a heading estimate to exist.
+      final hd = t.headingDeg;
+      if (hd != null) {
+        final a = hd * math.pi / 180;
+        final dir = Offset(math.sin(a), -math.cos(a));
+        final arrowPaint = Paint()
+          ..color = SentryColors.amber
+          ..strokeWidth = 2.5
+          ..strokeCap = StrokeCap.round;
+        final tip = p + dir * 30;
+        final base = p + dir * 14;
+        canvas.drawLine(base, tip, arrowPaint);
+        final perp = Offset(-dir.dy, dir.dx);
+        canvas.drawLine(
+            tip, tip - dir * 8 + perp * 4.5, arrowPaint);
+        canvas.drawLine(
+            tip, tip - dir * 8 - perp * 4.5, arrowPaint);
+      }
     }
   }
 
@@ -871,4 +898,84 @@ class _TrackingMapPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _TrackingMapPainter old) => true;
+}
+
+/// Compass rose overlay for the tracking map. The map is north-up, so
+/// this is a fixed orientation reference — not a live magnetometer
+/// reading. Kept static on purpose: no new sensor permissions, no
+/// calibration UX, nothing to go wrong in the field.
+class _CompassRose extends StatelessWidget {
+  const _CompassRose();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 60,
+      height: 60,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        color: SentryColors.surface2.withAlpha(210),
+        border: Border.all(color: SentryColors.border, width: 1),
+      ),
+      child: CustomPaint(painter: _CompassRosePainter()),
+    );
+  }
+}
+
+class _CompassRosePainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final c = Offset(size.width / 2, size.height / 2);
+    final r = size.width / 2 - 3;
+
+    // Tick marks every 45°; cardinal ticks run longer.
+    final tickPaint = Paint()
+      ..color = SentryColors.muted
+      ..strokeWidth = 1.5;
+    for (var i = 0; i < 8; i++) {
+      final a = i * math.pi / 4;
+      final dir = Offset(math.sin(a), -math.cos(a));
+      final inner = i % 2 == 0 ? r - 8 : r - 5;
+      canvas.drawLine(c + dir * inner, c + dir * r, tickPaint);
+    }
+
+    // North pointer triangle.
+    final northPaint = Paint()..color = SentryColors.amber;
+    canvas.drawPath(
+      Path()
+        ..moveTo(c.dx, c.dy - r + 2)
+        ..lineTo(c.dx - 4.5, c.dy - 8)
+        ..lineTo(c.dx + 4.5, c.dy - 8)
+        ..close(),
+      northPaint,
+    );
+
+    _cardinal(canvas, c, r, 'N', 0, SentryColors.amber);
+    _cardinal(canvas, c, r, 'E', 90, SentryColors.onDark);
+    _cardinal(canvas, c, r, 'S', 180, SentryColors.muted);
+    _cardinal(canvas, c, r, 'W', 270, SentryColors.muted);
+  }
+
+  void _cardinal(Canvas canvas, Offset c, double r, String label,
+      double deg, Color color) {
+    final a = deg * math.pi / 180;
+    final tp = TextPainter(
+      text: TextSpan(
+        text: label,
+        style: TextStyle(
+          color: color,
+          fontSize: 10,
+          fontWeight: FontWeight.bold,
+          fontFamily: SentryType.mono,
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    final pos =
+        c + Offset(math.sin(a), -math.cos(a)) * (r - 15);
+    tp.paint(canvas, pos - Offset(tp.width / 2, tp.height / 2));
+  }
+
+  @override
+  bool shouldRepaint(covariant _CompassRosePainter old) => false;
 }
