@@ -59,6 +59,7 @@ class EvidenceSheet extends StatelessWidget {
             if (event.aiLabel != null)
               _row('AI GUESS',
                   '${event.aiLabel} (${((event.aiConfidence ?? 0) * 100).toStringAsFixed(0)}% conf, synthetic-trained)'),
+            _rfSignatureRows(state),
             _bearingRow(window),
             const SizedBox(height: 12),
             Text('DEVIATION HISTORY (60s window)', style: SentryType.section()),
@@ -96,6 +97,40 @@ class EvidenceSheet extends StatelessWidget {
           ],
         ),
       );
+
+  Widget _rfSignatureRows(AppState state) {
+    final lines = state.elrsEvidenceLines;
+    if (lines.isEmpty) return const SizedBox.shrink();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const SizedBox(height: 6),
+        Text('RF SIGNATURES', style: SentryType.section()),
+        const SizedBox(height: 4),
+        for (final l in lines)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 3),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const SizedBox(width: 96),
+                Expanded(
+                    child: Text(l,
+                        style: SentryType.rowValue(SentryColors.onDark))),
+              ],
+            ),
+          ),
+        Padding(
+          padding: const EdgeInsets.only(top: 2, bottom: 3),
+          child: Text(
+            'Protocol-pattern evidence only: consistent with, never '
+            'confirmed. Any LoRa FHSS emitter can raise these.',
+            style: SentryType.rowLabel().copyWith(fontSize: 10),
+          ),
+        ),
+      ],
+    );
+  }
 
   Widget _bearingRow(List<LinkSample> window) {
     double? bearing;

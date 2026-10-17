@@ -20,6 +20,8 @@ import '../services/radio_driver.dart';
 import '../services/meshtastic_driver.dart';
 import '../services/esp32_driver.dart';
 import '../services/camera_driver.dart';
+import '../services/confidence_merger.dart';
+import '../services/track_consistency.dart';
 import '../services/generic_sensor_driver.dart';
 import '../models/sensor_observation.dart';
 import '../services/recorder.dart';
@@ -564,6 +566,23 @@ class AppState extends ChangeNotifier {
   /// Latest fused track; null when nothing is currently disturbed.
   TrackEstimate? track;
 
+  /// Gated confidence verdict for the current track (research finding
+  /// #2): C_display = clamp(C_RF + Σ w_s·e_s, C_RF, C_max), never
+  /// subtractive, saturating at +0.35, upgrades suspended while the
+  /// track is inconsistent. Null when there is no track. Display only
+  /// — the tripwire stays the detection authority.
+  MergedConfidence? trackConfidence;
+
+  /// Fix-to-fix consistency verdict for the current track (the honest
+  /// NEES analogue for the covariance-free tracker). Null when there
+  /// is no track.
+  TrackConsistency? trackConsistency;
+
+  /// Fix-to-fix consistency monitor (lane3 P8: RMSE alone can't catch
+  /// an inconsistent tracker). Fed one fix per fused track update.
+  final TrackConsistencyMonitor _consistencyMonitor =
+      TrackConsistencyMonitor();
+
   /// Latest shadow (attenuation) grid for the tracking map.
   List<ShadowCell> shadow = [];
 
@@ -617,6 +636,108 @@ class AppState extends ChangeNotifier {
 
   /// True when at least one SDR driver is polling.
   bool get hasSdrDriver => _pollers.any((p) => p.driver is SdrDriver);
+
+  /// ELRS Gemini signature evidence lines for the evidence view.
+  ///
+  /// Combines bridge-local signatures (wideband dual-frequency
+  /// coincidence) with app-level cross-radio correlation (GemX:
+  /// 2.4 GHz + 900 MHz chirps coinciding in time). Wording is the
+  /// honesty contract: "Possible ELRS Gemini signature", never an
+  /// identification.
+  List<String> get elrsEvidenceLines {
+    final now = DateTime.now();
+    const cutoff = Duration(seconds: 120);
+    final lines = <String>[];
+    final chirps = <ElrsChirp>[];
+    for (final p in _pollers) {
+      final d = p.driver;
+      if (d is! SdrDriver) continue;
+      for (final s in d.latestSignatures) {
+        if (now.difference(s.t) <= cutoff && s.score >= 0.3) {
+          lines.add(s.displayLabel);
+        }
+      }
+      chirps.addAll(d.recentChirps);
+    }
+    for (final s in GeminiCorrelator.correlate(chirps, now)) {
+      if (s.score >= 0.3) lines.add(s.displayLabel);
+    }
+    return lines;
+  }
+
+  /// Gated ELRS corroboration contributions for the confidence merger.
+  ///
+  /// The signature is EXISTENCE evidence, not position evidence: it
+  /// says "a LoRa-FHSS emitter with the Gemini dual-emission pattern
+  /// is active", while the track's position comes from the RF
+  /// tripwire. No geometry is claimed (and none is needed -- the
+  /// contribution carries no position).
+  ///
+  /// Not double-counting: SDR band ENERGY already feeds the tripwire
+  /// via virtual links; this is the modulation PATTERN on top of the
+  /// energy -- a distinct measurement (chirp shape + dual-band time
+  /// correlation), so it is independent evidence, not the same
+  /// reading counted twice.
+  List<GatedCorroboration> _elrsCorroborations(DateTime now) {
+    final out = <GatedCorroboration>[];
+    final healthy = _sdrSourceHealthy(now);
+    if (!healthy) return out;
+    const horizon = Duration(seconds: 60);
+    void add(ElrsSignature s, String sensorId) {
+      final age = now.difference(s.t);
+      if (age.isNegative || age > horizon || s.score < 0.3) return;
+      final w = reliabilityGate(
+        alignmentQuality: s.score,
+        age: age,
+        stalenessHorizon: horizon,
+        sourceHealthy: true,
+      );
+      if (w <= 0) return;
+      out.add(GatedCorroboration(
+        sensorId: sensorId,
+        // Protocol-pattern evidence: comparable to a camera-motion
+        // corroboration (0.15), scaled by the signature score through
+        // the reliability gate. Never subtractive (merger enforces).
+        boost: 0.15,
+        gateWeight: w,
+        note: s.displayLabel,
+      ));
+    }
+    final chirps = <ElrsChirp>[];
+    // Modes already contributed by a bridge-local signature: the app
+    // correlator must not double-count the same emission (reviewer B).
+    // Bridge-local modes are gemini-2g4/gemini-900m; app modes are
+    // gemx/gemini-2g4, so only gemini-2g4 can collide.
+    final bridgeModes = <String>{};
+    for (final p in _pollers) {
+      final d = p.driver;
+      if (d is! SdrDriver) continue;
+      for (final s in d.latestSignatures) {
+        bridgeModes.add(s.mode);
+        add(s, 'elrs:${s.radio}:${s.mode}');
+      }
+      chirps.addAll(d.recentChirps);
+    }
+    for (final s in GeminiCorrelator.correlate(chirps, now)) {
+      if (bridgeModes.contains(s.mode)) continue;
+      add(s, 'elrs:app:${s.mode}');
+    }
+    return out;
+  }
+
+  /// Source health for the ELRS path: an SDR driver must be enabled
+  /// and have polled recently -- otherwise the "no signature" silence
+  /// is unmeasurable and the gate must read it as no information.
+  bool _sdrSourceHealthy(DateTime now) {
+    for (final p in _pollers) {
+      if (p.driver is SdrDriver && p.config.enabled) {
+        final lp = p.status.lastPoll;
+        return lp != null &&
+            now.difference(lp) < const Duration(seconds: 30);
+      }
+    }
+    return false;
+  }
 
   /// Per-positioned-node health from link freshness, for the tracking
   /// map's health overlay: ok = every touching link live, degraded =
@@ -798,7 +919,7 @@ class AppState extends ChangeNotifier {
     _configureZmetaTimers();
     _tripwire = Tripwire(config: s.tripwireConfig);
     _tracker.reset();
-    track = null;
+    _clearTrackState();
     history.clear();
     events.clear();
     triage.clear();
@@ -831,7 +952,7 @@ class AppState extends ChangeNotifier {
     // (Establish the baseline with the area clear: whatever is standing
     // in a link when its baseline is learned is invisible until it moves.)
     _tracker.reset();
-    track = null;
+    _clearTrackState();
     history.clear();
     _tripwire = Tripwire(config: settings.tripwireConfig);
     _latestByPoller.clear();
@@ -964,7 +1085,7 @@ class AppState extends ChangeNotifier {
     replaying = true;
     _tripwire = Tripwire(config: settings.tripwireConfig);
     _tracker.reset();
-    track = null;
+    _clearTrackState();
     history.clear();
     events.clear();
     _latestByPoller.clear();
@@ -1198,6 +1319,102 @@ class AppState extends ChangeNotifier {
         );
       }
     }
+    // Gated confidence + consistency (research finding #2): feed the
+    // fix-to-fix monitor one fix per update, then merge corroborating
+    // sensors into the DISPLAYED confidence only. Detection authority
+    // is untouched — the tripwire above already decided what exists.
+    final t = track;
+    if (t != null) {
+      _consistencyMonitor.observe(t.timestamp, t.x, t.y);
+      trackConsistency = _consistencyMonitor.snapshot;
+      trackConfidence = _mergeTrackConfidence(now, t);
+    } else {
+      _consistencyMonitor.noteGap(now);
+      trackConsistency = null;
+      trackConfidence = null;
+    }
+  }
+
+  /// Merge recent sensor observations into the track's displayed
+  /// confidence via the gated merger (confidence_merger.dart).
+  ///
+  /// Only observations that (a) are fresher than every staleness
+  /// horizon, (b) come from a healthy source, and (c) geometrically
+  /// corroborate the track can contribute — and then only while the
+  /// track is internally consistent. Silence is "no opinion": missing
+  /// sensors, unknown sensor positions, and geometry misses add
+  /// nothing and subtract nothing.
+  MergedConfidence _mergeTrackConfidence(DateTime now, TrackEstimate t) {
+    final gated = <GatedCorroboration>[];
+    final origin = gpsOrigin;
+    if (origin != null) {
+      for (final o in sensorObservations) {
+        final age = now.difference(o.timestamp);
+        if (age.isNegative) continue; // clock skew: not evidence
+        final horizon = stalenessHorizonFor(o.type);
+        if (age > horizon) continue; // stale: the AV-FDTI zero-weight case
+        final slat = o.sensorLat;
+        final slon = o.sensorLon;
+        if (slat == null || slon == null) continue; // no geometry, no vote
+        final m = latLonToMeters(slat, slon, origin.lat, origin.lon);
+        final c = o.corroborationFor(t, sensorX: m.x, sensorY: m.y);
+        if (c.boost <= 0) continue; // silence: never a penalty
+        final w = reliabilityGate(
+          alignmentQuality: c.quality,
+          age: age,
+          stalenessHorizon: horizon,
+          sourceHealthy: _sensorSourceHealthy(o, now),
+        );
+        if (w <= 0) continue;
+        gated.add(GatedCorroboration(
+          sensorId: o.sensorId,
+          boost: c.boost,
+          gateWeight: w,
+          note: c.note,
+        ));
+      }
+    }
+    // ELRS Gemini signature: protocol-pattern existence evidence from
+    // the SDR bridge (no geometry claimed -- see _elrsCorroborations).
+    gated.addAll(_elrsCorroborations(now));
+    return mergeTrackConfidence(
+      baseConfidence: rfCoreConfidence(linksUsed: t.linksUsed),
+      contributions: gated,
+      trackConsistent: _consistencyMonitor.consistent,
+    );
+  }
+
+  /// Source health for one observation: the producing driver must be
+  /// alive with recent data, otherwise its evidence is unmeasurable —
+  /// exactly the "degraded modality" AV-FDTI's gate removes.
+  bool _sensorSourceHealthy(SensorObservation o, DateTime now) {
+    if (o.type == SensorObsType.motion) {
+      // Camera path: healthy when the integration is enabled and has
+      // produced motion recently (the camera driver owns its cadence).
+      return cameraSettings.enabled &&
+          _cameraDriver
+              .recentMotion(const Duration(seconds: 90))
+              .isNotEmpty;
+    }
+    // Sensor-bus path: the bus driver must have polled recently.
+    for (final p in _pollers) {
+      if (p.driver.driverId == 'sensor' && p.config.enabled) {
+        final lp = p.status.lastPoll;
+        return lp != null &&
+            now.difference(lp) < const Duration(seconds: 90);
+      }
+    }
+    return false;
+  }
+
+  /// Clear all track-derived display state (settings change, session
+  /// start, replay start). The monitor resets too — a new session's
+  /// velocity state starts clean.
+  void _clearTrackState() {
+    track = null;
+    trackConfidence = null;
+    trackConsistency = null;
+    _consistencyMonitor.reset();
   }
 
   DateTime? _lastFuse;

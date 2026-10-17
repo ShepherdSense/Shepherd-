@@ -12,6 +12,7 @@ library;
 
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
 import '../models/link_sample.dart';
 import '../models/tracking.dart';
@@ -371,6 +372,225 @@ class SdrBand {
 /// ENERGY, not direction, range, or identity — and these virtual links
 /// carry no geometry, so app_state keeps them out of the position
 /// solver, shadow grid, and stitcher. Alerts still fire.
+/// One detected LoRa chirp train from the bridge's ELRS detector
+/// (`elrs_chirp` UDP event). LoRa MODULATION evidence only: any LoRa
+/// emitter inside the detector's (SF, BW) grid lights this up. It is
+/// NOT an ELRS identification, and the UI must never present it as one
+/// (see [ElrsSignature.displayLabel] for the enforced wording).
+class ElrsChirp {
+  ElrsChirp({
+    required this.radio,
+    required this.band,
+    required this.centerMhz,
+    required this.freqMhz,
+    required this.sf,
+    required this.bwKhz,
+    required this.snrDb,
+    required this.t,
+  });
+
+  final String radio;
+  final String band;
+  final double centerMhz;
+
+  /// Absolute frequency of the train, MHz.
+  final double freqMhz;
+  final int sf;
+  final double bwKhz;
+  final double snrDb;
+  final DateTime t;
+
+  /// 2.4 GHz vs sub-GHz family, for the GemX cross-band correlation.
+  String get family {
+    if (centerMhz >= 2400 && centerMhz < 2500) return '2g4';
+    if (centerMhz >= 850 && centerMhz < 960) return '900m';
+    return 'other';
+  }
+
+  /// Parse a decoded bridge datagram. Null for wrong kinds/versions
+  /// and malformed packets (never throws).
+  static ElrsChirp? tryParse(Map<String, dynamic> j) {
+    try {
+      if (j['v'] != 1 || j['kind'] != 'elrs_chirp') return null;
+      double asDouble(String k) => (j[k] as num).toDouble();
+      final freq = asDouble('freq_mhz');
+      final snr = asDouble('snr_db');
+      if (!freq.isFinite || !snr.isFinite) return null;
+      return ElrsChirp(
+        radio: '${j['radio']}',
+        band: '${j['band']}',
+        centerMhz: asDouble('center_mhz'),
+        freqMhz: freq,
+        sf: (j['sf'] as num).toInt(),
+        bwKhz: asDouble('bw_khz'),
+        snrDb: snr,
+        t: DateTime.fromMillisecondsSinceEpoch(
+            ((j['t'] as num).toDouble() * 1000).round()),
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+}
+
+/// A scored Gemini dual-emission signature.
+///
+/// Sources: (a) bridge-local `elrs_signature` events — one wideband
+/// capture holding time-correlated chirp trains ~40 MHz apart; (b)
+/// app-correlated via [GeminiCorrelator] — chirp trains from two radios
+/// coinciding in time (GemX: 2.4 GHz + 900 MHz; or two 2.4 GHz radios
+/// ~40 MHz apart).
+///
+/// HONESTY CONTRACT (enforced by tests in test/sdr_bridge_test.dart):
+/// this is "signature consistent with ELRS Gemini", NEVER "confirmed
+/// ELRS". The score grows with repeated coincidences; a lone
+/// coincidence is weak evidence by construction.
+class ElrsSignature {
+  ElrsSignature({
+    required this.radio,
+    required this.mode,
+    required this.score,
+    required this.obs,
+    required this.freqsMhz,
+    required this.t,
+  });
+
+  /// Bridge radio name, or 'app' for app-level cross-radio correlation.
+  final String radio;
+
+  /// 'gemini-2g4' | 'gemini-900m' | 'gemx'.
+  final String mode;
+
+  /// 0..1, grows with repeated coincident observations.
+  final double score;
+
+  /// How many coincidences built the score.
+  final int obs;
+  final List<double> freqsMhz;
+  final DateTime t;
+
+  /// The ONLY user-facing description. "Possible" is load-bearing:
+  /// no public ELRS-specific detector exists, and ours is the first
+  /// attempt -- it must not present as ground truth.
+  String get displayLabel {
+    final bands = mode == 'gemx'
+        ? '2.4 GHz + 900 MHz'
+        : mode == 'gemini-900m'
+            ? '900 MHz dual-frequency'
+            : '2.4 GHz dual-frequency';
+    return 'Possible ELRS Gemini signature ($bands, '
+        'score ${(score * 100).round()}%, $obs coincidence${obs == 1 ? '' : 's'})';
+  }
+
+  /// Modes the bridge is allowed to report. A rogue or future bridge
+  /// sending an unknown mode string must not reach the UI (reviewer B).
+  static const knownModes = {'gemini-2g4', 'gemini-900m', 'gemx'};
+
+  static ElrsSignature? tryParse(Map<String, dynamic> j) {
+    try {
+      if (j['v'] != 1 || j['kind'] != 'elrs_signature') return null;
+      final mode = '${j['mode']}';
+      if (!knownModes.contains(mode)) return null;
+      final score = (j['score'] as num).toDouble();
+      if (!score.isFinite || score < 0 || score > 1) return null;
+      final freqs = (j['freqs_mhz'] as List)
+          .map((e) => (e as num).toDouble())
+          .where((f) => f.isFinite)
+          .toList();
+      return ElrsSignature(
+        radio: '${j['radio']}',
+        mode: mode,
+        score: score,
+        obs: (j['obs'] as num).toInt(),
+        freqsMhz: freqs,
+        t: DateTime.fromMillisecondsSinceEpoch(
+            ((j['t'] as num).toDouble() * 1000).round()),
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+}
+
+/// App-level Gemini correlation across bridge radios.
+///
+/// Two receivers are needed for GemX (no single SDR spans 2.4 GHz and
+/// 900 MHz): typically two bridge instances, one staring at each band.
+/// This correlator pairs chirp trains across radios/bands in time and
+/// scores the dual-emission signature the same way the bridge does
+/// locally: coincident pairs on the documented Gemini separations.
+///
+/// Pure function over a chirp list: deterministic, unit-tested, no I/O.
+class GeminiCorrelator {
+  /// Max |t_a - t_b| for two chirp trains to count as coincident.
+  /// Captures arrive seconds apart per sweep; 2 s keeps genuinely
+  /// simultaneous emissions while rejecting unrelated activity.
+  static const coincidenceWindow = Duration(seconds: 2);
+
+  /// How far back chirps stay eligible for correlation.
+  static const keepWindow = Duration(seconds: 120);
+
+  /// Correlate [chirps] (already time-pruned by the caller, ideally)
+  /// into app-level signatures. Returns at most one signature per
+  /// mode; empty when nothing coincides.
+  static List<ElrsSignature> correlate(List<ElrsChirp> chirps, DateTime now) {
+    final cutoff = now.subtract(keepWindow);
+    final live =
+        chirps.where((c) => !c.t.isBefore(cutoff)).toList(growable: false);
+    final out = <ElrsSignature>[];
+    // GemX: 2.4 GHz train + 900 MHz train within the window.
+    var gemxPairs = 0;
+    final gemxFreqs = <double>[];
+    // Cross-radio single-band Gemini: two 2.4 GHz trains ~40 MHz apart
+    // (two radios stitched across the Gemini pair).
+    var dualPairs = 0;
+    final dualFreqs = <double>[];
+    for (var i = 0; i < live.length; i++) {
+      for (var j = i + 1; j < live.length; j++) {
+        final a = live[i], b = live[j];
+        if (a.radio == b.radio && a.band == b.band) continue;
+        if (a.t.difference(b.t).abs() > coincidenceWindow) continue;
+        final fa = {a.family, b.family};
+        if (fa.contains('2g4') && fa.contains('900m')) {
+          gemxPairs++;
+          gemxFreqs.addAll([a.freqMhz, b.freqMhz]);
+        } else {
+          final sep = (a.freqMhz - b.freqMhz).abs();
+          if (sep >= 35 && sep <= 45) {
+            dualPairs++;
+            dualFreqs.addAll([a.freqMhz, b.freqMhz]);
+          }
+        }
+      }
+    }
+    // Score: 1 - exp(-pairs/3) -- several coincidences to matter, a
+    // lone pair is weak evidence, saturating like the bridge scorer.
+    if (gemxPairs > 0) {
+      final s = 1 - math.exp(-gemxPairs / 3);
+      out.add(ElrsSignature(
+        radio: 'app',
+        mode: 'gemx',
+        score: s,
+        obs: gemxPairs,
+        freqsMhz: gemxFreqs.toSet().toList(),
+        t: now,
+      ));
+    }
+    if (dualPairs > 0) {
+      final s = 1 - math.exp(-dualPairs / 3);
+      out.add(ElrsSignature(
+        radio: 'app',
+        mode: 'gemini-2g4',
+        score: s,
+        obs: dualPairs,
+        freqsMhz: dualFreqs.toSet().toList(),
+        t: now,
+      ));
+    }
+    return out;
+  }
+}
+
 class SdrDriver extends RadioDriver {
   SdrDriver({required this.host, required this.port});
 
@@ -409,11 +629,26 @@ class SdrDriver extends RadioDriver {
   final Map<String, SdrBand> _latest = {};
   final Map<String, DateTime> _arrivedAt = {};
 
+  /// Recent LoRa chirp trains (elrs_chirp events), oldest-first.
+  /// Bounded; pruned to [GeminiCorrelator.keepWindow] on read.
+  final List<ElrsChirp> _chirps = [];
+
+  /// Latest bridge-local Gemini signature per radio (elrs_signature).
+  final Map<String, ElrsSignature> _signatures = {};
+
   /// What the bridge last announced itself as ('' until first beacon).
   String get bridgeBackend => _bridgeBackend;
 
   /// Latest reading per band (read-only view, for UI panels).
   List<SdrBand> get latestBands => List.unmodifiable(_latest.values);
+
+  /// Recent chirp trains for the app-level Gemini correlator.
+  /// Read-only: pruning happens in _handle, never here.
+  List<ElrsChirp> get recentChirps => List.unmodifiable(_chirps);
+
+  /// Latest bridge-local Gemini signature per radio.
+  List<ElrsSignature> get latestSignatures =>
+      List.unmodifiable(_signatures.values);
 
   Future<void> _ensureSocket() async {
     if (_socket != null) return;
@@ -435,6 +670,32 @@ class SdrDriver extends RadioDriver {
       _lastBeaconAt = DateTime.now();
       final b = j['backend'];
       if (b is String) _bridgeBackend = b;
+      return;
+    }
+    // ELRS detector events: additive, older bridges never send them.
+    if (j['kind'] == 'elrs_chirp') {
+      final c = ElrsChirp.tryParse(j);
+      if (c != null) {
+        _chirps.add(c);
+        // Bounded: chirps are small; 300 covers >10 min at the
+        // throttled 1-per-2s-per-band rate with headroom. Prune by
+        // age here (not in the getter) so reads never mutate state.
+        if (_chirps.length > 300) {
+          _chirps.removeRange(0, _chirps.length - 300);
+        }
+        final cutoff =
+            DateTime.now().subtract(GeminiCorrelator.keepWindow);
+        _chirps.removeWhere((e) => e.t.isBefore(cutoff));
+        _lastDataAt = DateTime.now();
+      }
+      return;
+    }
+    if (j['kind'] == 'elrs_signature') {
+      final s = ElrsSignature.tryParse(j);
+      if (s != null) {
+        _signatures[s.radio] = s;
+        _lastDataAt = DateTime.now();
+      }
       return;
     }
     final band = SdrBand.tryParse(j);
@@ -523,6 +784,8 @@ class SdrDriver extends RadioDriver {
     _socket = null;
     _latest.clear();
     _arrivedAt.clear();
+    _chirps.clear();
+    _signatures.clear();
   }
 }
 
