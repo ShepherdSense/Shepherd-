@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../services/discovery.dart';
 import '../services/radio_driver.dart';
+import '../services/recorder.dart';
 import '../state/app_state.dart';
 import '../theme.dart';
 
@@ -25,14 +26,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late final TextEditingController _window;
   late final TextEditingController _newAddress;
   late final TextEditingController _newLabel;
+  late final TextEditingController _zmetaHost;
+  late final TextEditingController _zmetaPort;
+  late final TextEditingController _zmetaPlatform;
   late bool _simulated;
   late bool _wifiVision;
+  late bool _zmetaEnabled;
+  late bool _zmetaSecured;
+  late bool _camera;
   String _newDriverId = 'silvus';
 
   bool _scanning = false;
   double _scanProgress = 0;
   List<DiscoveredRadio> _found = [];
   String? _scanError;
+
+  /// True for loopback targets, where no wire is involved.
+  static bool _isLocalHost(String h) =>
+      h == '127.0.0.1' || h == '::1' || h.toLowerCase() == 'localhost';
 
   @override
   void initState() {
@@ -47,7 +58,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _window = TextEditingController(text: s.baselineWindow.toString());
     _newAddress = TextEditingController();
     _newLabel = TextEditingController();
+    _zmetaHost = TextEditingController(text: s.zmetaHost);
+    _zmetaPort = TextEditingController(text: s.zmetaPort.toString());
+    _zmetaPlatform = TextEditingController(text: s.zmetaPlatformId);
     _simulated = s.simulatedMode;
+    _zmetaEnabled = s.zmetaEnabled;
+    _zmetaSecured = s.zmetaSecured;
+    _camera = widget.state.cameraConfirmationEnabled;
     _wifiVision = widget.state.wifiVisionEnabled;
   }
 
@@ -61,6 +78,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _window.dispose();
     _newAddress.dispose();
     _newLabel.dispose();
+    _zmetaHost.dispose();
+    _zmetaPort.dispose();
+    _zmetaPlatform.dispose();
     super.dispose();
   }
 
@@ -81,6 +101,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
       baselineWindow:
           int.tryParse(_window.text.trim()) ?? widget.state.settings.baselineWindow,
       simulatedMode: _simulated,
+      zmetaEnabled: _zmetaEnabled,
+      zmetaHost: _zmetaHost.text.trim().isEmpty
+          ? '127.0.0.1'
+          : _zmetaHost.text.trim(),
+      zmetaPort:
+          (int.tryParse(_zmetaPort.text.trim()) ?? 5555).clamp(1, 65535),
+      zmetaPlatformId: _zmetaPlatform.text.trim().isEmpty
+          ? 'shepherd-mesh-1'
+          : _zmetaPlatform.text.trim(),
+      zmetaSecured: _zmetaSecured,
     );
     widget.state.applySettings(s);
     ScaffoldMessenger.of(context).showSnackBar(
@@ -180,11 +210,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ],
                   onChanged: (v) => setState(() {
                     _newDriverId = v ?? 'silvus';
-                    // The AD936x bridge talks to this app on UDP; prefill
+                    // The SDR bridge talks to this app on UDP; prefill
                     // the listen endpoint so it is one tap, not a guess.
                     if (_newDriverId == 'sdr' &&
                         _newAddress.text.trim().isEmpty) {
                       _newAddress.text = '127.0.0.1:49161';
+                    }
+                    // KrakenSDR web UI default.
+                    if (_newDriverId == 'kraken' &&
+                        _newAddress.text.trim().isEmpty) {
+                      _newAddress.text = '127.0.0.1:8081';
                     }
                   }),
                 ),
@@ -259,6 +294,74 @@ class _SettingsScreenState extends State<SettingsScreen> {
               widget.state.toggleWifiVision(v);
             },
           ),
+          SwitchListTile(
+            title: Text('CAMERA CONFIRMATION (UPGRADE)',
+                style: SentryType.rowValue(SentryColors.onDark)),
+            subtitle: Text(
+              'STUB — NO CAMERA CODE SHIPS YET. WHEN WIRED, CAMERA '
+              'EVIDENCE MAY UPGRADE DISPLAYED CONFIDENCE BUT MUST '
+              'NEVER VETO OR SUPPRESS A DETECTION.',
+              style: SentryType.section(10).copyWith(height: 1.6),
+            ),
+            value: _camera,
+            onChanged: (v) {
+              setState(() => _camera = v);
+              widget.state.toggleCameraConfirmation(v);
+            },
+          ),
+        ]),
+        _section('Record & replay', [
+          _recordRow(),
+          const SizedBox(height: 10),
+          _replayList(),
+        ]),
+        _section('ZMeta export', [
+          SwitchListTile(
+            title: Text('EMIT ZMETA EVENTS',
+                style: SentryType.rowValue(SentryColors.onDark)),
+            subtitle: Text(
+              'SEND EACH DETECTION TO A ZMETA GATEWAY AS OBSERVATION / INFERENCE EVENTS (UDP, EMIT-ONLY). '
+              'ONE MESH = ONE PLATFORM ID — THE GATEWAY FUSES ACROSS MESHES.',
+              style: SentryType.section(10).copyWith(height: 1.6),
+            ),
+            value: _zmetaEnabled,
+            onChanged: (v) => setState(() => _zmetaEnabled = v),
+          ),
+          if (_zmetaEnabled) ...[
+            const SizedBox(height: 10),
+            _field(_zmetaHost, 'Gateway host', 'e.g. 127.0.0.1'),
+            const SizedBox(height: 10),
+            _field(_zmetaPort, 'Gateway UDP port', 'e.g. 5555',
+                numeric: true),
+            const SizedBox(height: 10),
+            _field(_zmetaPlatform, 'Platform ID (this mesh)',
+                'e.g. shepherd-mesh-1'),
+            const SizedBox(height: 10),
+            SwitchListTile(
+              title: Text('LINK SECURED (WIREGUARD)',
+                  style: SentryType.rowValue(SentryColors.onDark)),
+              subtitle: Text(
+                'CONFIRM THE WIREGUARD TUNNEL TO THE GATEWAY IS ACTIVE. '
+                'THE APP CANNOT VERIFY THIS ITSELF.',
+                style: SentryType.section(10).copyWith(height: 1.6),
+              ),
+              value: _zmetaSecured,
+              onChanged: (v) => setState(() => _zmetaSecured = v),
+            ),
+            if (_zmetaHost.text.trim().isNotEmpty &&
+                !_isLocalHost(_zmetaHost.text.trim()) &&
+                !_zmetaSecured)
+              Padding(
+                padding: const EdgeInsets.only(top: 10),
+                child: Text(
+                  'WARNING: EXPORTING DETECTIONS TO A NON-LOCAL HOST WITHOUT '
+                  'A SECURED LINK. ACTIVATE THE WIREGUARD TUNNEL '
+                  '(SEE zmeta_secure/) OR EXPECT INTERCEPTION AND SPOOFING.',
+                  style: SentryType.section(10).copyWith(
+                      height: 1.6, color: SentryColors.red),
+                ),
+              ),
+          ],
         ]),
         _section('Find radios on LAN', [
           _field(_subnet, 'Discovery subnet (CIDR)', 'e.g. 172.17.97.0/24'),
@@ -371,6 +474,114 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
         ],
       ),
+    );
+  }
+
+  Widget _recordRow() {
+    final st = widget.state;
+    final recording = st.isRecording;
+    return Row(
+      children: [
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('SESSION RECORDING',
+                  style: SentryType.rowValue(SentryColors.onDark)),
+              Text(
+                recording
+                    ? 'RECORDING RAW LINK DATA…'
+                    : 'CAPTURE RAW SAMPLES TO CSV FOR LATER REPLAY.',
+                style: SentryType.section(10).copyWith(height: 1.6),
+              ),
+            ],
+          ),
+        ),
+        TextButton(
+          onPressed: () async {
+            if (recording) {
+              final summary = await st.stopRecording();
+              if (mounted) {
+                ScaffoldMessenger.of(context)
+                    .showSnackBar(SnackBar(content: Text(summary)));
+                setState(() {});
+              }
+            } else {
+              await st.startRecording();
+              if (mounted) setState(() {});
+            }
+          },
+          child: Text(recording ? 'STOP' : 'RECORD',
+              style: const TextStyle(color: SentryColors.purple)),
+        ),
+      ],
+    );
+  }
+
+  Widget _replayList() {
+    final st = widget.state;
+    return FutureBuilder(
+      future: RecordingService.listRecordings(),
+      builder: (context, snap) {
+        final files = snap.data ?? [];
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Text('REPLAY A RECORDING',
+                    style: SentryType.rowValue(SentryColors.onDark)),
+                const Spacer(),
+                if (st.replaying)
+                  TextButton(
+                    onPressed: () {
+                      st.stopReplay();
+                      setState(() {});
+                    },
+                    child: const Text('STOP REPLAY',
+                        style: TextStyle(color: SentryColors.red)),
+                  ),
+              ],
+            ),
+            Text(
+              'RUNS THE RECORDING THROUGH THE LIVE DETECTOR — TUNE '
+              'THRESHOLDS, THEN REPLAY TO SEE WHAT THE NEW SETTINGS '
+              'WOULD HAVE CAUGHT.',
+              style: SentryType.section(10).copyWith(height: 1.6),
+            ),
+            const SizedBox(height: 6),
+            if (files.isEmpty)
+              Text('NO RECORDINGS YET',
+                  style: SentryType.rowLabel()),
+            for (final f in files.take(10))
+              InkWell(
+                onTap: st.replaying
+                    ? null
+                    : () async {
+                        await st.startReplay(f.path);
+                        if (mounted) setState(() {});
+                      },
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 6),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.play_arrow,
+                          color: SentryColors.purple, size: 18),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          f.path.split('/').last,
+                          style: SentryType.rowValue(SentryColors.onDark)
+                              .copyWith(fontSize: 12),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+          ],
+        );
+      },
     );
   }
 

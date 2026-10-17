@@ -17,6 +17,7 @@ import '../models/link_sample.dart';
 import '../models/tracking.dart';
 import 'silvus_api.dart';
 import 'simulated.dart';
+import 'kraken_driver.dart';
 
 /// One configured radio network.
 class RadioConfig {
@@ -522,6 +523,8 @@ RadioDriver driverFor(RadioConfig config) {
       return L3HarrisDriver();
     case 'sdr':
       return SdrDriver.fromAddress(config.address);
+    case 'kraken':
+      return KrakenDriver.fromAddress(config.address);
     default:
       throw ArgumentError('Unknown driver: ${config.driverId}');
   }
@@ -531,6 +534,7 @@ RadioDriver driverFor(RadioConfig config) {
 const List<({String id, String label, bool implemented})> driverTypes = [
   (id: 'silvus', label: 'SILVUS', implemented: true),
   (id: 'sdr', label: 'SDR (Pluto / USRP / RTL-SDR / HackRF…)', implemented: true),
+  (id: 'kraken', label: 'KRAKENSDR (DF bearings)', implemented: true),
   (id: 'mpu5', label: 'MPU5 (Wave Relay)', implemented: false),
   (id: 'harris', label: 'L3HARRIS', implemented: false),
 ];

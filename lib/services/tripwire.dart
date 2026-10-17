@@ -16,6 +16,12 @@ class TripwireConfig {
     this.adaptiveFloorFrac = 0.67,
     this.adaptiveCapMult = 3.0,
     this.maxHoldPolls = 480,
+    this.signedDetection = true,
+    this.fadeGate = 3.0,
+    this.varianceChannel = true,
+    this.varK = 3.0,
+    this.varWindow = 12,
+    this.varFloor = 1.0,
   });
 
   /// Rolling history kept per link direction (in polls).
@@ -57,21 +63,58 @@ class TripwireConfig {
   /// (a node moved, lasting interference) and the link re-baselines.
   /// At the default 0.25 s poll interval, 480 polls = 2 minutes.
   final int maxHoldPolls;
+
+  /// Fade-level-aware signed detection (Wilson & Patwari 2012): estimate
+  /// each link's fade level during quiet calibration and expect the
+  /// disturbance in the physically likely direction — a *dip* on
+  /// anti-fade links, a *rise* on deep-fade links, either on intermediate
+  /// ones. Dip-only detection discards real signal on deep-fade links.
+  final bool signedDetection;
+
+  /// |fade level| below this (radio units) counts as intermediate, where
+  /// either direction may signal.
+  final double fadeGate;
+
+  /// Variance (VRTI) second channel (Patwari & Wilson 2011): motion raises
+  /// RSS variance even when the mean barely moves. Runs alongside the
+  /// mean-deviation detector with different false-alarm behavior; the two
+  /// cross-check.
+  final bool varianceChannel;
+
+  /// Variance alarm factor over the link's quiet variance.
+  final double varK;
+
+  /// Rolling window (polls) for the variance estimate. Shorter than the
+  /// baseline window on purpose: variance must react in a few polls.
+  final int varWindow;
+
+  /// Floor for the variance alarm (radio units squared). Stops a
+  /// perfectly flat link from alarming on quantization jitter.
+  final double varFloor;
 }
 
-/// Rolling-median baseline dip detector, one instance per link direction.
+/// Rolling-median baseline disturbance detector, one instance per link
+/// direction.
 ///
 /// For each poll: baseline = median of the link's recent SNR history
-/// (not including the current sample); dip = baseline − snr. A dip at/above
-/// the link's threshold for [TripwireConfig.confirmPolls] consecutive polls
-/// emits a [CrossingEvent] carrying the disturbance's peak depth and
-/// duration.
+/// (not including the current sample); deviation = baseline − snr on
+/// anti-fade links, snr − baseline on deep-fade links (fade level from
+/// the network median of link medians — Wilson & Patwari 2012), the
+/// larger of the two on intermediate links. A deviation at/above the
+/// link's threshold for [TripwireConfig.confirmPolls] consecutive polls
+/// emits a [CrossingEvent] carrying the disturbance's peak depth,
+/// direction, and duration.
+///
+/// A variance (VRTI) second channel (Patwari & Wilson 2011) runs
+/// alongside: motion raises RSS variance even when the mean barely
+/// moves.
 ///
 /// Baseline hold: samples that are themselves disturbed are NOT added to
-/// the history. Otherwise a target that lingers drags the median down and
-/// the detector "heals" around it while it is still there. The hold is
-/// bounded by [TripwireConfig.maxHoldPolls] so a genuine, lasting change
-/// of level re-baselines instead of alarming forever.
+/// the history (nor to the quiet variance estimate). Otherwise a target
+/// that lingers drags the median down and the detector "heals" around it
+/// while it is still there. The hold is bounded by
+/// [TripwireConfig.maxHoldPolls] so a genuine, lasting change of level
+/// re-baselines instead of alarming forever.
 ///
 /// All magnitudes are estimates in radio-internal units.
 class Tripwire {
@@ -89,6 +132,18 @@ class Tripwire {
   final Map<String, DateTime> _rebaselinedAt = {};
   int _rebaselines = 0;
 
+  /// Last trusted baseline median per link — the fade-level reference.
+  final Map<String, double> _linkMedian = {};
+
+  /// Rolling raw-SNR window per link for the variance (VRTI) channel.
+  final Map<String, ListQueue<double>> _varHist = {};
+
+  /// Quiet variance estimate per link (EWMA, updated only while calm).
+  final Map<String, double> _varBase = {};
+
+  /// Whether the variance channel fired during the current episode.
+  final Map<String, bool> _varFired = {};
+
   /// How many times a link gave up holding its baseline and re-baselined
   /// (lasting level change). Diagnostic.
   int get rebaselineCount => _rebaselines;
@@ -98,8 +153,13 @@ class Tripwire {
   /// there is invisible; callers should surface this, not show CLEAR.
   Map<String, DateTime> get rebaselinedAt => Map.unmodifiable(_rebaselinedAt);
 
-  /// Feed one raw sample; returns the sample enriched with dip, baseline
-  /// and this link's threshold.
+  /// Feed one raw sample; returns the sample enriched with deviation,
+  /// baseline and this link's threshold.
+  ///
+  /// `dip` on the returned sample is the deviation in the *expected*
+  /// direction (baseline−snr on anti-fade links, snr−baseline on
+  /// deep-fade links, the larger of the two on intermediate links) —
+  /// always ≥ 0 when disturbed.
   LinkSample process(LinkSample raw) {
     final key = raw.linkKey;
     final hist = _hist.putIfAbsent(key, () => ListQueue<double>());
@@ -108,20 +168,70 @@ class Tripwire {
     final trusted = hist.length >= config.minBaseline;
     var baseline = double.nan;
     var threshold = config.dipThreshold;
-    var dip = 0.0;
+    var dev = 0.0;
+    var direction = 'dip';
 
     if (trusted) {
       final sorted = hist.toList()..sort();
       baseline = _medianSorted(sorted);
       threshold = _thresholdFor(sorted, baseline);
-      if (snr != null) dip = baseline - snr;
+      _linkMedian[key] = baseline;
+      if (snr != null) {
+        final sign = _expectedSign(key);
+        final d = baseline - snr;
+        final r = snr - baseline;
+        if (sign > 0) {
+          dev = d;
+          direction = 'dip';
+        } else if (sign < 0) {
+          dev = r;
+          direction = 'rise';
+        } else if (d >= r) {
+          dev = d;
+          direction = 'dip';
+        } else {
+          dev = r;
+          direction = 'rise';
+        }
+      }
     } else if (snr != null) {
       baseline = snr; // warming up: not trusted yet
     }
 
-    final disturbed = trusted && snr != null && dip >= threshold;
+    final meanDisturbed = trusted && snr != null && dev >= threshold;
 
-    // History update. Only undisturbed samples extend the baseline.
+    // Variance (VRTI) second channel: motion raises RSS variance even
+    // when the mean barely moves. It only fires when the mean channel is
+    // quiet (|dev| < threshold) — the two channels are complementary:
+    // large mean shifts are judged by the signed mean test, subtle
+    // motion by variance.
+    var varDisturbed = false;
+    double? vNow;
+    if (snr != null && config.varianceChannel && dev.abs() < threshold) {
+      final vh = _varHist.putIfAbsent(key, () => ListQueue<double>());
+      vh.addLast(snr);
+      while (vh.length > config.varWindow) {
+        vh.removeFirst();
+      }
+      if (vh.length >= 8) {
+        vNow = _variance(vh);
+        final base = _varBase[key];
+        if (base != null &&
+            vNow > math.max(base * config.varK, config.varFloor)) {
+          varDisturbed = true;
+          // Don't let the outlier pollute the variance window — otherwise
+          // one blip keeps the variance high for a whole window and the
+          // baseline hold freezes on a transient.
+          vh.removeLast();
+        }
+      }
+    }
+
+    final disturbed = meanDisturbed || varDisturbed;
+    if (varDisturbed) _varFired[key] = true;
+
+    // History update. Disturbed samples extend neither the baseline nor
+    // the quiet variance estimate.
     if (snr != null) {
       if (!trusted || !disturbed) {
         hist.addLast(snr);
@@ -129,6 +239,10 @@ class Tripwire {
           hist.removeFirst();
         }
         _held[key] = 0;
+        if (vNow != null) {
+          final base = _varBase[key];
+          _varBase[key] = base == null ? vNow : base * 0.9 + vNow * 0.1;
+        }
       } else {
         final held = (_held[key] ?? 0) + 1;
         _held[key] = held;
@@ -154,14 +268,16 @@ class Tripwire {
     if (disturbed) {
       if (count == 0) {
         _dipStart[key] = raw.timestamp;
-        _dipPeak[key] = dip;
+        _dipPeak[key] = dev;
+        _varFired[key] = varDisturbed;
       } else {
-        _dipPeak[key] = math.max(_dipPeak[key] ?? dip, dip);
+        _dipPeak[key] = math.max(_dipPeak[key] ?? dev, dev);
+        if (varDisturbed) _varFired[key] = true;
       }
       count += 1;
       if (count == config.confirmPolls) {
         final start = _dipStart[key] ?? raw.timestamp;
-        final peak = _dipPeak[key] ?? dip;
+        final peak = _dipPeak[key] ?? dev;
         _pending.add(CrossingEvent(
           timestamp: raw.timestamp,
           linkKey: key,
@@ -169,6 +285,8 @@ class Tripwire {
           durationSecs:
               raw.timestamp.difference(start).inMilliseconds / 1000.0,
           sizeEstimate: _sizeEstimate(peak),
+          direction: direction,
+          viaVariance: _varFired[key] ?? false,
         ));
       }
       _dipCount[key] = count;
@@ -176,7 +294,7 @@ class Tripwire {
       _resetEpisode(key);
     }
 
-    return raw.copyWith(dip: dip, baseline: baseline, threshold: threshold);
+    return raw.copyWith(dip: dev, baseline: baseline, threshold: threshold);
   }
 
   /// Take and clear confirmed events.
@@ -190,6 +308,44 @@ class Tripwire {
     _dipCount[key] = 0;
     _dipStart.remove(key);
     _dipPeak.remove(key);
+    _varFired.remove(key);
+  }
+
+  /// Fade-level proxy for a link: its baseline median vs the network
+  /// median of link medians. Positive = anti-fade (expect dips),
+  /// negative = deep fade (expect rises). Wilson & Patwari 2012 use a
+  /// fitted path-loss model as the reference; the network median is the
+  /// honest no-model proxy. Needs 2+ links; a lone link is intermediate.
+  double _fadeLevel(String key) {
+    final med = _linkMedian[key];
+    if (med == null || _linkMedian.length < 2) return 0.0;
+    final all = _linkMedian.values.toList()..sort();
+    return med - _medianSorted(all);
+  }
+
+  /// Expected disturbance sign: +1 dip (baseline−snr), −1 rise
+  /// (snr−baseline), 0 intermediate (either may signal).
+  int _expectedSign(String key) {
+    if (!config.signedDetection) return 1;
+    final f = _fadeLevel(key);
+    if (f > config.fadeGate) return 1;
+    if (f < -config.fadeGate) return -1;
+    return 0;
+  }
+
+  /// Population variance of the values in [xs].
+  static double _variance(ListQueue<double> xs) {
+    var mean = 0.0;
+    for (final x in xs) {
+      mean += x;
+    }
+    mean /= xs.length;
+    var v = 0.0;
+    for (final x in xs) {
+      final d = x - mean;
+      v += d * d;
+    }
+    return v / xs.length;
   }
 
   /// This link's detection threshold given its sorted baseline window.
