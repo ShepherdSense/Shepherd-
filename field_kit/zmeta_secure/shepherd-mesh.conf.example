@@ -1,0 +1,28 @@
+# ============================================================
+# Shepherd mesh side — WireGuard tunnel config TEMPLATE
+# Copy to shepherd-mesh.conf, fill in the 4 values, import into
+# WireGuard for Windows ("Import tunnel(s) from file"), Activate.
+# ============================================================
+[Interface]
+# This mesh's PRIVATE key (from NEW_MESH_KEY.bat -> mesh.key).
+# Never share this. Never commit it anywhere.
+PrivateKey = PASTE_MESH_PRIVATE_KEY_HERE
+
+# This mesh's address INSIDE the tunnel (assigned by gateway operator).
+# Each mesh gets its own .11, .12, .13 ...
+Address = 10.99.0.11/32
+
+[Peer]
+# The ZMeta gateway's PUBLIC key (given by the gateway operator).
+PublicKey = PASTE_GATEWAY_PUBLIC_KEY_HERE
+
+# The gateway's public endpoint reachable from this network.
+# Format host:port — the operator opens UDP 51820 (or their port).
+Endpoint = PASTE_GATEWAY_HOST:51820
+
+# ONLY the ZMeta gateway's tunnel address goes through the tunnel.
+# Everything else uses the normal network (split tunnel).
+AllowedIPs = 10.99.0.1/32
+
+# Keep NAT mappings alive on flaky tactical links.
+PersistentKeepalive = 25

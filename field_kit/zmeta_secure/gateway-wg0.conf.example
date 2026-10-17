@@ -1,0 +1,39 @@
+# ============================================================
+# ZMeta gateway side — WireGuard hub config TEMPLATE (Linux)
+# /etc/wireguard/wg0.conf on the gateway host (or a relay next to it).
+#
+# The gateway keeps ONE private key. Every Shepherd mesh is a [Peer]
+# with its own public key + tunnel IP. Add a [Peer] block per mesh.
+# ============================================================
+[Interface]
+# Gateway's PRIVATE key. Generate once:  wg genkey > gateway.key
+PrivateKey = PASTE_GATEWAY_PRIVATE_KEY_HERE
+
+# The gateway's address INSIDE the tunnel. Meshes send ZMeta events
+# (UDP 5555) to this address — plaintext inside the tunnel is fine,
+# the tunnel itself is the encryption.
+Address = 10.99.0.1/32
+
+# UDP port WireGuard listens on (open this in the firewall).
+ListenPort = 51820
+
+# --- Mesh A -------------------------------------------------------
+[Peer]
+# mesh A public key (from their mesh.pub)
+PublicKey = PASTE_MESH_A_PUBLIC_KEY_HERE
+# mesh A's tunnel IP — must match what you assigned them
+AllowedIPs = 10.99.0.11/32
+
+# --- Mesh B -------------------------------------------------------
+[Peer]
+# mesh B public key
+PublicKey = PASTE_MESH_B_PUBLIC_KEY_HERE
+AllowedIPs = 10.99.0.12/32
+
+# --- Add more meshes: copy a [Peer] block, new key, next .IP --------
+
+# Bring up:   sudo wg-quick up wg0
+# Check:      sudo wg show
+# Forward the ZMeta ingest port only inside the tunnel — the reference
+# gateway listens on UDP 0.0.0.0:5555; bind it to 10.99.0.1 instead so
+# plaintext events are never exposed on an untrusted interface.
