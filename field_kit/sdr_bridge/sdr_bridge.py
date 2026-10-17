@@ -32,11 +32,21 @@ Protocol (UDP JSON datagrams to the Shepherd host, default 127.0.0.1:49161):
      "center_mhz":433.92,"bw_mhz":1.0,
      "energy_dbfs":-52.3,"noise_dbfs":-81.2,
      "bins_dbfs":[-53.1,... 8 values ...],
+     "peak_mhz":433.97,"peak_dbfs":-48.2,"span_mhz":1.0,
      "t":1729123456.789}
 
-  beacon packet (every 10 s, lets Shepherd show bridge status):
+  (peak_mhz is the absolute frequency of the strongest non-DC bin in the
+  measured span, peak_dbfs its level, span_mhz the width actually
+  measured -- see "Band width" below. All three are optional extras;
+  older Shepherd builds ignore them.)
+
+  beacon packet (every 3 s, lets Shepherd show bridge status):
     {"v":1,"kind":"beacon","radio":"rtlsdr0","backend":"rtlsdr",
-     "bands":["433","915"],"t":1729123456.789}
+     "bands":["433","915"],"dropped":0,"t":1729123456.789}
+
+Band width: the measurement is limited to the central 80% of the radio's
+sample rate (the edges are filter roll-off). A band wider than that is
+measured over its usable centre only and span_mhz says so honestly.
 
 Examples:
   python sdr_bridge.py --simulate
@@ -61,6 +71,10 @@ except ImportError:
 UDP_PORT_DEFAULT = 49161
 SAMPLE_RATE = 4_000_000      # Pluto/USRP/Soapy-practical; RTL-SDR uses 2.4e6
 CAPTURE_N = 16384
+MIN_CAPTURE_N = 4096         # shorter captures are treated as a failed read
+SEG_N = 2048                 # Welch segment length (averaging lowers variance)
+USABLE_FRAC = 0.8            # central fraction of the sample rate we trust
+BEACON_S = 3.0
 TUNE_SETTLE_S = 0.15
 
 # Drone-relevant bands: (label, center MHz, bandwidth MHz).
@@ -128,6 +142,10 @@ class PlutoBackend(RadioBackend):
         self.sdr = adi.Pluto(uri=uri)
         self.sdr.rx_buffer_size = CAPTURE_N
         self.sdr.gain_control_mode_chan0 = "manual"
+        try:
+            self.sdr.rx_output_type = "raw"   # ADC counts, fixed scale
+        except Exception:
+            pass
         self.gain_db = gain_db
 
     def tune(self, center_mhz, bw_mhz, gain_db):
@@ -144,10 +162,11 @@ class PlutoBackend(RadioBackend):
         x = np.asarray(x, dtype=np.complex64)
         if x.size == 0:
             return x  # USB hiccup: let the DSP clamp handle it
-        # pyadi-iio returns int16-scale complex; normalize to [-1, 1].
-        peak = np.max(np.abs(x))
-        if peak > 1.5:  # looks like raw ADC counts
-            x = x / 32768.0
+        # AD936x ADC is 12-bit: raw counts span +/-2048. ALWAYS apply the
+        # same fixed scale. (A data-dependent "looks like counts" test
+        # flips scale between quiet and loud captures -- a ~55 dB jump
+        # that reads as a phantom emitter.)
+        x = x / 2048.0
         if len(x) > n:
             x = x[:n]
         return x
@@ -339,21 +358,22 @@ class SimBackend(RadioBackend):
         self.center = center_mhz
         self.bw = bw_mhz
 
-    def _emitter_level_db(self, now):
-        """Extra dB above the noise floor right now, for the tuned band."""
+    def _emitter(self, now):
+        """(level dB above floor, wideband?) for the tuned band right now."""
         el = now - self.t0
-        lvl = 0.0
+        lvl, wide = 0.0, False
         if abs(self.center - 2437.0) < 1.0:
-            phase = el % 90.0
-            if 20.0 <= phase < 40.0:
-                lvl = max(lvl, 28.0)
+            # FPV/Wi-Fi-like wideband burst: raises the band MEDIAN.
+            if 20.0 <= (el % 90.0) < 40.0:
+                lvl, wide = 28.0, True
         if abs(self.center - 915.0) < 1.0:
-            phase = el % 47.0
-            if 5.0 <= phase < 9.0:
-                lvl = max(lvl, 18.0)
+            # LoRa-like narrowband burst: visible in sub-band peaks and
+            # peak_mhz, deliberately NOT in the median (honest limit).
+            if 5.0 <= (el % 47.0) < 9.0:
+                lvl, wide = max(lvl, 18.0), False
         if abs(self.center - 433.92) < 1.0:
-            lvl = max(lvl, 12.0)  # always-on weak carrier
-        return lvl
+            lvl = max(lvl, 12.0)  # always-on weak narrowband carrier
+        return lvl, wide
 
     def capture(self, n):
         now = time.time()
@@ -362,54 +382,93 @@ class SimBackend(RadioBackend):
         floor_lin = 10 ** (floor_db / 20.0)
         x = (self.rng.standard_normal(n) + 1j * self.rng.standard_normal(n))
         x = (x / np.sqrt(2.0)).astype(np.complex64) * floor_lin
-        lvl_db = self._emitter_level_db(now)
+        lvl_db, wide = self._emitter(now)
         if lvl_db > 0:
-            # A tone-ish emitter with slight FM wobble, AM flutter.
-            t = np.arange(n) / self.sample_rate
-            fm = 0.15 * np.sin(2 * np.pi * 37.0 * t)
-            tone = np.exp(2j * np.pi * fm * t).astype(np.complex64)
             amp = floor_lin * (10 ** (lvl_db / 20.0))
-            am = (0.85 + 0.15 * np.sin(2 * np.pi * 3.0 * t)).astype(np.float32)
-            x = x + (tone * amp * am).astype(np.complex64)
+            if wide:
+                # Wideband: extra noise-like power across the whole span.
+                w = (self.rng.standard_normal(n)
+                     + 1j * self.rng.standard_normal(n)) / np.sqrt(2.0)
+                x = x + (w * amp).astype(np.complex64)
+            else:
+                # Narrowband: tone 150 kHz off centre with FM wobble.
+                t = np.arange(n) / self.sample_rate
+                ph = 2 * np.pi * 150e3 * t + 2.0 * np.sin(2 * np.pi * 37.0 * t)
+                x = x + (np.exp(1j * ph) * amp).astype(np.complex64)
         return x
 
 
 # ---------------------------------------------------------------- DSP
 
-def psd_dbfs(x):
-    """Power spectral density in dBFS (full-scale sine == 0 dBFS).
+def psd_dbfs(x, seg=SEG_N):
+    """Welch-averaged, FFT-shifted power spectral density in dBFS.
 
-    Only deltas matter downstream; this just needs to be self-consistent.
+    Returns (freqs, p): freqs in cycles/sample (-0.5..0.5), p in dBFS
+    (full-scale sine == 0 dBFS per bin). Averaging SEG_N-point segments
+    in the power domain cuts the variance of the band metrics so the
+    tripwire sees fewer phantom wobbles. Only deltas matter downstream.
     """
     n = len(x)
-    if n == 0:
-        return np.array([], dtype=np.float32)
-    w = np.hanning(n).astype(np.float32)
+    if n < 256:
+        return np.array([]), np.array([], dtype=np.float32)
+    seg = min(seg, 1 << (n.bit_length() - 1))  # largest power of two <= n
+    nseg = n // seg
+    w = np.hanning(seg).astype(np.float32)
+    xs = np.asarray(x[:nseg * seg], dtype=np.complex64).reshape(nseg, seg) * w
     # Complex input -> full FFT (rfft would discard the imaginary part).
-    spec = np.fft.fft(x * w)
-    mag = np.abs(spec) * 2.0 / (n * np.mean(w))
-    return (20.0 * np.log10(mag + 1e-12)).astype(np.float32)
+    spec = np.fft.fftshift(np.fft.fft(xs, axis=1), axes=1)
+    mag = np.abs(spec) * 2.0 / (seg * np.mean(w))
+    p = np.mean(mag.astype(np.float64) ** 2, axis=0)
+    freqs = np.fft.fftshift(np.fft.fftfreq(seg))
+    return freqs, (10.0 * np.log10(p + 1e-24)).astype(np.float32)
 
 
-def band_measurement(x):
-    """Per-band energy metrics from one capture.
+def band_measurement(x, sample_rate=SAMPLE_RATE, bw_mhz=None):
+    """Per-band energy metrics from one capture, or None if unusable.
+
+    Only the part of the spectrum inside the requested band (clipped to
+    the central USABLE_FRAC of the sample rate) is measured:
 
     energy: median PSD across the band -- the stable wideband metric and
         the primary tripwire input (robust to spurs and narrow tones).
     noise: 10th-percentile PSD -- the band's noise floor estimate.
-    bins: per-sub-band (8) PEAK PSD -- catches narrowband emitters
-        (LoRa/RC tones) that the median deliberately ignores. Peak-based,
-        so spur-sensitive: treat as an investigation aid, and rely on the
-        tripwire's confirm-polls + adaptive threshold before alarming.
+    bins: 8 contiguous sub-bands, LOW to HIGH frequency, PEAK PSD each --
+        catches narrowband emitters (LoRa/RC tones) that the median
+        deliberately ignores. Peak-based, so spur-sensitive: treat as an
+        investigation aid, and rely on the tripwire's confirm-polls +
+        adaptive threshold before alarming.
+    peak: frequency offset (MHz from centre) and level of the strongest
+        bin, ignoring the DC-spike region.
+    span_mhz: the width actually measured (<= requested bw).
     """
-    p = psd_dbfs(x)
-    if p.size == 0:
-        return -120.0, -120.0, [-120.0] * 8
-    energy = float(np.median(p))
-    noise = float(np.percentile(p, 10))
-    edges = np.array_split(p, 8)
-    bins = [float(np.max(e)) if e.size else -120.0 for e in edges]
-    return energy, noise, bins
+    freqs, p = psd_dbfs(x)
+    if p.size == 0 or not np.all(np.isfinite(p)):
+        return None
+    f_hz = freqs * float(sample_rate)
+    half = USABLE_FRAC * sample_rate / 2.0
+    if bw_mhz:
+        half = min(half, bw_mhz * 1e6 / 2.0)
+    sel = np.abs(f_hz) <= half
+    if int(sel.sum()) < 16:
+        return None
+    ps = p[sel].copy()
+    fs = f_hz[sel]
+    # Mask the DC spike (LO leakage / DC offset) so it can't pose as an
+    # emitter in the peaks. The median/percentile barely notice it.
+    dc = np.abs(fs) <= 3.0 * float(sample_rate) / SEG_N
+    if dc.any() and (~dc).any():
+        ps[dc] = np.median(ps[~dc])
+    energy = float(np.median(ps))
+    noise = float(np.percentile(ps, 10))
+    bins = [float(np.max(e)) for e in np.array_split(ps, 8) if e.size]
+    while len(bins) < 8:
+        bins.append(noise)
+    k = int(np.argmax(ps))
+    return {
+        "energy": energy, "noise": noise, "bins": bins,
+        "peak_off_mhz": float(fs[k]) / 1e6, "peak_dbfs": float(ps[k]),
+        "span_mhz": 2.0 * half / 1e6,
+    }
 
 
 # ---------------------------------------------------------------- main
@@ -534,8 +593,15 @@ def main():
     if args.bands:
         bands = []
         for item in args.bands.split(","):
+            item = item.strip()
+            if not item:
+                continue
             c, _, b = item.partition("/")
-            bands.append((c, float(c), float(b or 4.0)))
+            try:
+                bands.append((c, float(c), float(b or 4.0)))
+            except ValueError:
+                sys.exit(f"bad --bands item {item!r}: use centerMHz[/bwMHz], "
+                         "e.g. 433.92/1,915/2,2437/20")
     elif args.stare:
         bands = [(f"{args.stare:g}", args.stare, 20.0)]
     else:
@@ -554,36 +620,81 @@ def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     def emit(pkt):
+        # allow_nan=False: NaN/Infinity are not valid JSON and Shepherd's
+        # decoder would drop the whole datagram. Callers pre-check finite.
+        data = json.dumps(pkt, allow_nan=False)
         if args.print_only:
-            print(json.dumps(pkt), flush=True)
-        else:
-            sock.sendto(json.dumps(pkt).encode(), (host, port))
+            print(data, flush=True)
+            return
+        try:
+            sock.sendto(data.encode(), (host, port))
+        except OSError as e:  # unreachable host, buffer full, etc.
+            now = time.time()
+            if now - emit.last_err > 30.0:
+                emit.last_err = now
+                print(f"[bridge] send failed ({e}); will keep trying")
+    emit.last_err = 0.0
 
     labels = [n for n, _, _ in bands]
     last_beacon = 0.0
     sweeps_done = 0
+    dropped = 0
+    last_warn = 0.0
+
+    def finite_all(vals):
+        return all(math.isfinite(v) for v in vals)
 
     try:
         while True:
             for label, center, bw in bands:
                 backend.tune(center, bw, args.gain)
-                x = None
+                ms = []
                 for _ in range(max(1, args.dwell)):
                     x = backend.capture(CAPTURE_N)
-                energy, noise, bins = band_measurement(x)
+                    if x is None or len(x) < MIN_CAPTURE_N:
+                        continue  # failed/short read: never report as data
+                    m = band_measurement(x, backend.sample_rate, bw)
+                    if m is not None:
+                        ms.append(m)
+                if not ms:
+                    # Reporting a fake "-120 dBFS" here would poison
+                    # Shepherd's baseline and cause a phantom emitter on
+                    # the next good read. Stay silent instead; Shepherd
+                    # treats missing data as missing data.
+                    dropped += 1
+                    now = time.time()
+                    if now - last_warn > 30.0:
+                        last_warn = now
+                        print(f"[bridge] band {label}: capture failed "
+                              f"({dropped} dropped so far)")
+                    continue
+                energy = sum(m["energy"] for m in ms) / len(ms)
+                noise = sum(m["noise"] for m in ms) / len(ms)
+                bins = [sum(m["bins"][i] for m in ms) / len(ms)
+                        for i in range(8)]
+                top = max(ms, key=lambda m: m["peak_dbfs"])
+                peak_mhz = center + top["peak_off_mhz"]
+                vals = [energy, noise, top["peak_dbfs"], peak_mhz] + bins
+                if not finite_all(vals):
+                    dropped += 1
+                    continue
                 pkt = {"v": 1, "kind": "band", "radio": radio, "band": label,
                        "center_mhz": center, "bw_mhz": bw,
                        "energy_dbfs": round(energy, 1),
                        "noise_dbfs": round(noise, 1),
                        "bins_dbfs": [round(b, 1) for b in bins],
+                       "peak_mhz": round(peak_mhz, 3),
+                       "peak_dbfs": round(top["peak_dbfs"], 1),
+                       "span_mhz": round(top["span_mhz"], 3),
                        "t": time.time()}
                 emit(pkt)
             sweeps_done += 1
             now = time.time()
-            if now - last_beacon >= 10.0:
+            if now - last_beacon >= BEACON_S:
                 last_beacon = now
                 bc = {"v": 1, "kind": "beacon", "radio": radio,
-                      "backend": backend.name, "bands": labels, "t": now}
+                      "backend": backend.name, "bands": labels,
+                      "dropped": dropped, "t": now}
                 emit(bc)
             if args.sweeps and sweeps_done >= args.sweeps:
                 break

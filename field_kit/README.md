@@ -21,6 +21,12 @@ UDP 49160. Status page at http://192.168.4.1 when joined to its AP.
 Source: `esp32/shepherd_node/shepherd_node.ino`
 Pre-compiled binaries: `thumbdrive/firmware/` (flash with esptool)
 
+**Wiring (SPI modules):** SCK 18, MISO 19, MOSI 23; nRF24L01 CS 4 and
+**CE 22** (the node holds CE high — the nRF24 only measures energy while
+CE is high; a module with CE tied to 3V3 also works, leave GPIO22
+unconnected); CC1101 CS 21. nRF24 and CC1101 channels report energy, so
+an emitter appearing raises the reading and fires an event.
+
 **Honest scope:** ESP32 CSI is coarse — a cheap distributed tripwire
 layer, not Silvus-grade MIMO. It reports link disturbances, never
 identities. Event classes (PASSING/LINGERING) are crude duration

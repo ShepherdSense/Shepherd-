@@ -27,7 +27,15 @@
  *            "detail":""}
  *
  * Wiring (changeable below): VSPI SCK=18 MISO=19 MOSI=23,
- *   nRF24 CS=4, CC1101 CS=21, UART2 RX=16 TX=17.
+ *   nRF24 CS=4, nRF24 CE=22 (the node holds CE high; a module with CE
+ *   hard-wired to 3V3 also works, just leave GPIO22 unconnected),
+ *   CC1101 CS=21, UART2 RX=16 TX=17.
+ *
+ * Polarity: nrf24 and cc110 report ENERGY, so an emitter appearing is a
+ * rise and fires an event. The wifi channel reports -RSSI (a link dip is
+ * a rise). UART lines are treated like wifi: SENSOR <name> <rssi_dbm>
+ * fires when the reported RSSI FALLS; send the negative of an energy
+ * reading if you want "emitter appeared" semantics.
  *
  * Honest scope: these are coarse tripwire layers, not lab instruments.
  * ESP32 CSI is a poor-man's link disturbance sensor; nRF24 RPD is a
@@ -55,9 +63,11 @@
 #define BLE_EVERY_MS  60000
 #define BLE_SCAN_S    6
 #define CC1101_FREQ_HZ 433920000UL   // sub-GHz watch frequency
+#define MAX_EVENT_MS  120000UL       // longest an event may stay open
 
 // pins
 #define NRF_CS   4
+#define NRF_CE   22
 #define CC110_CS 21
 #define UART_RX  16
 #define UART_TX  17
@@ -115,7 +125,16 @@ struct SensorCh {
         open = true; t0 = now; peak = m; base = med; quiet = 0;
       } else if (open) {
         if (m > peak) peak = m;
-        if (m < med + (thr - med) * 0.5f) {
+        if (now - t0 > MAX_EVENT_MS) {
+          // The level never came back (node moved, lasting interference).
+          // Close the event and relearn the baseline at the new level;
+          // otherwise the channel stays "open" forever and goes deaf.
+          durS = (now - t0) / 1000.0f;
+          depthDb = peak - base;
+          cls = "LINGERING";
+          open = false; closed = 1;
+          n = 0; i = 0;
+        } else if (m < med + (thr - med) * 0.5f) {
           if (!quiet) quiet = now;
           if (now - quiet > 3000) {
             durS = (now - t0) / 1000.0f;
@@ -141,32 +160,56 @@ void sendEvent(const char *sensor, float durS, float depthDb,
                const char *cls, float conf, const char *detail);  // fwd
 uint32_t eventT0glob = 0;
 
+// Copy [src] into [dst] keeping only characters that are safe inside a
+// JSON string. UART sensor names/details come from outside the node; a
+// quote or backslash in one would corrupt the whole datagram.
+static void jsonSafe(char *dst, size_t n, const char *src) {
+  size_t o = 0;
+  for (; src && *src && o + 1 < n; src++) {
+    char c = *src;
+    bool ok = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+              (c >= 'a' && c <= 'z') || c == ' ' || c == '_' || c == '.' ||
+              c == ':' || c == '-' || c == '!';
+    dst[o++] = ok ? c : '_';
+  }
+  dst[o] = 0;
+}
+
 void sendEvent(const char *sensor, float durS, float depthDb,
                const char *cls, float conf, const char *detail) {
-  char buf[320];
+  char buf[320], sSafe[32], dSafe[48];
+  jsonSafe(sSafe, sizeof(sSafe), sensor);
+  jsonSafe(dSafe, sizeof(dSafe), detail ? detail : "");
+  // eventT0glob is the event's START (millis), set by the caller from
+  // the channel; t0 is seconds since boot.
   uint32_t t0 = (eventT0glob - bootMs) / 1000;
   snprintf(buf, sizeof(buf),
     "{\"type\":\"event\",\"node\":\"%s\",\"sensor\":\"%s\",\"t0\":%lu,"
     "\"dur_s\":%.1f,\"depth_db\":%.1f,\"class\":\"%s\",\"conf\":%.2f,"
     "\"detail\":\"%s\"}",
-    nodeId, sensor, (unsigned long)t0, durS, depthDb, cls, conf,
-    detail ? detail : "");
+    nodeId, sSafe, (unsigned long)t0, durS, depthDb, cls, conf, dSafe);
   udp.beginPacket(IPAddress(192, 168, 4, 255), BEACON_PORT);
   udp.write((uint8_t *)buf, strlen(buf));
   udp.endPacket();
   eventCount++;
-  Serial.printf("[%s] %s %.1fs %.1fdB %s\n", sensor, cls, durS, depthDb,
-                detail ? detail : "");
+  Serial.printf("[%s] %s %.1fs %.1fdB %s\n", sSafe, cls, durS, depthDb,
+                dSafe);
 }
 
 // ---------------- WiFi CSI sniffer ----------------
 volatile uint32_t g_frames = 0;
 volatile int32_t  g_rssiSum = 0;
+// The CSI callback runs on the Wi-Fi task (other core); loop() reads and
+// zeroes these once a second. Without the lock a frame landing between
+// the read and the reset was silently lost.
+portMUX_TYPE g_csiMux = portMUX_INITIALIZER_UNLOCKED;
 
 void csi_cb(void *ctx, wifi_csi_info_t *data) {
   if (!data) return;
+  portENTER_CRITICAL(&g_csiMux);
   g_frames++;
   g_rssiSum += data->rx_ctrl.rssi;
+  portEXIT_CRITICAL(&g_csiMux);
 }
 
 void wifiSniff(bool on) {
@@ -227,7 +270,14 @@ void bleScanOnce() {
 uint8_t spiRegRead(int cs, uint8_t reg, bool cc1101) {
   digitalWrite(cs, LOW);
   uint8_t v;
-  if (cc1101) { SPI.transfer(0x80 | reg); v = SPI.transfer(0x00); }
+  // CC1101: config regs (0x00-0x2F) read with 0x80|addr; STATUS regs
+  // (0x30-0x3D: PARTNUM, VERSION, RSSI...) need the burst bit as well
+  // (0xC0|addr). Without it 0x30-0x3D are command strobes -- reading
+  // "VERSION" that way never returned the version (and 0x30 is SRES).
+  if (cc1101) {
+    SPI.transfer((reg >= 0x30 ? 0xC0 : 0x80) | reg);
+    v = SPI.transfer(0x00);
+  }
   else        { SPI.transfer(reg & 0x1F); v = SPI.transfer(0xFF); }
   digitalWrite(cs, HIGH);
   return v;
@@ -266,9 +316,12 @@ int nrfSweep() {
 // ---------------- CC1101: sub-GHz RSSI ----------------
 bool ccPresent = false;
 bool ccDetect() {
-  return spiRegRead(CC110_CS, 0x30, true) == 0x14;  // VERSION
+  uint8_t v = spiRegRead(CC110_CS, 0x31, true);      // VERSION
+  return v == 0x14 || v == 0x04;                      // 0x04 = older/clone
 }
 void ccInit() {
+  ccStrobe(CC110_CS, 0x30);                        // SRES (reset)
+  delay(5);
   ccStrobe(CC110_CS, 0x36);                        // SIDLE
   uint32_t f = (uint32_t)((CC1101_FREQ_HZ * 65536.0) / 26000000.0);
   spiRegWrite(CC110_CS, 0x0D, (f >> 16) & 0xFF, true);  // FREQ2
@@ -277,7 +330,7 @@ void ccInit() {
   ccStrobe(CC110_CS, 0x34);                        // SRX
 }
 float ccRssiDbm() {
-  uint8_t raw = spiRegRead(CC110_CS, 0xF4, true);   // RSSI (burst read)
+  uint8_t raw = spiRegRead(CC110_CS, 0x34, true);   // RSSI status reg
   int v = (int)raw;
   float dbm = (v >= 128 ? (v - 256) : v) / 2.0f - 74.0f;
   return dbm;
@@ -303,10 +356,11 @@ void uartPoll(uint32_t now) {
           }
         if (u) {
           float durS, depth; const char *cls;
-          eventT0glob = now;
-          if (u->ch.push(-rssi, now, durS, depth, cls))
+          if (u->ch.push(-rssi, now, durS, depth, cls)) {
+            eventT0glob = u->ch.t0;
             sendEvent(u->name, durS, depth, cls, 0.6f,
                       *detail ? detail : name);
+          }
         }
       }
     } else if (c != '\r') uartLine[uartPos++] = c;
@@ -378,6 +432,8 @@ void setup() {
 
   // SPI module auto-detect
   pinMode(NRF_CS, OUTPUT); digitalWrite(NRF_CS, HIGH);
+  // nRF24 only measures RPD while CE is high in RX mode.
+  pinMode(NRF_CE, OUTPUT); digitalWrite(NRF_CE, HIGH);
   pinMode(CC110_CS, OUTPUT); digitalWrite(CC110_CS, HIGH);
   SPI.begin(18, 19, 23);
   char sl[96] = "\"wifi\",\"ble\"";
@@ -406,30 +462,37 @@ void loop() {
   if (now - lastBle > BLE_EVERY_MS) { lastBle = now; bleScanOnce(); }
 
   if (now - lastSec >= 1000) {
+    portENTER_CRITICAL(&g_csiMux);
     uint32_t f = g_frames; int32_t rs = g_rssiSum;
     g_frames = 0; g_rssiSum = 0;
+    portEXIT_CRITICAL(&g_csiMux);
     lastSec = now;
     if (f > 0) {
       float m = -((float)rs / (float)f);
       lastWifiMetric = m;
       float durS, depth; const char *cls;
-      eventT0glob = now;
-      if (chWifi.push(m, now, durS, depth, cls))
+      if (chWifi.push(m, now, durS, depth, cls)) {
+        eventT0glob = chWifi.t0;
         sendEvent("wifi", durS, depth, cls, 0.70f, "");
+      }
     }
     if (nrfPresent && now - lastNrf > 5000) {
       lastNrf = now;
       float durS, depth; const char *cls;
-      eventT0glob = now;
-      if (chNrf.push((float)nrfSweep(), now, durS, depth, cls))
+      if (chNrf.push((float)nrfSweep(), now, durS, depth, cls)) {
+        eventT0glob = chNrf.t0;
         sendEvent("nrf24", durS, depth, cls, 0.60f, "band-energy");
+      }
     }
     if (ccPresent && now - lastCc > 2000) {
       lastCc = now;
       float durS, depth; const char *cls;
-      eventT0glob = now;
-      if (chCc.push(-ccRssiDbm(), now, durS, depth, cls))
+      // +RSSI: an emitter appearing RAISES it (the old -RSSI only fired
+      // when a signal disappeared, the opposite of the nrf24 channel).
+      if (chCc.push(ccRssiDbm(), now, durS, depth, cls)) {
+        eventT0glob = chCc.t0;
         sendEvent("cc110", durS, depth, cls, 0.60f, "subghz-rssi");
+      }
     }
   }
 

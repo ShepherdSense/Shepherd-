@@ -46,6 +46,27 @@ enumerated SoapySDR device, first working one wins.
 7. In Shepherd: Settings → add radio → driver **SDR**,
    address `127.0.0.1:49161` (prefilled).
 
+## What each band packet means
+
+- `energy_dbfs` — **median** power across the band. The tripwire input; it
+  rises for *wideband* emitters (FPV video, Wi-Fi) and ignores narrow tones.
+- `bins_dbfs` — 8 sub-bands, **low → high frequency**, peak power each.
+  Catches narrowband emitters (LoRa, RC links) the median ignores; more
+  spur-sensitive, so it is an investigation aid, not an alarm source.
+- `peak_mhz` / `peak_dbfs` — frequency and level of the strongest bin
+  (DC spike masked). Tells you *where in the band* to look. It is a
+  frequency, not a direction.
+- `span_mhz` — the width actually measured. Only the central 80% of the
+  radio's sample rate is trusted (the edges are filter roll-off), so a
+  20 MHz band on a 4 MS/s capture reports `span_mhz` ≈ 3.2. Raise the
+  sample rate (`--soapy-rate`) on radios that support it for wider coverage.
+- Measurements are Welch-averaged over several FFT segments per capture;
+  `--dwell N` averages N captures per band per sweep.
+- A capture that fails or comes back short is **dropped, not reported**
+  (the beacon's `dropped` counter says how many). A fake "-120 dBFS"
+  reading would otherwise poison the baseline and cause a phantom alert
+  on the next good read.
+
 ## Rules that keep the sensing honest
 
 - **Manual gain, fixed.** AGC hides the energy changes you're detecting.
