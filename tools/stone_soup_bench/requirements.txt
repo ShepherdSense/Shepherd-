@@ -1,0 +1,4 @@
+stonesoup
+numpy
+scipy
+matplotlib
