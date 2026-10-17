@@ -122,20 +122,76 @@ markers. Observations older than 5 min or without lat/lon are skipped
 ## 5. Tracker corroboration (upgrade-only)
 
 `SensorObservation.corroborationFor(track, sensorX, sensorY)` returns
-a non-negative boost (asserted). Current gates:
+a non-negative boost (asserted) plus a 0..1 `quality` (geometry
+alignment). Current gates:
 
 - RANGE: track within ±12 m of reported distance (and ±20° of the
-  axis when directional) → up to +0.25.
+  axis when directional) → up to +0.25, quality = closeness.
 - BEARING: track within ±25° of the acoustic bearing → up to +0.20
-  scaled by array confidence.
-- BINARY: triggered + track within ~12 m → +0.10.
-- MOTION: +0.15 (camera saw motion where the track is).
+  scaled by array confidence, quality = angular alignment.
+- BINARY: triggered + track within ~12 m → +0.10, quality 1.0.
+- MOTION: +0.15 (camera saw motion where the track is), quality 1.0.
 - SPECTRUM / ENERGY: +0 (context for the evidence view, not a vote;
   ENERGY already drives the tripwire — no double counting).
 
 Total boost is capped by the merger (at wire-up). Silence — missing
 data, geometry miss, degenerate input — is always "no opinion", never
 a veto.
+
+### 5a. Gated confidence merger (research finding #2)
+
+AppState merges corroboration into the track's *displayed* confidence
+with the gated merger (`lib/services/confidence_merger.dart`) — the
+literature shape of the upgrade-only rule (AV-FDTI entropy-gated
+asymmetric fusion, lane3 P5):
+
+```
+C_display = clamp(C_RF + U, C_RF, C_max)
+U  = U_max · (1 − exp(−Σ_s (w_s · e_s) / U_max))     (saturating)
+w_s = freshness_s · health_s · quality_s              (reliability gate)
+```
+
+- `C_RF`: RF-core confidence from the deterministic tracker
+  (`rfCoreConfidence`: saturating in linksUsed, capped 0.80 —
+  a labeled display heuristic, not a measured probability).
+- `e_s`: the non-negative boost from `corroborationFor` above.
+- `w_s ∈ [0,1]`: measured information content, multiplicative —
+  any single zero collapses the weight:
+
+| gate factor | measures | zero when |
+|---|---|---|
+| freshness | observation age vs the per-type staleness horizon below | age ≥ horizon (no recent data ⇒ no weight — the AV-FDTI `h → 0` case) |
+| health | driver alive / recent data (sensor-bus last-poll ≤ 90 s; camera enabled + recent motion) | source silent or unconfigured |
+| quality | `Corroboration.quality` — geometry alignment from the gates above | geometry miss (`none` carries quality 0) |
+
+Staleness horizons: RANGE/BEARING/SPECTRUM 10 s, ENERGY 30 s,
+MOTION 30 s, BINARY 2 min — the sensors' natural cadence, not a
+tuning knob.
+
+Hard properties (all property-tested): **never subtractive**
+(`C_display ≥ C_RF` by construction — the merger has no code path
+that lowers confidence); **saturating** (total upgrade capped
++0.35, exponential approach — ten weak PIR triggers asymptote, they
+cannot manufacture certainty); **never identity** (`C_max = 0.95`).
+Detection authority is untouched: the tripwire originates every
+detection; the merger only computes a display number for a track the
+RF core already supports.
+
+While the track is internally inconsistent (see §5b) all upgrades are
+suspended: `C_display = C_RF`. Upgrading a misassociated track is the
+failure mode the consistency literature warns about.
+
+### 5b. Consistency monitor (honest NEES analogue)
+
+The app tracker is a grid search with no state covariance, so a
+textbook NEES (eᵀP⁻¹e) is impossible. `lib/services/track_consistency.dart`
+checks what *can* be checked: predict each fix from the track's recent
+constant-velocity motion, normalize the residual by the tracker's
+expected fix-error scale (1.0 m — the coarse-grid quantization scale),
+and flag **sustained** large normalized innovations (3σ × 3
+consecutive to flag, 5 consecutive small to clear — one jump never
+flaps the flag). The verdict surfaces on the tracking screen as a
+`TRACK STATE: INCONSISTENT` flag and gates the merger per §5a.
 
 ## 6. ZMeta export
 

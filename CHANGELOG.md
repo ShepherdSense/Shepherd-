@@ -1,5 +1,74 @@
 # Changelog
 
+## v0.16.0 — 2026-10-17
+
+### ELRS Gemini signature detection (protocol-pattern corroboration)
+
+RX-only DSP that detects LoRa chirp trains (ELRS's LoRa modes) and
+scores the Gemini dual-emission signature — the first public
+ELRS-specific detector of any kind (see
+`docs/elrs_detection_spec.md`; research brief
+`~/workspace/your_files/elrs_gemini_detection_brief.md`).
+
+- **Bridge** (`field_kit/sdr_bridge/elrs_detect.py`): dechirp chirp
+  detector over an (SF, BW) candidate grid (concentration gate keeps
+  tones/FSK/noise out — 13/13 DSP tests), FHSS hop tracker,
+  bridge-local Gemini coincidence scorer, throttled `elrs_chirp` /
+  `elrs_signature` UDP events (`--no-elrs` disables). SimBackend gains
+  a wall-clock-deterministic chirp emitter so two `--simulate`
+  instances demo app-level GemX correlation.
+- **App**: `ElrsChirp`/`ElrsSignature` parsing + `GeminiCorrelator`
+  cross-radio coincidence (GemX: 2.4 GHz + 900 MHz; dual-radio 2.4 GHz
+  ~40 MHz pair) in `lib/services/radio_driver.dart`; evidence-view
+  "RF SIGNATURES" section; gated merger input (boost 0.15,
+  score-weighted, 60 s horizon — existence evidence, no geometry
+  claimed, never subtractive).
+- **Honesty contract, test-enforced**: "Possible ELRS Gemini
+  signature", never "confirmed ELRS". Documented gaps: FLRC modes,
+  no identity vs other LoRa FHSS emitters, DF unbuilt, bridge-local
+  dual-frequency needs ≥ ~50 MHz instantaneous BW, GemX needs two
+  radios.
+
+### Gated confidence merger + consistency monitor (research finding #2)
+
+The upgrade-only rule is now confidence math, shaped by the
+literature (AV-FDTI entropy-gated asymmetric fusion, lane3 P5; NEES
+consistency, lane3 P8):
+
+- **Gated merger** (`lib/services/confidence_merger.dart`):
+  `C_display = clamp(C_RF + Σ w_s·e_s, C_RF, C_max)` — the
+  reliability gate `w_s` (freshness × source health × alignment
+  quality) collapses to 0 for stale/dead/misaligned sensors, so a
+  degraded modality can never drag the picture below the RF-only
+  baseline. Saturating (+0.35 cap, exponential approach — ten weak
+  PIR triggers asymptote, never manufacture certainty). Never
+  subtractive by construction; displayed confidence caps at 0.95
+  (confidence, never identity). `Corroboration` gains a 0..1
+  `quality` alignment channel feeding the gate.
+- **Consistency monitor** (`lib/services/track_consistency.dart`):
+  the honest NEES analogue for the covariance-free grid-search
+  tracker — fix-to-fix innovation normalized by the tracker's
+  expected fix-error scale (1.0 m), flags sustained 3σ jumps
+  (3 consecutive to flag, 5 clean to clear, gaps reset instead of
+  flagging). Surfaces as a `TRACK STATE: INCONSISTENT` flag on the
+  tracking screen and **suspends all corroboration upgrades** while
+  inconsistent — a misassociated track is never upgraded.
+- **Tracking screen** shows the merged `CONFIDENCE` row (RF base +
+  applied sensor upgrades) and the inconsistency flag.
+- **Stone Soup bench** gains a true NEES evaluation
+  (`tools/stone_soup_bench/bench_jpda.py`): mean NEES over the 4-D
+  state should sit near d=4; the current config scores ≈66 —
+  flagged OVERCONFIDENT, correctly: the link-midpoint detection
+  stand-in carries unmodeled bias the 3 m covariance doesn't cover
+  (RMSE alone never said so). `--shrink-covar 0.01` demo scores
+  2865. Covariances must be re-honest (inflate or swap the
+  detector) before porting to the app.
+- Docs: `docs/confidence_math.md` (formula, literature basis,
+  honesty boundaries); `docs/sensor_protocol_spec.md` §5a/§5b
+  (merger math + reliability-gate table).
+- Detection authority unchanged: the tripwire still originates
+  every detection; the merger only computes a display number.
+
 ## 0.15.1 — bug fixes, LoRa nodes, universal sensors, callsigns
 
 Everything the v0.15.0 adversarial review found (HIGH through LOW),
