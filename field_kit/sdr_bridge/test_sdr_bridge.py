@@ -210,6 +210,56 @@ def test_sim_ofdm_burst_produces_ofdm_hint():
     assert hint == "ofdm-5g", hint
 
 
+def test_sig_hint_ofdm_5g_survives_burst_past_window():
+    # M3 regression: a burst outliving the rolling window must not
+    # purge its own quiet reference and self-extinguish mid-burst.
+    # Tiny 1 s window + real sleeps keeps the test fast; bookkeeping
+    # runs on the monotonic clock, so the sleeps drive the purge.
+    sig = b.SigHistory(window_s=1.0, min_obs=3)
+    hint = None
+
+    def feed(burst):
+        nonlocal hint
+        if burst:
+            bins = [-40.0] * 8          # burst: every sub-band lifted,
+            energy, noise = -60.0, -65.0  # median AND floor up
+        else:
+            bins = [-83.0] * 8
+            energy, noise = -80.0, -85.0
+        hint = sig.observe("x", 5780.0, time.time(), bins, energy, noise)
+
+    for _ in range(3):                  # quiet reference
+        feed(False)
+        time.sleep(0.15)
+    for _ in range(6):                  # burst arrives
+        feed(True)
+        time.sleep(0.15)
+    assert hint == "ofdm-5g", hint
+    for _ in range(6):                  # burst outlives the 1 s window:
+        feed(True)                      # the quiet reference is gone
+        time.sleep(0.15)
+    assert hint == "ofdm-5g", hint       # without the latch this is None
+    for _ in range(8):                  # burst ends: latch must release
+        feed(False)
+        time.sleep(0.15)
+    assert hint is None, hint
+
+
+def test_sim_5780_burst_fires_when_staring_off_center():
+    # M14 regression: the 5780 OFDM gate keyed on the exact float
+    # 5780.0, so --stare 5780.5 entered the band branch but the burst
+    # never appeared. The gate now reads a MHz-normalized band key.
+    sim = b.SimBackend()
+    sim.tune(5780.5, 20.0, 40)
+    sim.t0 = time.time() - 101.0       # first capture: quiet, primes gate
+    quiet = b.band_measurement(sim.capture(N), SR, 20.0)
+    assert quiet is not None
+    sim.t0 = time.time() - 5.0         # burst window
+    hot = b.band_measurement(sim.capture(N), SR, 20.0)
+    assert hot is not None
+    assert hot["energy"] - quiet["energy"] > 15.0, (quiet, hot)
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):

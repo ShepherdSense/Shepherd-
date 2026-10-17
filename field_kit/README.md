@@ -64,6 +64,58 @@ startup. Full zero-click node pickup activates with that driver; this
 kit gets the app installed, the nodes flashed, and discovery staged, so
 when the driver lands the nodes appear with no further config.
 
+
+## Secured ZMeta link (tactical → operational)
+
+Shepherd works at the tactical level; a ZMeta gateway fuses detections
+across meshes at the operational/strategic level. The link between them
+**must** be secured — `zmeta_secure/` has everything:
+
+1. Double-click **`NEW_MESH_KEY.bat`** on the mesh PC to generate its
+   WireGuard keypair (private key never leaves that PC).
+2. Send only the `.pub` file to the gateway operator.
+3. Operator adds a `[Peer]` block to the gateway config and registers the
+   mesh in `PEERS.md` (tunnel IP ↔ platform ID binding).
+4. In the app: Settings → ZMeta export → point host at the tunnel
+   address, tick "link secured".
+
+Full architecture: `docs/zmeta_deployment.md` in the repo.
+
+## Passive radar (R&D prototype)
+
+`passive_radar/` is an offline research prototype — passive coherent
+location using broadcast illuminators (FM/DVB-T), receive-only, with a
+synthetic demo. Not a field sensor; honest-scope notes in its README.
+
+## LoRa nodes (two ways in)
+
+Whatever LoRa hardware is on hand works as a Shepherd node:
+
+**A. Meshtastic devices (no flashing).** In the app: add radio →
+MESHTASTIC → enter the node's LAN IP (or 127.0.0.1 for a USB-bridged
+node). "Find radios on LAN" auto-detects them. Nodes appear on the map
+from their mesh GPS; you get presence + coarse link health. USB-serial
+nodes go through the standard serial-to-TCP bridge.
+
+**B. ESP32 + SX1276 tripwire nodes (flash once).** For real tripwire
+sensing at LoRa range:
+1. Double-click `FLASH_LORA_GATEWAY.bat` (gateway ESP32) and
+   `FLASH_LORA_NODE.bat` (each node ESP32) — pre-compiled firmware in
+   `thumbdrive/firmware_lora/`.
+2. Join the `Shepherd-LoRa-XXXX` AP from the Shepherd PC
+   (password `shepherd-field`).
+3. In the app: add radio → ESP32 NODE. Detections stream in, zero config.
+
+The node senses with WiFi (edge tripwire) and uses LoRa purely as
+backhaul — compact binary packets, ~22 bytes, beacons every 30 s.
+Region is a compile flag (default US 915 MHz). Sources:
+`esp32/lora_node/`, `esp32/lora_gateway/`. Full spec:
+`docs/lora_nodes_spec.md` in the repo.
+
+**Honest scope:** Meshtastic = coarse presence/health (minute-scale
+telemetry), not tripwire-grade. LoRa range is km-class line-of-sight,
+less in clutter/urban; the backhaul carries detections only.
+
 ## Honest notes
 
 - Windows blocks true USB auto-run (since Win 7, for security). The one

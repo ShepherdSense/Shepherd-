@@ -47,12 +47,19 @@
  *   beacon: {"type":"beacon","node":"SHN-XXXX","ip":"192.168.4.1","ch":6,
  *            "fps":42,"events":3,"uptime_s":1234,
  *            "sensors":["wifi","ble","nrf24"],"ble_seen":5,
- *            "lat":12.345678,"lon":-45.123456,"pps":1}
- *            (lat/lon 0,0 and pps 0 when no GPS fix)
+ *            "lat":12.345678,"lon":-45.123456,"pps":1,
+ *            "rdrop":0,"rch_warn":0}
+ *            (lat/lon 0,0 and pps 0 when no GPS fix/lock; rdrop counts
+ *            relay packets dropped (oversize/queue-full/send-fail);
+ *            rch_warn 1 = AP channel != relay_ch pref)
  *   event:  {"type":"event","node":"SHN-XXXX","sensor":"wifi","t0":1234,
  *            "t_us":1234567890123,"dur_s":5.2,"depth_db":6.1,
  *            "class":"PASSING","conf":0.7,"detail":""}
- *            (t_us = microsecond clock, PPS-disciplined when GPS present)
+ *            (t_us = microsecond clock: UTC-epoch-aligned when GPS locked
+ *            (pps:1), node-local boot-relative otherwise — never compare
+ *            t_us across unlocked nodes. MOTION events carry
+ *            "context":true; consumers must filter on sensor+class or
+ *            the context flag, never on conf alone.)
  *   relay (ESP-NOW only, never on UDP):
  *            {"type":"relay","id":12345,"ttl":4,"ev":{...event...}}
  *
@@ -69,7 +76,9 @@
  *     (rising edge). NEO-M8N @9600 baud. Optional — silent when absent.
  *   IMU (IMU_ON): MPU6050 SDA=32 SCL=33, AD0 -> GND (addr 0x68), 3.3V.
  *   ESP-NOW relay: no extra wiring. All relaying nodes MUST share the
- *     same AP channel (prefs "channel", default 6).
+ *     same AP channel (prefs "channel", default 6). Set the "relay_ch"
+ *     pref to flag a mismatch: "rch_warn":1 appears in beacons and the
+ *     host app should surface it (a mismatch is a silent mesh island).
  *
  * Polarity: nrf24 and cc110 report ENERGY, so an emitter appearing is a
  * rise and fires an event. The wifi channel reports -RSSI (a link dip is
@@ -96,6 +105,7 @@
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include "esp_wifi.h"
+#include "driver/gpio.h"   // gpio_pullup_en for the floating GPS RX pin
 #ifdef ESPNOW_RELAY
 #include <esp_now.h>
 #endif
@@ -143,6 +153,9 @@ WebServer server(STATUS_PORT);
 WiFiUDP udp;
 
 char nodeId[16] = "SHN-????";
+// Operator callsign ("RAPTOR-1"), broadcast in beacons. Set from the
+// status page (/callsign?c=...), stored in Preferences.
+char nodeCallsign[17] = "";
 uint32_t bootMs = 0;
 uint32_t eventCount = 0;
 float lastWifiMetric = 0;
@@ -152,24 +165,77 @@ char sensorList[128] = "wifi,ble";
 
 // ---------------- microsecond event clock (PPS-disciplined) ----------------
 // A GPS PPS rising edge marks an exact second boundary. Between edges we
-// interpolate with micros(). With no GPS (no edges ever seen) this is
-// just micros() — same clock, undisciplined.
+// interpolate with micros(). With no GPS (no edges ever seen) this is a
+// 64-bit wrap-extended micros() — same rate, undisciplined.
+//
+// Lock discipline (M8): ppsLocked is true only after 3 consecutive
+// ~1 s-spaced edges, and drops if no edge arrives for >2.5 s. A single
+// spurious edge (e.g. from the GPIO27 pull-up at boot on a floating pin)
+// can therefore never read as "locked".
+//
+// Epoch (M9): each folded edge advances the clock by exactly 1 s. While
+// locked, every valid $GxRMC snaps the clock to the UTC epoch — the RMC
+// timestamp labels the second whose PPS edge fired most recently
+// (u-blox sends PPS at top-of-second, then the sentence within the same
+// second). Two GPS-locked nodes thus share the UTC epoch and their t_us
+// values ARE comparable. Without lock, t_us is node-local monotonic
+// (boot-relative) and MUST NOT be compared across nodes.
 volatile uint32_t ppsEdgeMicros = 0;
 volatile uint32_t ppsEdges = 0;
 static uint32_t ppsSeen = 0;
 static uint64_t ppsBaseUs = 0;      // disciplined time at the last edge
 static uint32_t ppsBaseMicros = 0;  // micros() value at the last edge
+static uint32_t ppsLockN = 0;       // consecutive sane-spaced edges
+static uint32_t ppsPrevEdgeMicros = 0;
+static uint32_t ppsLastEdgeMs = 0;  // millis() at the last folded edge
+static bool ppsLocked = false;
+portMUX_TYPE g_ppsMux = portMUX_INITIALIZER_UNLOCKED;
 
 void IRAM_ATTR ppsIsr() {
   ppsEdgeMicros = micros();
   ppsEdges++;
 }
 
+// micros() extended to 64 bits across the ~71 min wrap (M7). Must run at
+// least once per wrap period; gpsPoll() calls it every loop iteration.
+uint64_t micros64() {
+  static uint32_t last = 0;
+  static uint64_t high = 0;
+  uint32_t r = micros();
+  if (r < last) high += 0x100000000ULL;
+  last = r;
+  return high | r;
+}
+
+// Fold newly seen PPS edges into the disciplined clock. Loop context.
+static void ppsFold() {
+  // seqlock: the ISR may fire between the two volatile reads
+  uint32_t e1, em, e2;
+  do { e1 = ppsEdges; em = ppsEdgeMicros; e2 = ppsEdges; } while (e1 != e2);
+  if (e1 == ppsSeen) return;
+  uint32_t gap = em - ppsPrevEdgeMicros;      // wrap-safe, microseconds
+  bool sane = (ppsSeen > 0) && gap >= 700000UL && gap <= 1500000UL;
+  ppsLockN = sane ? ppsLockN + 1 : 1;
+  ppsPrevEdgeMicros = em;
+  if (ppsLockN >= 3) ppsLocked = true;
+  portENTER_CRITICAL(&g_ppsMux);
+  if (ppsSeen == 0) ppsBaseUs = (uint64_t)em;  // M6: seed from the first
+                                              // edge, never accumulate from 0
+  else ppsBaseUs += (uint64_t)(e1 - ppsSeen) * 1000000ULL;
+  ppsBaseMicros = em;
+  portEXIT_CRITICAL(&g_ppsMux);
+  ppsSeen = e1;
+  ppsLastEdgeMs = millis();
+}
+
 // Microsecond node clock. Call from loop/task context, not from the ISR.
 uint64_t nodeNowUs() {
-  if (ppsSeen == 0) return (uint64_t)micros();
-  uint32_t now = micros();
-  return ppsBaseUs + (uint64_t)(now - ppsBaseMicros);  // wrap-safe
+  if (ppsSeen == 0) return micros64();   // M7: wrap-extended, no GPS
+  uint64_t base; uint32_t baseM;
+  portENTER_CRITICAL(&g_ppsMux);          // 64-bit torn-read guard
+  base = ppsBaseUs; baseM = ppsBaseMicros;
+  portEXIT_CRITICAL(&g_ppsMux);
+  return base + (uint64_t)(micros() - baseM);  // wrap-safe delta
 }
 
 // ---------------- generic MAD channel ----------------
@@ -250,7 +316,8 @@ struct UartCh { char name[16]; SensorCh ch; bool used = false; };
 UartCh uartCh[4];
 
 void sendEvent(const char *sensor, float durS, float depthDb,
-               const char *cls, float conf, const char *detail);  // fwd
+               const char *cls, float conf, const char *detail,
+               bool context = false);  // fwd
 uint32_t eventT0glob = 0;
 uint64_t eventT0usGlob = 0;
 
@@ -277,8 +344,9 @@ void relayFlush();
 #endif
 
 void sendEvent(const char *sensor, float durS, float depthDb,
-               const char *cls, float conf, const char *detail) {
-  char buf[320], sSafe[32], dSafe[48];
+               const char *cls, float conf, const char *detail,
+               bool context) {
+  char buf[352], sSafe[32], dSafe[48];
   jsonSafe(sSafe, sizeof(sSafe), sensor);
   jsonSafe(dSafe, sizeof(dSafe), detail ? detail : "");
   // eventT0glob/eventT0usGlob are the event's START, set by the caller
@@ -287,9 +355,9 @@ void sendEvent(const char *sensor, float durS, float depthDb,
   snprintf(buf, sizeof(buf),
     "{\"type\":\"event\",\"node\":\"%s\",\"sensor\":\"%s\",\"t0\":%lu,"
     "\"t_us\":%llu,\"dur_s\":%.1f,\"depth_db\":%.1f,\"class\":\"%s\","
-    "\"conf\":%.2f,\"detail\":\"%s\"}",
+    "\"conf\":%.2f,\"detail\":\"%s\"%s}",
     nodeId, sSafe, (unsigned long)t0, (unsigned long long)eventT0usGlob,
-    durS, depthDb, cls, conf, dSafe);
+    durS, depthDb, cls, conf, dSafe, context ? ",\"context\":true" : "");
   udp.beginPacket(IPAddress(192, 168, 4, 255), BEACON_PORT);
   udp.write((uint8_t *)buf, strlen(buf));
   udp.endPacket();
@@ -480,10 +548,20 @@ void uartPoll(uint32_t now) {
 #ifdef LD2450_ON
 // ---------------- LD2450 24 GHz FMCW radar ----------------
 // Hi-Link LD2450 on UART2 @256000 baud (EITHER/OR with the text SENSOR
-// protocol above). Binary frames: AA FF 03 00, then 3 x 6-byte targets
-// (X_lo X_hi Y_lo Y_hi SPD_lo SPD_hi, signed 16-bit, millimetres),
-// then 55 CC. X==0 && Y==0 means "no target in this slot".
+// protocol above). Binary frames: AA FF 03 00, then 3 x 8-byte targets
+// (X_lo X_hi Y_lo Y_hi SPD_lo SPD_hi RES_lo RES_hi, signed 16-bit,
+// millimetres; bytes 6-7 are distance-resolution, unused here),
+// then 55 CC. X==0 && Y==0 means "no target in this slot" — this
+// conflates an empty slot with a target exactly at the origin, but the
+// origin is inside the radar housing, so it is negligible in practice.
 // Wiring: LD_TX -> GPIO16, LD_RX -> GPIO17, 5V, GND (3.3V logic).
+//
+// H1 NOTE: the 24-byte (3x8) target block is PER CODE ANALYSIS of the
+// LD2450 protocol — UNVERIFIED against hardware (no UART dump was
+// available). Field check: capture raw UART2 @256000 hex; between the
+// "03 00" header and the trailing "55 CC" there must be exactly 24 bytes
+// (3 targets x 8). If the "frame sync failing" warning below fires, the
+// layout assumption is wrong — send the hex dump back for re-analysis.
 struct LdSlot { bool present = false; float x = 0, y = 0;
                 uint32_t lastReport = 0; };
 LdSlot ldSlots[3];
@@ -499,8 +577,9 @@ void ld2450Report(int slot, float xm, float ym, uint32_t now,
 
 void ld2450Frame(uint8_t *d, uint32_t now) {
   for (int s = 0; s < 3; s++) {
-    int16_t x = (int16_t)(d[s * 6] | (d[s * 6 + 1] << 8));
-    int16_t y = (int16_t)(d[s * 6 + 2] | (d[s * 6 + 3] << 8));
+    uint8_t *t = d + s * 8;   // 8 bytes/target; bytes 6-7 (dist-res) skipped
+    int16_t x = (int16_t)(t[0] | (t[1] << 8));
+    int16_t y = (int16_t)(t[2] | (t[3] << 8));
     bool present = !(x == 0 && y == 0);
     float xm = x / 1000.0f, ym = y / 1000.0f;
     LdSlot &sl = ldSlots[s];
@@ -520,23 +599,44 @@ void ld2450Frame(uint8_t *d, uint32_t now) {
 }
 
 void ld2450Poll(uint32_t now) {
-  // byte-wise frame sync: AA FF 03 00 ...18 bytes... 55 CC
+  // byte-wise frame sync: AA FF 03 00 ...24 bytes... 55 CC
   static uint8_t state = 0;
-  static uint8_t data[18];
+  static uint8_t data[24];
   static int di = 0;
+  static uint32_t syncFails = 0;   // consecutive frame-sync failures (H1)
   while (Serial2.available()) {
     uint8_t b = (uint8_t)Serial2.read();
     switch (state) {
       case 0: state = (b == 0xAA) ? 1 : 0; break;
-      case 1: state = (b == 0xFF) ? 2 : (b == 0xAA ? 1 : 0); break;
-      case 2: state = (b == 0x03) ? 3 : 0; break;
-      case 3: state = (b == 0x00) ? 4 : 0; di = 0; break;
-      case 4: data[di++] = b; if (di >= 18) state = 5; break;
-      case 5: state = (b == 0x55) ? 6 : 0; break;
+      case 1:
+        if (b == 0xFF) state = 2;
+        else { state = (b == 0xAA) ? 1 : 0; syncFails++; }
+        break;
+      case 2:
+        if (b == 0x03) state = 3;
+        else { state = 0; syncFails++; }
+        break;
+      case 3:
+        if (b == 0x00) { state = 4; di = 0; }
+        else { state = 0; syncFails++; }
+        break;
+      case 4: data[di++] = b; if (di >= 24) state = 5; break;
+      case 5:
+        if (b == 0x55) state = 6;
+        else { state = 0; syncFails++; }
+        break;
       case 6:
-        if (b == 0xCC) ld2450Frame(data, now);
+        if (b == 0xCC) { ld2450Frame(data, now); syncFails = 0; }
+        else syncFails++;
         state = 0;
         break;
+    }
+    if (syncFails == 51) {
+      // H1 runtime sanity check: 50+ consecutive frames failed to sync —
+      // with the 24-byte layout assumption this means wrong wiring/baud
+      // OR a wrong layout (see the H1 NOTE above). Fires once per streak.
+      Serial.println("LD2450: frame sync failing — check wiring/baud, "
+                     "parser expects 24-byte target block");
     }
   }
 }
@@ -546,7 +646,11 @@ void ld2450Poll(uint32_t now) {
 // NEO-M8N-class module on Serial1 (RX=25 <- GPS TX, TX=26 -> GPS RX,
 // PPS=27 rising). Always compiled; with no module attached nothing
 // arrives, no PPS edges are ever seen, and the node silently uses the
-// local micros() clock with lat/lon 0,0 and pps 0 in beacons.
+// local wrap-extended micros() clock with lat/lon 0,0 and pps 0 in
+// beacons. Position comes from $GxGGA (any talker: GP/GN/GL/GB/GA,
+// checksum-verified); the UTC epoch comes from $GxRMC (see M9 note in
+// the clock section above). pps:1 in beacons means LOCKED (3 consecutive
+// ~1 s-spaced edges), not merely "an edge was seen once".
 char nmeaLine[96]; int nmeaPos = 0;
 double gpsLat = 0, gpsLon = 0;
 bool gpsFix = false;
@@ -557,29 +661,60 @@ static double nmeaToDeg(double v) {
   return deg + minutes / 60.0;
 }
 
+// $GPGGA/$GNGGA/$GLGGA/$GBGGA/$GAGGA (and the RMC equivalents): talker
+// letter P/N/L/B/A followed by the sentence kind.
+static bool nmeaIs(const char *line, const char *kind) {
+  return line[0] == '$' && line[1] == 'G' && strchr("PNLBA", line[2]) &&
+         strncmp(line + 3, kind, 3) == 0 && line[6] == ',';
+}
+
+// Verify the NMEA *HH checksum when the sentence carries one; sentences
+// with no '*' are accepted as before.
+static bool nmeaChecksumOk(const char *line) {
+  const char *star = strchr(line, '*');
+  if (!star) return true;
+  uint8_t cs = 0;
+  for (const char *p = line + 1; p < star; p++) cs ^= (uint8_t)*p;
+  unsigned v = 0;
+  if (sscanf(star + 1, "%2x", &v) != 1) return false;
+  return (uint8_t)v == cs;
+}
+
+// Seconds since 1970-01-01T00:00:00Z (Howard Hinnant's days_from_civil).
+static uint64_t utcEpoch(int hh, int mm, int ss, int dd, int mo, int yyyy) {
+  int y = yyyy - (mo <= 2);
+  int64_t era = (y >= 0 ? y : y - 399) / 400;
+  unsigned yoe = (unsigned)(y - era * 400);
+  unsigned doy = (153 * (mo + (mo > 2 ? -3 : 9)) + 2) / 5 + dd - 1;
+  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  int64_t days = era * 146097 + (int64_t)doe - 719468;
+  return (uint64_t)days * 86400ULL + (uint64_t)(hh * 3600 + mm * 60 + ss);
+}
+
 void gpsPoll() {
-  // Fold newly arrived PPS edges into the disciplined clock.
-  uint32_t e = ppsEdges;
-  if (e != ppsSeen) {
-    ppsBaseUs += (uint64_t)(e - ppsSeen) * 1000000ULL;
-    ppsBaseMicros = ppsEdgeMicros;
-    ppsSeen = e;
+  micros64();   // keep the wrap extension fresh (M7)
+  ppsFold();    // PPS discipline (M6/M8)
+  if (ppsLocked && (int32_t)(millis() - ppsLastEdgeMs) > 2500) {
+    ppsLocked = false;   // GPS died mid-run: stop claiming lock (M8)
+    ppsLockN = 0;
   }
-  // NMEA: we only need $GxGGA for position + fix quality.
+  // NMEA: $GxGGA for position + fix quality, $GxRMC for the UTC epoch.
   while (Serial1.available()) {
     char c = (char)Serial1.read();
     if (c == '\n' || nmeaPos >= (int)sizeof(nmeaLine) - 1) {
       nmeaLine[nmeaPos] = 0; nmeaPos = 0;
-      if (strncmp(nmeaLine, "$GPGGA,", 7) == 0 ||
-          strncmp(nmeaLine, "$GNGGA,", 7) == 0) {
-        // fields: 0=id 1=time 2=lat 3=N/S 4=lon 5=E/W 6=quality
-        const char *f[8] = {0};
-        int fi = 0;
-        for (char *p = nmeaLine; *p && fi < 8; p++) {
-          if (*p == ',') { *p = 0; f[fi++] = p + 1; }
-        }
-        // f[1]=lat f[2]=N/S f[3]=lon f[4]=E/W f[5]=quality
-        // (f[0] is the text after the first comma)
+      if (!nmeaChecksumOk(nmeaLine)) continue;
+      bool gga = nmeaIs(nmeaLine, "GGA");
+      bool rmc = nmeaIs(nmeaLine, "RMC");
+      if (!gga && !rmc) continue;
+      const char *f[12] = {0};
+      int fi = 0;
+      for (char *p = nmeaLine; *p && fi < 12; p++) {
+        if (*p == ',') { *p = 0; f[fi++] = p + 1; }
+      }
+      // f[0] is the text after the first comma.
+      if (gga) {
+        // f[0]=time f[1]=lat f[2]=N/S f[3]=lon f[4]=E/W f[5]=quality
         if (fi >= 6 && f[1] && f[2] && f[3] && f[4] && f[5] &&
             *f[1] && *f[3]) {
           int q = atoi(f[5]);
@@ -590,8 +725,29 @@ void gpsPoll() {
             if (*f[4] == 'W') lo = -lo;
             gpsLat = la; gpsLon = lo; gpsFix = true;
           } else {
-            gpsFix = false;
+            // M10: fix lost — zero the coords so beacons stop
+            // advertising a stale position (docs say 0,0 = no fix).
+            gpsFix = false; gpsLat = 0; gpsLon = 0;
           }
+        }
+      } else if (rmc && fi >= 10 && f[0] && f[1] && f[9] &&
+                 *f[0] && *f[9] && *f[1] == 'A') {
+        // M9: f[0]=hhmmss.ss f[9]=ddmmyy. Snap the disciplined clock to
+        // the UTC epoch. The RMC timestamp labels the second whose PPS
+        // edge fired most recently (u-blox: PPS at top-of-second, then
+        // the sentence). Gated on ppsLocked so a lone spurious edge can
+        // never epoch-label a free-running clock. Worst case on modules
+        // that emit RMC before the edge: a fixed 1 s offset.
+        int hh, mm, ss, dd, mo, yy;
+        if (sscanf(f[0], "%2d%2d%2d", &hh, &mm, &ss) == 3 &&
+            sscanf(f[9], "%2d%2d%2d", &dd, &mo, &yy) == 3 &&
+            hh < 24 && mm < 60 && ss < 60 &&
+            dd >= 1 && dd <= 31 && mo >= 1 && mo <= 12) {
+          int fullY = (yy >= 80) ? 1900 + yy : 2000 + yy;
+          uint64_t epoch = utcEpoch(hh, mm, ss, dd, mo, fullY);
+          portENTER_CRITICAL(&g_ppsMux);
+          if (ppsLocked) ppsBaseUs = epoch * 1000000ULL;
+          portEXIT_CRITICAL(&g_ppsMux);
         }
       }
     } else if (c != '\r') nmeaLine[nmeaPos++] = c;
@@ -612,13 +768,31 @@ uint8_t relayBcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 uint32_t relaySeen[RELAY_SEEN_N];
 int relaySeenN = 0, relaySeenI = 0;
 char relayOut[4][352]; int relayOutN = 0;
+bool relayOk = false;        // set only after clean init: no half-alive relay
+bool relayChWarn = false;    // AP channel != relay_ch pref (M12)
+uint32_t relayDrops = 0;     // H5/LOW: dropped packets (oversize/queue/send)
 
-static uint32_t relayId(const char *node, const char *sensor, uint32_t t0) {
+// H4: the ESP-NOW receive callback runs on the WiFi task, where lwIP/UDP
+// calls and the shared relay state are not safe to touch. The callback
+// therefore only copies raw datagrams into this ring under a critical
+// section; relayPump() (loop context, below) does ALL parsing, dedup,
+// UDP re-emit and ESP-NOW forwarding.
+struct RelayRxPkt { char data[256]; uint8_t len; };
+RelayRxPkt relayRx[8];
+volatile uint8_t relayRxHead = 0, relayRxTail = 0;
+portMUX_TYPE g_relayMux = portMUX_INITIALIZER_UNLOCKED;
+
+// M11: the per-node eventCount sequence is hashed into the dedup ID, so
+// distinct events in the same 1 s t0 bucket (e.g. 3 LD2450 targets)
+// no longer collide.
+static uint32_t relayId(const char *node, const char *sensor, uint32_t t0,
+                        uint32_t seq) {
   uint32_t h = 2166136261UL;   // FNV-1a
   const char *p;
   for (p = node; *p; p++) { h ^= (uint8_t)*p; h *= 16777619UL; }
   for (p = sensor; *p; p++) { h ^= (uint8_t)*p; h *= 16777619UL; }
   for (int i = 0; i < 4; i++) { h ^= (t0 >> (i * 8)) & 0xFF; h *= 16777619UL; }
+  for (int i = 0; i < 4; i++) { h ^= (seq >> (i * 8)) & 0xFF; h *= 16777619UL; }
   return h;
 }
 static bool relaySeenId(uint32_t id) {
@@ -631,16 +805,43 @@ static void relayRemember(uint32_t id) {
   if (relaySeenN < RELAY_SEEN_N) relaySeenN++;
 }
 static void relayQueuePkt(uint32_t id, int ttl, const char *evJson) {
-  if (relayOutN >= 4) return;   // saturated: drop, don't block
-  snprintf(relayOut[relayOutN], sizeof(relayOut[0]),
-           "{\"type\":\"relay\",\"id\":%lu,\"ttl\":%d,\"ev\":%s}",
-           (unsigned long)id, ttl, evJson);
-  relayOutN++;
+  if (!relayOk) return;
+  if (relayOutN >= 4) { relayDrops++; return; }  // saturated: drop, count it
+  char ev[336];
+  strncpy(ev, evJson, sizeof(ev) - 1); ev[sizeof(ev) - 1] = 0;
+  // H5: ESP-NOW payloads are capped at 250 bytes. Shrink the inner event
+  // JSON first: drop the detail field preferentially, then hard-truncate
+  // at a field boundary (the event JSON is flat, so cutting at the last
+  // comma stays valid). Anything that still cannot fit is dropped and
+  // counted in relayDrops (surfaced in beacons).
+  for (;;) {
+    char pkt[400];
+    int n = snprintf(pkt, sizeof(pkt),
+             "{\"type\":\"relay\",\"id\":%lu,\"ttl\":%d,\"ev\":%s}",
+             (unsigned long)id, ttl, ev);
+    if (n > 0 && n < 250) {
+      strcpy(relayOut[relayOutN], pkt); relayOutN++;
+      return;
+    }
+    char *d = strstr(ev, "\"detail\":\"");
+    if (d) {
+      char *e = strchr(d + 10, '"');
+      if (e) { memmove(d + 10, e, strlen(e) + 1); continue; }  // detail -> ""
+    }
+    int keep = 250 - 64;   // wrapper budget
+    char *c = NULL;
+    if (keep > 16) { ev[keep] = 0; c = strrchr(ev, ','); }
+    if (c && c > ev + 8) { *c = 0; strcat(ev, "}"); continue; }
+    relayDrops++;
+    return;
+  }
 }
 // Called from sendEvent for every LOCAL event: remember the id (so the
 // mesh echo of our own event is dropped) and queue it for relay.
+// eventCount is the pre-increment sequence, unique per local event.
 void relayNoteLocal(const char *eventJson, const char *sensor, uint32_t t0) {
-  uint32_t id = relayId(nodeId, sensor, t0);
+  if (!relayOk) return;
+  uint32_t id = relayId(nodeId, sensor, t0, eventCount);
   if (relaySeenId(id)) return;
   relayRemember(id);
   relayQueuePkt(id, RELAY_TTL, eventJson);
@@ -668,32 +869,69 @@ static bool relayExtract(const char *p, uint32_t &id, int &ttl,
   ev = b; evLen = (int)(q - b + 1);
   return true;
 }
+// H4: WiFi-task context — copy bytes only, never parse or send here.
 void onRelayRecv(const uint8_t *mac, const uint8_t *data, int len) {
   (void)mac;
-  if (len <= 0 || len >= 512) return;
-  static char tmp[512];
-  memcpy(tmp, data, len); tmp[len] = 0;
-  uint32_t id; int ttl; const char *ev; int evLen;
-  if (!relayExtract(tmp, id, ttl, ev, evLen)) return;
-  if (relaySeenId(id)) return;    // already forwarded: drop
-  relayRemember(id);
-  // Re-emit on this node's LAN so the Shepherd host joined here sees it.
-  udp.beginPacket(IPAddress(192, 168, 4, 255), BEACON_PORT);
-  udp.write((uint8_t *)ev, evLen);
-  udp.endPacket();
-  // Forward with decremented TTL.
-  if (ttl > 1 && relayOutN < 4) {
-    char evJson[320];
-    int n = evLen < (int)sizeof(evJson) - 1 ? evLen : (int)sizeof(evJson) - 1;
-    memcpy(evJson, ev, n); evJson[n] = 0;
-    relayQueuePkt(id, ttl - 1, evJson);
+  if (!relayOk) return;
+  if (len <= 0) return;
+  if (len > 250) { relayDrops++; return; }   // over the ESP-NOW cap: junk
+  portENTER_CRITICAL(&g_relayMux);
+  uint8_t nh = (relayRxHead + 1) % 8;
+  if (nh == relayRxTail) {          // ring full: drop, count it
+    portEXIT_CRITICAL(&g_relayMux);
+    relayDrops++;
+    return;
+  }
+  memcpy(relayRx[relayRxHead].data, data, len);
+  relayRx[relayRxHead].len = (uint8_t)len;
+  relayRxHead = nh;
+  portEXIT_CRITICAL(&g_relayMux);
+}
+// H4: loop context — drain the RX ring: parse, dedup, UDP re-emit,
+// ESP-NOW forward. TTL/echo-suppression logic unchanged, just relocated.
+void relayPump() {
+  if (!relayOk) return;
+  for (;;) {
+    char tmp[256]; uint8_t len;
+    portENTER_CRITICAL(&g_relayMux);
+    if (relayRxHead == relayRxTail) { portEXIT_CRITICAL(&g_relayMux); break; }
+    uint8_t t = relayRxTail;
+    len = relayRx[t].len;
+    memcpy(tmp, relayRx[t].data, len); tmp[len] = 0;
+    relayRxTail = (t + 1) % 8;
+    portEXIT_CRITICAL(&g_relayMux);
+    uint32_t id; int ttl; const char *ev; int evLen;
+    if (!relayExtract(tmp, id, ttl, ev, evLen)) continue;
+    if (relaySeenId(id)) continue;    // already forwarded: drop
+    relayRemember(id);
+    // Re-emit on this node's LAN so the Shepherd host joined here sees
+    // it — but not when the TTL is exhausted.
+    if (ttl > 0) {
+      udp.beginPacket(IPAddress(192, 168, 4, 255), BEACON_PORT);
+      udp.write((uint8_t *)ev, evLen);
+      udp.endPacket();
+    }
+    // Forward with decremented TTL.
+    if (ttl > 1 && relayOutN < 4) {
+      char evJson[336];
+      int n = evLen < (int)sizeof(evJson) - 1 ? evLen : (int)sizeof(evJson) - 1;
+      memcpy(evJson, ev, n); evJson[n] = 0;
+      relayQueuePkt(id, ttl - 1, evJson);
+    }
   }
 }
 void relayFlush() {
-  if (relayOutN == 0) return;
+  if (!relayOk || relayOutN == 0) return;
   wifiSniff(false);   // radio time-slice, like the BLE scan
-  for (int i = 0; i < relayOutN; i++)
-    esp_now_send(relayBcast, (uint8_t *)relayOut[i], strlen(relayOut[i]));
+  for (int i = 0; i < relayOutN; i++) {
+    // H5: check the send result; ESP_ERR_ESPNOW_ARG fires on oversize
+    // payloads, which relayQueuePkt already prevents.
+    if (esp_now_send(relayBcast, (uint8_t *)relayOut[i],
+                     strlen(relayOut[i])) != ESP_OK) {
+      relayDrops++;
+      Serial.println("ESP-NOW send failed; packet dropped");
+    }
+  }
   relayOutN = 0;
   wifiSniff(true);
 }
@@ -712,6 +950,17 @@ void relayInit(char *sl) {
     Serial.println("ESP-NOW peer add failed; relay off");
     return;
   }
+  // M12: esp_now_add_peer succeeds regardless of channel, so a channel
+  // mismatch is a silent mesh island. Compare against the optional
+  // "relay_ch" pref and flag it: "rch_warn":1 in beacons + a serial
+  // warning. The Shepherd host app should surface rch_warn prominently.
+  int rch = prefs.getInt("relay_ch", 0);
+  if (rch > 0 && WiFi.channel() != rch) {
+    relayChWarn = true;
+    Serial.printf("ESP-NOW relay: AP ch %d != relay_ch pref %d; mesh island!\n",
+                  WiFi.channel(), rch);
+  }
+  relayOk = true;
   strcat(sl, ",\"relay\"");
   Serial.println("ESP-NOW relay on");
 }
@@ -738,6 +987,10 @@ bool imuInit() {
   Wire.requestFrom(MPU6050_ADDR, (uint8_t)1);
   if (!Wire.available() || Wire.read() != 0x68) return false;
   imuRegWrite(0x6B, 0x00);                // PWR_MGMT_1: wake
+  // LOW: the MPU6050 samples internally at 1 kHz; without the digital
+  // low-pass filter that aliases straight into our 10 Hz poll. DLPF
+  // 44 Hz (CONFIG=0x03) keeps the motion-energy channel honest.
+  imuRegWrite(0x1A, 0x03);                // CONFIG: DLPF 44 Hz
   return true;
 }
 // Returns motion energy in g, or -1 on read failure.
@@ -760,44 +1013,78 @@ void imuSample(uint32_t now) {
   if (chImu.push(m, now, durS, depth, cls)) {
     eventT0glob = chImu.t0;
     eventT0usGlob = chImu.t0us;
-    sendEvent("imu", durS, depth, "MOTION", 0.50f, "");
+    // M13: MOTION is context, not intrusion — mark it explicitly.
+    // Consumer contract: the app must filter on sensor+class (or this
+    // context flag), never on conf alone (0.50 here sits near BLE's
+    // 0.55 NEW_DEVICE hint).
+    sendEvent("imu", durS, depth, "MOTION", 0.50f, "", true);
   }
 }
 #endif
 
 // ---------------- beacons / status ----------------
 void sendBeacon(float fps) {
-  char buf[448];
+  char buf[560];
+#ifdef ESPNOW_RELAY
+  uint32_t rd = relayDrops;      // H5/LOW: relay drop counter
+  int rcw = relayChWarn ? 1 : 0; // M12: AP channel != relay_ch pref
+#else
+  uint32_t rd = 0;
+  int rcw = 0;
+#endif
   snprintf(buf, sizeof(buf),
-    "{\"type\":\"beacon\",\"node\":\"%s\",\"ip\":\"%s\",\"ch\":%d,"
+    "{\"type\":\"beacon\",\"node\":\"%s\",\"callsign\":\"%s\",\"ip\":\"%s\",\"ch\":%d,"
     "\"fps\":%.0f,\"events\":%lu,\"uptime_s\":%lu,"
     "\"sensors\":[%s],\"ble_seen\":%d,"
-    "\"lat\":%.6f,\"lon\":%.6f,\"pps\":%d}",
-    nodeId, WiFi.softAPIP().toString().c_str(), WiFi.channel(), fps,
+    "\"lat\":%.6f,\"lon\":%.6f,\"pps\":%d,\"rdrop\":%lu,\"rch_warn\":%d}",
+    nodeId, nodeCallsign, WiFi.softAPIP().toString().c_str(), WiFi.channel(), fps,
     (unsigned long)eventCount, (unsigned long)((millis() - bootMs) / 1000),
-    sensorList, bleN, gpsLat, gpsLon, ppsSeen > 0 ? 1 : 0);
+    sensorList, bleN, gpsLat, gpsLon, ppsLocked ? 1 : 0,
+    (unsigned long)rd, rcw);
   udp.beginPacket(IPAddress(192, 168, 4, 255), BEACON_PORT);
   udp.write((uint8_t *)buf, strlen(buf));
   udp.endPacket();
 }
 
 void handleRoot() {
-  char html[1600];
+  char html[1900];
   snprintf(html, sizeof(html),
     "<html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
     "<style>body{background:#111;color:#c9a7eb;font-family:sans-serif;padding:24px}"
-    "h1{color:#a855f7}.card{background:#1c1c22;padding:16px;border-radius:12px;margin:12px 0}</style>"
+    "h1{color:#a855f7}.card{background:#1c1c22;padding:16px;border-radius:12px;margin:12px 0}"
+    "input{background:#111;color:#c9a7eb;border:1px solid #a855f7;border-radius:8px;padding:8px}"
+    "button{background:#a855f7;color:#111;border:0;border-radius:8px;padding:8px 16px}</style>"
     "</head><body><h1>Shepherd Node %s</h1>"
+    "<div class=card>Callsign: <b>%s</b><br><form action=/callsign method=get>"
+    "<input name=c maxlength=16 placeholder='RAPTOR-1' value='%s'> "
+    "<button>Set</button></form></div>"
     "<div class=card>Sensors: %s<br>Uptime %lu s &nbsp; Channel %d<br>"
     "WiFi metric %.1f dB &nbsp; BLE seen %d &nbsp; Events %lu</div>"
     "<div class=card>GPS: %s &nbsp; PPS: %s<br>Lat %.6f Lon %.6f</div>"
     "<div class=card>Join this AP from the Shepherd device.<br>"
     "Beacons + events on UDP %d.</div></body></html>",
-    nodeId, sensorList, (unsigned long)((millis() - bootMs) / 1000),
+    nodeId, nodeCallsign[0] ? nodeCallsign : "(none)", nodeCallsign,
+    sensorList, (unsigned long)((millis() - bootMs) / 1000),
     WiFi.channel(), lastWifiMetric, bleN, (unsigned long)eventCount,
-    gpsFix ? "fix" : "no fix", ppsSeen > 0 ? "locked" : "free-run",
+    gpsFix ? "fix" : "no fix", ppsLocked ? "locked" : "free-run",
     gpsLat, gpsLon, BEACON_PORT);
   server.send(200, "text/html", html);
+}
+
+// /callsign?c=RAPTOR-1 — sanitized to A-Z 0-9 _ - space, max 16.
+void handleCallsign() {
+  String c = server.arg("c");
+  c.trim(); c.toUpperCase();
+  String clean;
+  for (size_t i = 0; i < c.length() && clean.length() < 16; i++) {
+    char ch = c[i];
+    if ((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ||
+        ch == '-' || ch == '_' || ch == ' ') clean += ch;
+  }
+  clean.toCharArray(nodeCallsign, sizeof(nodeCallsign));
+  prefs.putString("callsign", String(nodeCallsign));
+  server.sendHeader("Location", "/");
+  server.send(303);
 }
 
 void setup() {
@@ -812,6 +1099,8 @@ void setup() {
     nid = tmp; prefs.putString("node_id", nid);
   }
   nid.toCharArray(nodeId, sizeof(nodeId));
+  String cs = prefs.getString("callsign", "");
+  cs.toCharArray(nodeCallsign, sizeof(nodeCallsign));
   int ch = prefs.getInt("channel", DEFAULT_CH);
   String pass = prefs.getString("ap_pass", "shepherd-field");
 
@@ -854,6 +1143,10 @@ void setup() {
 
   // GPS: always wired up, silent when no module answers.
   Serial1.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
+  // LOW: Serial1 RX floats with no GPS attached. gpio_pullup_en only
+  // enables the pull-up — unlike pinMode(INPUT_PULLUP) it does not steal
+  // the pin back from the UART peripheral.
+  gpio_pullup_en((gpio_num_t)GPS_RX);
   pinMode(GPS_PPS, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(GPS_PPS), ppsIsr, RISING);
 
@@ -876,6 +1169,7 @@ void setup() {
   if (MDNS.begin(nodeId)) MDNS.addService("shepherd-node", "udp", BEACON_PORT);
   udp.begin(BEACON_PORT);
   server.on("/", handleRoot);
+  server.on("/callsign", handleCallsign);
   server.begin();
   Serial.printf("node %s ready: %s\n", nodeId, sensorList);
 }
@@ -904,6 +1198,7 @@ void loop() {
   }
 #endif
 #ifdef ESPNOW_RELAY
+  relayPump();   // H4: RX-ring processing happens here, in loop context
   if (now - lastRelayFlush > RELAY_FLUSH_MS) {
     lastRelayFlush = now;
     relayFlush();

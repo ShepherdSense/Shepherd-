@@ -405,7 +405,7 @@ class SimBackend(RadioBackend):
         self.center = 2437.0
         self.rng = np.random.default_rng(7)
         self._cap_n = 0            # total captures (drives the hop slot)
-        self._band_caps = {}       # center MHz -> completed captures
+        self._band_caps = {}       # rounded center MHz -> completed captures
 
     def tune(self, center_mhz, bw_mhz, gain_db):
         self.center = center_mhz
@@ -436,7 +436,12 @@ class SimBackend(RadioBackend):
             # capture of this band: the OFDM detector needs a calm
             # reference to recognize the lift, and this makes the
             # demo deterministic on any machine speed.
-            if (self._band_caps.get(5780.0, 0) >= 1
+            # M14: the gate reads a MHz-normalized band key. The branch
+            # above matches any center within 1 MHz of 5780 (so
+            # --stare 5780.5 enters it), but the old exact-float
+            # _band_caps.get(5780.0) key was never primed by such a
+            # stare, silently disabling the burst.
+            if (self._band_caps.get(5780, 0) >= 1
                     and (el % 150.0) < 20.0):
                 return 22.0, "wide"
             if 60.0 <= (el % 150.0) < 80.0:
@@ -476,7 +481,12 @@ class SimBackend(RadioBackend):
                       + 2.0 * np.sin(2 * np.pi * 37.0 * t))
                 x = x + (np.exp(1j * ph) * amp).astype(np.complex64)
         self._cap_n += 1
-        self._band_caps[self.center] = self._band_caps.get(self.center, 0) + 1
+        # MHz-normalized band key (round(5780.5) == 5780): a stare at any
+        # center in the 5780 branch primes the same gate the burst
+        # checks in _emitter (M14). Distinct real bands never collide
+        # after rounding (433.92->434, 915->915, 1290->1290, ...).
+        key = round(self.center)
+        self._band_caps[key] = self._band_caps.get(key, 0) + 1
         return x
 
 
@@ -560,7 +570,13 @@ def band_measurement(x, sample_rate=SAMPLE_RATE, bw_mhz=None):
 # band, so it survives gain differences).
 SIG_WINDOW_S = 30.0     # how far back the statistics look, per band
 SIG_MIN_OBS = 3         # observations needed before any hint is emitted
-SIG_HOT_DB = 10.0       # sub-band "hot" threshold above the noise floor
+SIG_HOT_DB = 12.0       # sub-band "hot" threshold above the noise floor
+                      # (measured: the worst single-bin noise excursion on
+                      # pure AWGN is ~7.6 dB over 200 trials, leaving only
+                      # ~2.4 dB headroom under 10 dB; 12 dB buys margin
+                      # against front-end spurs without touching any
+                      # scripted emitter -- the weakest, the 915 MHz
+                      # LoRa-like tone, still sits 18 dB up)
 SIG_FHSS_MIN_BINS = 3   # distinct hot sub-bands => hopping, not a tone
 SIG_FHSS_MAX_DUTY = 0.6  # no single sub-band may dominate (else: static)
 SIG_FHSS_MIN_ACTIVE = 0.3  # fraction of observations showing any hop
@@ -595,14 +611,28 @@ class SigHistory:
         self.window_s = window_s
         self.min_obs = min_obs
         self._hist = {}  # band label -> deque of (t, bins[8], energy, noise)
+        # M3: ofdm-5g latch, label -> pre-burst quiet reference. A burst
+        # that outlives the rolling window purges its own quiet
+        # reference, so the hint latches at trigger time and releases
+        # only when the band median falls back near that reference.
+        self._ofdm_latch = {}
 
     def observe(self, label, center_mhz, t, bins, energy, noise):
-        """Record one band measurement; return this band's sig_hint."""
+        """Record one band measurement; return this band's sig_hint.
+
+        The wall-clock `t` is accepted for API compatibility (tests and
+        callers may drive synthetic timelines) but no longer drives the
+        window: bookkeeping runs on the monotonic clock, so a forward
+        NTP step cannot flush the history (detector blind for seconds)
+        and a backward step cannot linger stale hints (LOW-N). The
+        packet "t" field keeps using wall-clock time, set by the caller.
+        """
         dq = self._hist.setdefault(label, deque())
-        dq.append((t, list(bins), float(energy), float(noise)))
-        while dq and t - dq[0][0] > self.window_s:
+        now = time.monotonic()
+        dq.append((now, list(bins), float(energy), float(noise)))
+        while dq and now - dq[0][0] > self.window_s:
             dq.popleft()
-        return self._classify(center_mhz, dq)
+        return self._classify(label, center_mhz, dq)
 
     @staticmethod
     def _family(center_mhz):
@@ -614,7 +644,7 @@ class SigHistory:
             return "5g"
         return None
 
-    def _classify(self, center_mhz, dq):
+    def _classify(self, label, center_mhz, dq):
         if len(dq) < self.min_obs:
             return None
         family = self._family(center_mhz)
@@ -626,21 +656,36 @@ class SigHistory:
         n = len(hots)
         duty = [sum(h[k] for h in hots) / n for k in range(8)]
         distinct = sum(1 for k in range(8) if duty[k] > 0)
-        _, _, energy, _ = dq[-1]
 
         if family == "5g":
-            # Quiet reference: the calmest floor seen in the window. A
-            # wideband burst is only recognizable against quiet the
-            # bridge has actually observed -- at startup with an
-            # already-active emitter there is no reference yet (None).
-            quiet = min(n for _, _, _, n in dq)
-            bins_now = dq[-1][1]
-            wide_hot = sum(1 for b in bins_now if b > quiet + SIG_HOT_DB)
-            # DJI O4-like: wideband OFDM lifts the whole band -- median
-            # up against the quiet floor, most sub-bands hot with it.
-            if (energy > quiet + SIG_OFDM_RISE_DB
-                    and wide_hot >= SIG_OFDM_MIN_BINS):
-                return "ofdm-5g"
+            _, _, energy, _ = dq[-1]  # LOW-O: was unpacked for all families
+            latch_quiet = self._ofdm_latch.get(label)
+            if latch_quiet is not None:
+                if energy < latch_quiet + SIG_OFDM_RISE_DB:
+                    # Burst over: the median fell back near the pre-burst
+                    # reference. Release the latch and classify fresh.
+                    del self._ofdm_latch[label]
+                    latch_quiet = None
+                else:
+                    return "ofdm-5g"
+            if latch_quiet is None:
+                # Quiet reference: the calmest floor seen in the window. A
+                # wideband burst is only recognizable against quiet the
+                # bridge has actually observed -- at startup with an
+                # already-active emitter there is no reference yet (None).
+                quiet = min(n for _, _, _, n in dq)
+                bins_now = dq[-1][1]
+                wide_hot = sum(1 for b in bins_now if b > quiet + SIG_HOT_DB)
+                # DJI O4-like: wideband OFDM lifts the whole band -- median
+                # up against the quiet floor, most sub-bands hot with it.
+                if (energy > quiet + SIG_OFDM_RISE_DB
+                        and wide_hot >= SIG_OFDM_MIN_BINS):
+                    # M3: latch the hint against the PRE-burst quiet. A
+                    # burst persisting past the window purges its own
+                    # reference and would otherwise self-extinguish
+                    # mid-burst. Releases when the median falls back.
+                    self._ofdm_latch[label] = quiet
+                    return "ofdm-5g"
             # Analog-FPV-like: one carrier sitting in the 5.8 GHz video
             # band, present most of the time.
             if (center_mhz >= 5650.0 and distinct <= 2
