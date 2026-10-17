@@ -1,8 +1,0 @@
-# Shepherd AD936x bridge dependencies.
-# numpy is required. Backend libraries are optional: install the one
-# matching your hardware (or neither, and use --simulate).
-numpy>=1.24
-# ADALM-Pluto (AD9363): uncomment to install
-# pyadi-iio>=0.0.14
-# Ettus USRP B200/B210 (AD9364/AD9361): uncomment to install
-# uhd>=4.0
