@@ -23,7 +23,7 @@ class DiscoveredRadio {
 }
 
 class RadioDiscovery {
-  /// Scan a CIDR (prefix /16–/30, /24 typical). Progress callback reports
+  /// Scan a CIDR (prefix /20–/30, /24 typical). Progress callback reports
   /// (done, total) for a progress bar.
   static Future<List<DiscoveredRadio>> scanSubnet(
     String cidr, {
@@ -57,8 +57,8 @@ class RadioDiscovery {
     } catch (_) {
       return null;
     }
+    final api = SilvusApi(ip: ip, timeout: const Duration(seconds: 4));
     try {
-      final api = SilvusApi(ip: ip, timeout: const Duration(seconds: 4));
       final snap = await api.fetchSnapshot();
       if (snap == null) return null;
       return DiscoveredRadio(
@@ -68,6 +68,8 @@ class RadioDiscovery {
       );
     } catch (_) {
       return null;
+    } finally {
+      api.close();
     }
   }
 
@@ -77,8 +79,10 @@ class RadioDiscovery {
     if (slash < 0) throw const FormatException('CIDR needs a /prefix');
     final base = cidr.substring(0, slash).trim();
     final prefix = int.tryParse(cidr.substring(slash + 1).trim());
-    if (prefix == null || prefix < 16 || prefix > 30) {
-      throw const FormatException('prefix must be /16../30');
+    // /20 is the largest scan (4096 addresses); the old text promised
+    // /16 but the size check below rejected everything under /20.
+    if (prefix == null || prefix < 20 || prefix > 30) {
+      throw const FormatException('prefix must be /20../30');
     }
     final parts = base.split('.');
     if (parts.length != 4) throw const FormatException('bad IPv4 address');

@@ -212,7 +212,13 @@ class NetshWifiSource extends WifiRssiSource {
       String auth = '';
       String cipher = '';
       String? pendingBssid;
-      for (final line in out.split('\n')) {
+      // netsh prints CRLF. Split on either: a stray '\r' at the end of a
+      // line stops `(.*)$` from matching (Dart's `.` excludes '\r', and
+      // `$` is end-of-input without multiLine), which made EVERY SSID
+      // header fail and every AP read as "(hidden)" on Windows -- which
+      // silently disabled rogue-AP detection.
+      for (final rawLine in out.split(RegExp(r'\r?\n'))) {
+        final line = rawLine.trimRight();
         final ssidM =
             RegExp(r'^SSID \d+ :\s*(.*)$').firstMatch(line);
         if (ssidM != null) {
@@ -533,6 +539,21 @@ class WifiVisionService {
     }
     _registry.removeWhere(
         (k, v) => now.difference(v.lastSeen) > apMaxAge);
+    // An AP that vanished while flagged (powered off, out of range) can
+    // never be re-sampled "clean", so close its episode here instead of
+    // leaving the DETECTED state stuck on forever.
+    for (final k in activeCrossings.keys
+        .where((k) => !_registry.containsKey(k))
+        .toList()) {
+      final done = activeCrossings.remove(k);
+      disturbedBssids.remove(k);
+      if (done != null) {
+        done.endTime = now;
+        crossings.insert(0, done);
+        if (crossings.length > 30) crossings.removeLast();
+      }
+    }
+    disturbedBssids.removeWhere((k) => !_registry.containsKey(k));
     readings
       ..clear()
       ..addAll(_registry.values.map((e) => e.reading));
@@ -565,6 +586,9 @@ class WifiVisionService {
               math.max(open.peakDipDb, b.lastDepthDb);
         }
       } else if (was) {
+        // Re-sampled and clean: clear the flag (it was never removed
+        // before, so an AP stayed "hot" in the UI for the whole session).
+        disturbedBssids.remove(r.bssid);
         final done = activeCrossings.remove(r.bssid);
         if (done != null) {
           done.endTime = DateTime.now();

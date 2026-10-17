@@ -54,7 +54,9 @@ class RadioConfig {
         label: '${j['label'] ?? ''}',
         enabled: j['enabled'] != false,
         pollInterval:
-            (double.tryParse('${j['pollInterval']}') ?? 0.25).clamp(0.1, 60),
+            (double.tryParse('${j['pollInterval']}') ?? 0.25)
+                .clamp(0.1, 60.0)
+                .toDouble(),
       );
 }
 
@@ -93,6 +95,16 @@ abstract class RadioDriver {
 
   /// Quick reachability check for discovery / setup validation.
   Future<bool> probe();
+
+  /// Shown on the radio card when a poll succeeds but returns no links.
+  String get emptyHint =>
+      'Radio reachable but reports no RF links (radios unmeshed?)';
+
+  /// Longest a sample from this driver may age before it stops counting
+  /// as live evidence. Null = derive from the poll interval (default).
+  /// Drivers whose hardware reports slower than they are polled (a
+  /// sweeping SDR) override this.
+  Duration? get sampleMaxAge => null;
 
   void dispose() {}
 }
@@ -134,6 +146,9 @@ class SilvusDriver extends RadioDriver {
 
   @override
   Future<bool> probe() => _api.probe();
+
+  @override
+  void dispose() => _api.close();
 }
 
 /// Simulated mesh driver: wraps [SimulatedSource] so simulated mode is
@@ -241,6 +256,9 @@ class SdrBand {
     required this.noiseDbfs,
     required this.binsDbfs,
     required this.t,
+    this.peakMhz,
+    this.peakDbfs,
+    this.spanMhz,
   });
 
   final String radio;
@@ -260,6 +278,16 @@ class SdrBand {
 
   final DateTime t;
 
+  /// Absolute frequency (MHz) and level of the strongest non-DC bin the
+  /// bridge saw in this band. Null from older bridges. An investigation
+  /// aid, not an identification.
+  final double? peakMhz;
+  final double? peakDbfs;
+
+  /// Width (MHz) of spectrum actually measured; can be narrower than
+  /// [bwMhz] when the radio's sample rate can't cover the whole band.
+  final double? spanMhz;
+
   /// Parse a decoded bridge datagram. Returns null for beacons,
   /// wrong versions, and malformed packets (never throws).
   static SdrBand? tryParse(Map<String, dynamic> j) {
@@ -268,14 +296,30 @@ class SdrBand {
       final bins = (j['bins_dbfs'] as List)
           .map((e) => (e as num).toDouble())
           .toList();
+      final energy = (j['energy_dbfs'] as num).toDouble();
+      final noise = (j['noise_dbfs'] as num).toDouble();
+      // NaN / infinite readings must never reach the tripwire's baseline.
+      if (!energy.isFinite ||
+          !noise.isFinite ||
+          bins.any((b) => !b.isFinite)) {
+        return null;
+      }
+      double? opt(String k) {
+        final v = j[k];
+        return v is num && v.isFinite ? v.toDouble() : null;
+      }
+
       return SdrBand(
         radio: '${j['radio']}',
         band: '${j['band']}',
         centerMhz: (j['center_mhz'] as num).toDouble(),
         bwMhz: (j['bw_mhz'] as num).toDouble(),
-        energyDbfs: (j['energy_dbfs'] as num).toDouble(),
-        noiseDbfs: (j['noise_dbfs'] as num).toDouble(),
+        energyDbfs: energy,
+        noiseDbfs: noise,
         binsDbfs: bins,
+        peakMhz: opt('peak_mhz'),
+        peakDbfs: opt('peak_dbfs'),
+        spanMhz: opt('span_mhz'),
         t: DateTime.fromMillisecondsSinceEpoch(
             ((j['t'] as num).toDouble() * 1000).round()),
       );
@@ -339,8 +383,13 @@ class SdrDriver extends RadioDriver {
   final String host;
   final int port;
 
+  /// Bands the bridge hasn't refreshed in this long are dropped, so a
+  /// dead bridge reads as no data instead of a frozen last reading.
+  static const Duration maxBandAge = Duration(seconds: 15);
+
   RawDatagramSocket? _socket;
   DateTime? _lastBeaconAt;
+  DateTime? _lastDataAt;
   String _bridgeBackend = '';
   final Map<String, SdrBand> _latest = {};
   final Map<String, DateTime> _arrivedAt = {};
@@ -348,8 +397,15 @@ class SdrDriver extends RadioDriver {
   /// What the bridge last announced itself as ('' until first beacon).
   String get bridgeBackend => _bridgeBackend;
 
+  /// Latest reading per band (read-only view, for UI panels).
+  List<SdrBand> get latestBands => List.unmodifiable(_latest.values);
+
   Future<void> _ensureSocket() async {
-    _socket ??= await RawDatagramSocket.bind(InternetAddress(host), port);
+    if (_socket != null) return;
+    // `InternetAddress(host)` throws for anything but an IP literal;
+    // fall back to all interfaces so a hostname (or "0.0.0.0") works.
+    final ip = InternetAddress.tryParse(host) ?? InternetAddress.anyIPv4;
+    _socket = await RawDatagramSocket.bind(ip, port);
   }
 
   void _handle(List<int> data) {
@@ -368,6 +424,7 @@ class SdrDriver extends RadioDriver {
     }
     final band = SdrBand.tryParse(j);
     if (band == null) return;
+    _lastDataAt = DateTime.now();
     final key = '${band.radio}:${band.band}';
     _latest[key] = band;
     _arrivedAt[key] = DateTime.now();
@@ -392,6 +449,17 @@ class SdrDriver extends RadioDriver {
   bool get isImplemented => true;
 
   @override
+  String get emptyHint =>
+      'No SDR bridge data — is sdr_bridge.py running and sending to '
+      '$host:$port?';
+
+  // The bridge sweeps bands one after another, so each band refreshes
+  // only every few seconds. Stay live as long as the driver itself
+  // keeps the reading.
+  @override
+  Duration? get sampleMaxAge => maxBandAge + const Duration(seconds: 1);
+
+  @override
   Future<List<LinkSample>> poll() async {
     await _ensureSocket();
     _drain();
@@ -400,7 +468,7 @@ class SdrDriver extends RadioDriver {
     // an empty poll reads as "radio broken" downstream. But bands the
     // bridge hasn't refreshed in a while are dropped, so a dead bridge
     // reads as no data instead of a frozen last reading.
-    final cutoff = DateTime.now().subtract(const Duration(seconds: 15));
+    final cutoff = DateTime.now().subtract(maxBandAge);
     _latest.removeWhere((k, _) => (_arrivedAt[k] ?? cutoff).isBefore(cutoff));
     _arrivedAt.removeWhere((k, _) => !_latest.containsKey(k));
     return [for (final b in _latest.values) b.toLinkSample()];
@@ -413,17 +481,21 @@ class SdrDriver extends RadioDriver {
     } catch (_) {
       return false;
     }
-    // Listen briefly for a bridge beacon; the bridge is a separate
-    // process the user starts, so "not heard yet" is not a failure of
-    // this endpoint -- but probe() reports what setup validation needs:
-    // true only when the bridge is actually talking.
-    final deadline = DateTime.now().add(const Duration(seconds: 2));
+    // Listen briefly for the bridge; it is a separate process the user
+    // starts, so probe() reports what setup validation needs: true only
+    // when the bridge is actually talking. ANY bridge packet counts --
+    // beacons come every few seconds and a sweep's band packets nearly
+    // as often, so waiting for one specific kind made a healthy bridge
+    // fail the probe most of the time.
+    final deadline = DateTime.now().add(const Duration(seconds: 5));
     while (DateTime.now().isBefore(deadline)) {
       _drain();
-      final heard = _lastBeaconAt;
-      if (heard != null &&
-          DateTime.now().difference(heard) < const Duration(seconds: 30)) {
-        return true;
+      final now = DateTime.now();
+      for (final heard in [_lastBeaconAt, _lastDataAt]) {
+        if (heard != null &&
+            now.difference(heard) < const Duration(seconds: 30)) {
+          return true;
+        }
       }
       await Future.delayed(const Duration(milliseconds: 100));
     }
@@ -434,6 +506,8 @@ class SdrDriver extends RadioDriver {
   void dispose() {
     _socket?.close();
     _socket = null;
+    _latest.clear();
+    _arrivedAt.clear();
   }
 }
 

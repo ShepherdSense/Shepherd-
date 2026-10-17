@@ -63,6 +63,18 @@ class Tracker {
     }
     _lastDetect = now;
 
+    // Geometry gate: one link (two nodes) only says "somewhere along this
+    // line", and the grid search would pick an arbitrary point on it.
+    // Without 3+ positioned nodes there is nothing honest to localize --
+    // the disturbance is still reported by the tripwire / banner.
+    final geometryIds = <String>{};
+    for (final p in pairs.values) {
+      geometryIds
+        ..add(p.a.nodeId)
+        ..add(p.b.nodeId);
+    }
+    if (geometryIds.length < 3) return null;
+
     // Position: coarse 3D tomographic grid search. Each candidate point is
     // scored by how well the disturbed links' dips match a Gaussian
     // falloff of the point's distance to each link. The argmax is the
@@ -93,7 +105,7 @@ class Tracker {
       return -err;
     }
 
-    // Pass 1: coarse 2.5 m grid.
+    // Pass 1: coarse grid (2.5 m by default; coarser for big meshes).
     var best = -1e9, bx = 0.0, by = 0.0, bz = 0.0;
     var minX = double.infinity,
         maxX = -double.infinity,
@@ -113,9 +125,21 @@ class Tracker {
     maxY += 15;
     final zMax = maxH + 15;
 
-    for (var x = minX; x <= maxX; x += 2.5) {
-      for (var y = minY; y <= maxY; y += 2.5) {
-        for (var z = 0.0; z <= zMax; z += 2.5) {
+    // The solve runs on the UI isolate every poll, so cap its cost: grow
+    // the coarse step until the grid is at most ~20k points. The forward
+    // model's falloff (sigma ~ 11 m) makes steps up to ~8 m harmless.
+    var step = 2.5;
+    double gridPoints(double st) =>
+        ((maxX - minX) / st + 1) *
+        ((maxY - minY) / st + 1) *
+        (zMax / st + 1);
+    while (gridPoints(step) > 20000 && step < 8.0) {
+      step *= 1.25;
+    }
+
+    for (var x = minX; x <= maxX; x += step) {
+      for (var y = minY; y <= maxY; y += step) {
+        for (var z = 0.0; z <= zMax; z += step) {
           final s = scoreAt(x, y, z);
           if (s > best) {
             best = s;
@@ -126,12 +150,16 @@ class Tracker {
         }
       }
     }
-    // Pass 2: refine around the coarse winner, 0.6 m steps.
-    for (var x = bx - 3; x <= bx + 3; x += 0.6) {
-      for (var y = by - 3; y <= by + 3; y += 0.6) {
-        for (var z = math.max(0.0, bz - 3);
-            z <= bz + 3;
-            z += 0.6) {
+    // Pass 2: refine around the coarse winner. The window covers one
+    // coarse step each way (>= 3 m); fine step is a fifth of it (0.6 m
+    // at the default grid).
+    final win = math.max(3.0, step);
+    final fine = win / 5.0;
+    for (var x = bx - win; x <= bx + win + 1e-9; x += fine) {
+      for (var y = by - win; y <= by + win + 1e-9; y += fine) {
+        for (var z = math.max(0.0, bz - win);
+            z <= bz + win + 1e-9;
+            z += fine) {
           final s = scoreAt(x, y, z);
           if (s > best) {
             best = s;
@@ -175,6 +203,13 @@ class Tracker {
       }
       _fixes.add(_Fix(t: now, x: x, y: y));
       if (_fixes.length > 40) _fixes.removeAt(0);
+      // With 3+ recent fixes, fit a line through them: far less jumpy
+      // than differencing two noisy grid positions.
+      final fit = _fitVelocity(now);
+      if (fit != null) {
+        _vx = fit.vx;
+        _vy = fit.vy;
+      }
     }
     double? speed;
     double? heading;
@@ -228,6 +263,34 @@ class Tracker {
     );
   }
 
+  /// Least-squares velocity over fixes from the last [window] seconds.
+  /// Null with fewer than 3 fixes or no time spread.
+  ({double vx, double vy})? _fitVelocity(DateTime now,
+      {double window = 12.0}) {
+    final pts = [
+      for (final f in _fixes)
+        if (now.difference(f.t).inMilliseconds / 1000.0 <= window) f,
+    ];
+    if (pts.length < 3) return null;
+    final t0 = pts.first.t;
+    final ts = [
+      for (final f in pts) f.t.difference(t0).inMilliseconds / 1000.0
+    ];
+    final n = pts.length;
+    final mt = ts.reduce((a, b) => a + b) / n;
+    final mx = pts.map((f) => f.x).reduce((a, b) => a + b) / n;
+    final my = pts.map((f) => f.y).reduce((a, b) => a + b) / n;
+    var sxx = 0.0, sxt = 0.0, syt = 0.0;
+    for (var i = 0; i < n; i++) {
+      final dt = ts[i] - mt;
+      sxx += dt * dt;
+      sxt += dt * (pts[i].x - mx);
+      syt += dt * (pts[i].y - my);
+    }
+    if (sxx < 1e-6) return null;
+    return (vx: sxt / sxx, vy: syt / sxx);
+  }
+
   void reset() {
     _fixes.clear();
     _vx = null;
@@ -266,13 +329,21 @@ class Tracker {
     minY -= 12;
     maxY += 12;
 
+    // Cap the cell count (~6k) so a large field doesn't mean thousands of
+    // cells x every link, every poll.
+    var cell = cellM;
+    while (((maxX - minX) / cell + 1) * ((maxY - minY) / cell + 1) > 6000 &&
+        cell < 20.0) {
+      cell *= 1.25;
+    }
+
     final linkList = pairs.values.toList();
     var peak = 0.0;
     final raws = <double>[];
     final xs = <double>[];
     final ys = <double>[];
-    for (var x = minX; x <= maxX; x += cellM) {
-      for (var y = minY; y <= maxY; y += cellM) {
+    for (var x = minX; x <= maxX; x += cell) {
+      for (var y = minY; y <= maxY; y += cell) {
         var v = 0.0;
         for (final p in linkList) {
           if (p.dip < p.threshold * 0.5) continue;

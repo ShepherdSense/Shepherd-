@@ -23,6 +23,13 @@ class SilvusApi {
   final String ip;
   final Duration timeout;
 
+  /// One keep-alive client for the life of the poller. A fresh client per
+  /// call opened a new TCP connection four times a second.
+  final http.Client _client = http.Client();
+
+  /// Release the connection. Safe to call more than once.
+  void close() => _client.close();
+
   static const _path = '/cgi-bin/streamscape_api';
   static final _keyRe = RegExp(r'^\$(snr|laMCS|pcns|vgm)_(\d+)_(\d+)$');
 
@@ -30,7 +37,7 @@ class SilvusApi {
 
   /// POST a JSON-RPC batch; returns the decoded batch on success, else null.
   Future<List<dynamic>?> _post(List<Map<String, Object>> methods) async {
-    final resp = await http
+    final resp = await _client
         .post(
           _uri,
           headers: {'Content-Type': 'application/json'},
@@ -131,7 +138,21 @@ class SilvusApi {
       }
     }
 
-    final links = pending
+    // A link direction must appear once per snapshot. If the radio lists
+    // the same direction under more than one node, feeding both copies to
+    // the tripwire would let ONE reading satisfy "confirm over N polls".
+    final seen = <String>{};
+    final unique = <_PendingLink>[];
+    for (final p in pending) {
+      if (seen.add('${p.fromNode}>${p.toNode}')) {
+        unique.add(p);
+      } else if (p.snr != null) {
+        final i = unique.indexWhere(
+            (u) => u.fromNode == p.fromNode && u.toNode == p.toNode);
+        if (i >= 0 && unique[i].snr == null) unique[i] = p;
+      }
+    }
+    final links = unique
         .map((p) => LinkSample(
               timestamp: p.timestamp,
               fromNode: p.fromNode,

@@ -85,6 +85,7 @@ class WifiThreatDetector {
   final Map<String, Map<String, double>> _rssiEma = {};
   final Set<String> _evented = {};
   bool _wasConnected = false;
+  bool _connectionSeen = false;
   final List<DateTime> _flaps = [];
   DateTime? _lastBurstAt;
 
@@ -150,6 +151,14 @@ class WifiThreatDetector {
   }
 
   void _ingestConnection(bool connected, DateTime now) {
+    if (!_connectionSeen) {
+      // First observation is a starting state, not a transition: counting
+      // it made the very first connect a "flap" and left a burst one
+      // transition short of firing.
+      _connectionSeen = true;
+      _wasConnected = connected;
+      return;
+    }
     if (connected != _wasConnected) {
       _flaps.add(now);
       _wasConnected = connected;
@@ -198,9 +207,9 @@ class WifiThreatDetector {
     for (final ssid in _sightings.keys.toList()) {
       final seen = present[ssid] ?? const <String>{};
       for (final bssid in _sightings[ssid]!.keys.toList()) {
-        if (seen.contains(bssid)) {
-          _sightings[ssid]![bssid] = _sightings[ssid]![bssid]! + 1;
-        } else {
+        // Present ones are counted once below with the rest of this
+        // survey (they used to be counted twice per survey).
+        if (!seen.contains(bssid)) {
           _sightings[ssid]!.remove(bssid);
         }
       }
@@ -281,6 +290,7 @@ class WifiThreatDetector {
     _evented.clear();
     _flaps.clear();
     _wasConnected = false;
+    _connectionSeen = false;
     _lastBurstAt = null;
   }
 }

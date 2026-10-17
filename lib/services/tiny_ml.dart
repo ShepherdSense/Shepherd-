@@ -115,6 +115,9 @@ class TinyMlp {
         best = k;
       }
     });
+    // NaN inputs give NaN probabilities, which no `p > bestP` ever wins:
+    // report "no answer" (confidence 0) rather than a fake class at -100%.
+    if (!bestP.isFinite || bestP < 0) return (classNames[0], 0.0);
     return (best, bestP);
   }
 
