@@ -1,24 +1,28 @@
 # Field Kit v1 — update notes (2026-10-16)
 
-## v1.1 — AD936x SDR support (evening)
+## v1.2 — SDR bridge for (almost) every SDR (evening)
 
-**AD936x spectrum-sensor bridge** (`field_kit/ad936x_bridge/`) — owners of
-ADALM-Pluto / USRP B200/B210 hardware can now use their radios with
-Shepherd. Receive only, by construction (no TX code path exists).
+**Universal SDR bridge** (`field_kit/sdr_bridge/`) — owners of RTL-SDR,
+ADALM-Pluto, USRP B200/B210, HackRF, Airspy, LimeSDR, SDRplay, or bladeRF
+hardware can now use their radios with Shepherd. Receive only, by
+construction (no TX code path exists; the RTL-SDR can't transmit at all).
 
-- `ad936x_bridge.py`: sweeps the drone bands (433/915/1290/2437/5780 MHz)
-  or stares at one; per-band energy + sub-band peaks over UDP to Shepherd.
-  Backends: pluto (pyadi-iio), uhd (B200/B210), simulate (scripted synthetic
-  spectrum — verifies the whole pipeline with no hardware), auto.
-- `RUN_AD936X_BRIDGE.bat`: double-click launcher (venv + deps + run).
-- **In-app driver** (`Ad936xDriver`, in this release's source): each band
+- `sdr_bridge.py`: sweeps the drone bands (433/915/1290/2437/5780 MHz,
+  skipped above each radio's ceiling) or stares at one; per-band energy +
+  sub-band peaks over UDP to Shepherd. Backends: rtlsdr, pluto, uhd,
+  soapy (HackRF/Airspy/Lime/SDRplay/bladeRF via SoapySDR), simulate
+  (scripted synthetic spectrum — verifies the whole pipeline with no
+  hardware), auto (first working backend wins).
+- `RUN_SDR_BRIDGE.bat`: double-click launcher (venv + deps + run).
+- **In-app driver** (`SdrDriver`, in this release's source): each band
   becomes a virtual tripwire link via a polarity trick — negated dBFS
   energy makes an emitter *appearing* read as a link dip, so adaptive
   thresholds, baseline hold, alerts, and the event log work unchanged.
   Band links are deliberately excluded from the position solver (no
-  geometry); alerts are the product. Add via Settings → AD936X.
+  geometry); alerts are the product. Add via Settings → SDR.
 - Honest limits: one radio = energy, not direction; sweep gaps are real
-  (stare mode closes them for one band); dBFS is gain-relative.
+  (stare mode closes them for one band); dBFS is gain-relative; know
+  your ceiling (an RTL-SDR will never see 2.4 GHz).
 
 ## v1.0 — initial field kit (morning)
 

@@ -1,0 +1,14 @@
+# Shepherd SDR bridge dependencies.
+# numpy is required. Backend libraries are optional: install the one(s)
+# matching your hardware (or none, and use --simulate).
+numpy>=1.24
+# ADALM-Pluto (AD9363): uncomment to install
+# pyadi-iio>=0.0.14
+# Ettus USRP B200/B210 (AD9364/AD9361): uncomment to install
+# uhd>=4.0
+# RTL-SDR dongles: uncomment to install (also needs the RTL-SDR driver:
+# Windows: run Zadig, install WinUSB for the dongle)
+# pyrtlsdr>=2.0
+# HackRF / Airspy / LimeSDR / SDRplay / bladeRF via SoapySDR:
+# Windows: install PothosSDR (bundles bindings + hardware modules)
+# Linux:   apt install python3-soapysdr soapysdr-module-all

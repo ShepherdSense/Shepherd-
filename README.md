@@ -66,7 +66,7 @@ Stand up new sensor nodes and new Shepherd installs without touching a terminal:
 
 - **ESP32 sensor node** — a cheap (~$10 class) auto-join sensor node. Flash it once; after that, every USB plug-in is just power: it boots, hosts its own status page, and auto-joins Shepherd's discovery. On board: a Wi-Fi tripwire detector, a BLE presence scanner, auto-detect plug-in nRF24L01 / CC1101 RF modules, and a simple serial protocol for attached sensors.
 - **Thumb-drive installer** — plug the drive into any Windows PC and double-click to install the latest Shepherd and set up automatic node detection.
-- **AD936x SDR bridge** — owners of ADALM-Pluto / USRP B200/B210 hardware can use their radios as Shepherd sensors (receive only). Each watched band becomes a virtual tripwire link; an emitter appearing reads as a link dip.
+- **SDR bridge** — owners of RTL-SDR, ADALM-Pluto, USRP B200/B210, HackRF, Airspy, LimeSDR (and friends) can use their radios as Shepherd sensors (receive only). Each watched band becomes a virtual tripwire link; an emitter appearing reads as a link dip.
 
 Download the kit (ZIP): [Shepherd Field Kit v1](https://drive.google.com/file/d/1xcCs_LQVoSrefEfABMa3RTDOGWKvsENd/view?usp=drivesdk)
 

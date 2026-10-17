@@ -28,7 +28,7 @@ class RadioConfig {
     this.pollInterval = 0.25,
   });
 
-  /// 'silvus' | 'mpu5' | 'harris' | 'ad936x' | 'simulated'.
+  /// 'silvus' | 'mpu5' | 'harris' | 'sdr' | 'simulated'.
   final String driverId;
 
   /// IP/host for network drivers; '' for simulated.
@@ -79,7 +79,7 @@ class DriverStatus {
 
 /// The contract every radio family implements.
 abstract class RadioDriver {
-  /// 'silvus' | 'mpu5' | 'harris' | 'ad936x' | 'simulated'.
+  /// 'silvus' | 'mpu5' | 'harris' | 'sdr' | 'simulated'.
   String get driverId;
 
   /// Human label, e.g. 'SILVUS'.
@@ -229,10 +229,10 @@ class L3HarrisDriver extends RadioDriver {
   Future<bool> probe() async => false;
 }
 
-/// One band-energy reading from the PC-side `ad936x_bridge.py`.
-/// Pure data + parsing; unit-tested in test/ad936x_packet_test.dart.
-class Ad936xBand {
-  Ad936xBand({
+/// One band-energy reading from the PC-side `sdr_bridge.py`.
+/// Pure data + parsing; unit-tested in test/sdr_bridge_test.dart.
+class SdrBand {
+  SdrBand({
     required this.radio,
     required this.band,
     required this.centerMhz,
@@ -262,13 +262,13 @@ class Ad936xBand {
 
   /// Parse a decoded bridge datagram. Returns null for beacons,
   /// wrong versions, and malformed packets (never throws).
-  static Ad936xBand? tryParse(Map<String, dynamic> j) {
+  static SdrBand? tryParse(Map<String, dynamic> j) {
     try {
       if (j['v'] != 1 || j['kind'] != 'band') return null;
       final bins = (j['bins_dbfs'] as List)
           .map((e) => (e as num).toDouble())
           .toList();
-      return Ad936xBand(
+      return SdrBand(
         radio: '${j['radio']}',
         band: '${j['band']}',
         centerMhz: (j['center_mhz'] as num).toDouble(),
@@ -284,7 +284,7 @@ class Ad936xBand {
     }
   }
 
-  /// Virtual link `ad936x:<radio> → ad936x:band-<label>`.
+  /// Virtual link `sdr:<radio> → sdr:band-<label>`.
   ///
   /// Polarity convention (shared with the bridge): bridge energy is dBFS
   /// (negative). Negated into [LinkSample.snr], an emitter APPEARING in
@@ -293,16 +293,16 @@ class Ad936xBand {
   /// ride along in [LinkSample.pcns] for investigation.
   LinkSample toLinkSample() => LinkSample(
         timestamp: t,
-        fromNode: 'ad936x:$radio',
-        toNode: 'ad936x:band-$band',
+        fromNode: 'sdr:$radio',
+        toNode: 'sdr:band-$band',
         snr: -energyDbfs,
         noiseFrom: -noiseDbfs,
         pcns: [for (final b in binsDbfs) -b],
       );
 }
 
-/// AD936x spectrum-sensor driver: listens for the PC-side bridge
-/// (`field_kit/ad936x_bridge/ad936x_bridge.py`, driving an ADALM-Pluto or
+/// SDR spectrum-sensor driver: listens for the PC-side bridge
+/// (`field_kit/sdr_bridge/sdr_bridge.py`, driving an ADALM-Pluto or
 /// Ettus USRP B200/B210 — RX only, never transmits) on UDP.
 ///
 /// Each watched band becomes a virtual tripwire link, so the whole
@@ -311,12 +311,12 @@ class Ad936xBand {
 /// ENERGY, not direction, range, or identity — and these virtual links
 /// carry no geometry, so app_state keeps them out of the position
 /// solver, shadow grid, and stitcher. Alerts still fire.
-class Ad936xDriver extends RadioDriver {
-  Ad936xDriver({required this.host, required this.port});
+class SdrDriver extends RadioDriver {
+  SdrDriver({required this.host, required this.port});
 
   /// The bridge's destination, i.e. where THIS app listens:
   /// "127.0.0.1:49161" (default), "host", or "host:port".
-  factory Ad936xDriver.fromAddress(String address) {
+  factory SdrDriver.fromAddress(String address) {
     var host = '127.0.0.1';
     var port = defaultBridgePort;
     final addr = address.trim();
@@ -329,7 +329,7 @@ class Ad936xDriver extends RadioDriver {
         host = addr;
       }
     }
-    return Ad936xDriver(host: host, port: port);
+    return SdrDriver(host: host, port: port);
   }
 
   /// UDP port the bridge sends to (and this driver listens on).
@@ -341,7 +341,7 @@ class Ad936xDriver extends RadioDriver {
   RawDatagramSocket? _socket;
   DateTime? _lastBeaconAt;
   String _bridgeBackend = '';
-  final Map<String, Ad936xBand> _latest = {};
+  final Map<String, SdrBand> _latest = {};
   final Map<String, DateTime> _arrivedAt = {};
   DateTime _lastPoll = DateTime.fromMillisecondsSinceEpoch(0);
 
@@ -366,7 +366,7 @@ class Ad936xDriver extends RadioDriver {
       if (b is String) _bridgeBackend = b;
       return;
     }
-    final band = Ad936xBand.tryParse(j);
+    final band = SdrBand.tryParse(j);
     if (band == null) return;
     final key = '${band.radio}:${band.band}';
     _latest[key] = band;
@@ -383,10 +383,10 @@ class Ad936xDriver extends RadioDriver {
   }
 
   @override
-  String get driverId => 'ad936x';
+  String get driverId => 'sdr';
 
   @override
-  String get label => 'AD936X';
+  String get label => 'SDR';
 
   @override
   bool get isImplemented => true;
@@ -447,8 +447,8 @@ RadioDriver driverFor(RadioConfig config) {
       return Mpu5Driver();
     case 'harris':
       return L3HarrisDriver();
-    case 'ad936x':
-      return Ad936xDriver.fromAddress(config.address);
+    case 'sdr':
+      return SdrDriver.fromAddress(config.address);
     default:
       throw ArgumentError('Unknown driver: ${config.driverId}');
   }
@@ -457,7 +457,7 @@ RadioDriver driverFor(RadioConfig config) {
 /// Driver types the user can pick in the radio manager.
 const List<({String id, String label, bool implemented})> driverTypes = [
   (id: 'silvus', label: 'SILVUS', implemented: true),
-  (id: 'ad936x', label: 'AD936X (Pluto / USRP)', implemented: true),
+  (id: 'sdr', label: 'SDR (Pluto / USRP / RTL-SDR / HackRF…)', implemented: true),
   (id: 'mpu5', label: 'MPU5 (Wave Relay)', implemented: false),
   (id: 'harris', label: 'L3HARRIS', implemented: false),
 ];

@@ -477,13 +477,13 @@ class AppState extends ChangeNotifier {
         for (final s in batch)
           if (_isLive(s, now)) s,
     ];
-    // Spectrum-band virtual links (AD936x energy watch) feed the tripwire
+    // Spectrum-band virtual links (SDR energy watch) feed the tripwire
     // and alerts like any link, but they carry no geometry -- a hot band
     // is not a position. Keep them out of the position solver, the
     // shadow grid, and the stitcher so they can't drag the track.
     final geo = [
       for (final s in all)
-        if (driverOf(s.fromNode) != 'ad936x') s,
+        if (driverOf(s.fromNode) != 'sdr') s,
     ];
     track = _tracker.update(
       now: now,
