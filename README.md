@@ -59,6 +59,18 @@ For a standalone install, double-click **`build_exe.bat`** — it compiles a por
 
 > **Note:** `lib/services/wifi_aware.dart` / `MainActivity.kt` contain experimental Wi-Fi Aware discovery (hand-written, cooperative-only). If the APK build fails in `compileReleaseKotlin`, that file is the first suspect — deleting it and its channel block builds fine without the Aware panel.
 
+
+## Field Kit
+
+Stand up new sensor nodes and new Shepherd installs without touching a terminal:
+
+- **ESP32 sensor node** — a cheap (~$10 class) auto-join sensor node. Flash it once; after that, every USB plug-in is just power: it boots, hosts its own status page, and auto-joins Shepherd's discovery. On board: a Wi-Fi tripwire detector, a BLE presence scanner, auto-detect plug-in nRF24L01 / CC1101 RF modules, and a simple serial protocol for attached sensors.
+- **Thumb-drive installer** — plug the drive into any Windows PC and double-click to install the latest Shepherd and set up automatic node detection.
+
+Download the kit (ZIP): [Shepherd Field Kit v1](https://drive.google.com/file/d/1xcCs_LQVoSrefEfABMa3RTDOGWKvsENd/view?usp=drivesdk)
+
+Sources live in `field_kit/` — firmware, installer scripts, and [update notes](field_kit/UPDATE_NOTES.md). Full in-app auto-detection of these nodes lights up when the ESP32 driver lands (mesh-mode Phase 1).
+
 ## Screenshots
 
 See [`docs/screenshots/`](docs/screenshots/) — captured from the live app.
