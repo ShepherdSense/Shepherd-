@@ -90,4 +90,6 @@ build_exe.bat / build_apk.bat   one-shot builders
 
 ## License
 
-© 2026 Draco. All rights reserved.
+MIT — see [LICENSE](LICENSE). Contributions welcome: fork, branch, pull request.
+Please read [CONTRIBUTING.md](CONTRIBUTING.md) first — Shepherd stays
+defensive-only, and contributions must keep it that way.
