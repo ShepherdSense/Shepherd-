@@ -27,6 +27,20 @@ in the repo for the full design.
 `--backend auto` (the default) tries pluto → uhd → rtlsdr → any
 enumerated SoapySDR device, first working one wins.
 
+## Band plans
+
+`--plan <name>` sweeps a curated band set instead of the default five.
+Explicit `--bands` or `--stare` always win over `--plan`.
+
+| Plan | Bands | Why these |
+|---|---|---|
+| `fpv` | 1290/8, 2437/20, 5780/20 | The full FPV-drone RF footprint: 1.3 GHz video, 2.4 GHz ELRS control link, 5.8 GHz video downlink |
+| `dji` | 2437/20, 5780/20 | DJI OcuSync/O4: control link lives in 2.4 GHz ISM, video downlink in 5 GHz ISM |
+| `longrange` | 433.92/1, 868/1, 915/2 | Sub-GHz long-range control: 433 LoRa, 868 (EU SRD band), 915 (US ISM) — Crossfire / ELRS-900 country |
+| `lora` | 433.92/1, 868/1, 915/2 | Pure sub-GHz LoRa/Meshtastic watch (same bands as `longrange`; the name says what you're looking for) |
+
+Example: `RUN_SDR_BRIDGE.bat --simulate --plan fpv`.
+
 ## Quick start
 
 1. Double-click **`RUN_SDR_BRIDGE.bat`**. First run creates a venv and
@@ -60,6 +74,16 @@ enumerated SoapySDR device, first working one wins.
   radio's sample rate is trusted (the edges are filter roll-off), so a
   20 MHz band on a 4 MS/s capture reports `span_mhz` ≈ 3.2. Raise the
   sample rate (`--soapy-rate`) on radios that support it for wider coverage.
+- `sig_hint` — emitter *signature* hint, or `null`. One of:
+  - `"fhss-2g4"` — 2.4 GHz band, energy hopping between sub-bands
+    (ELRS-style frequency-hopping control link)
+  - `"fhss-900m"` — 900 MHz band, same hopping behaviour
+    (ELRS-900 / Crossfire-style)
+  - `"ofdm-5g"` — 5 GHz band, energy up across most sub-bands at once
+    with the median lifted (DJI O4-style wideband OFDM video)
+  - `"tone-5g8"` — 5.8 GHz band, one sub-band persistently hot
+    (analog-FPV-style video carrier)
+  - `null` — nothing signature-like (or not enough observations yet)
 - Measurements are Welch-averaged over several FFT segments per capture;
   `--dwell N` averages N captures per band per sweep.
 - A capture that fails or comes back short is **dropped, not reported**
@@ -83,3 +107,10 @@ enumerated SoapySDR device, first working one wins.
 - **Know your ceiling.** The bridge skips bands above your radio's max
   frequency and tells you. An RTL-SDR will never see 2.4 GHz — that's
   physics, not a bug.
+- **Signatures are not identities.** `sig_hint` says "something is
+  frequency-hopping the way ELRS control links hop" — never "this is an
+  ELRS drone", and never a drone claim of any kind. A hint needs several
+  observations of the band (a few seconds at least); the OFDM hint also
+  needs a quiet baseline the bridge has actually seen, so a burst
+  already active at startup reads as `null` until the bridge learns
+  calm. Additive field: older Shepherd builds ignore it.

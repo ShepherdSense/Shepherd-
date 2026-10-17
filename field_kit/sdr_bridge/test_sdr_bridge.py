@@ -36,7 +36,7 @@ def test_wideband_emitter_raises_median():
 def test_sim_backend_wideband_burst_is_visible():
     sim = b.SimBackend()
     sim.tune(2437.0, 20.0, 40)
-    sim.t0 = time.time() - 5       # quiet phase
+    sim.t0 = time.time() - 5       # hopper phase (narrow: median stays quiet)
     quiet = b.band_measurement(sim.capture(N), SR, 20.0)
     sim.t0 = time.time() - 25      # burst phase
     hot = b.band_measurement(sim.capture(N), SR, 20.0)
@@ -87,6 +87,127 @@ def test_all_reported_values_are_finite_json():
     vals = [m["energy"], m["noise"], m["peak_dbfs"], *m["bins"]]
     json.dumps(vals, allow_nan=False)
     assert all(math.isfinite(v) for v in vals)
+
+
+def test_plan_presets():
+    assert set(b.PLANS) == {"fpv", "dji", "longrange", "lora"}
+    assert b.PLANS["fpv"] == [("1290", 1290.0, 8.0),
+                              ("2437", 2437.0, 20.0),
+                              ("5780", 5780.0, 20.0)]
+    assert b.PLANS["dji"] == [("2437", 2437.0, 20.0),
+                              ("5780", 5780.0, 20.0)]
+    assert b.PLANS["longrange"] == [("433", 433.92, 1.0),
+                                    ("868", 868.0, 1.0),
+                                    ("915", 915.0, 2.0)]
+    assert b.PLANS["lora"] == [("433", 433.92, 1.0),
+                               ("868", 868.0, 1.0),
+                               ("915", 915.0, 2.0)]
+
+
+def _sig_hint(center, hots_list, energy=-80.0, noise=-85.0, t0=1000.0):
+    """Feed synthetic per-observation hot-bin lists through SigHistory."""
+    sig = b.SigHistory(window_s=30.0, min_obs=3)
+    hint = None
+    for i, hot in enumerate(hots_list):
+        bins = [noise + 2.0] * 8
+        for k in hot:
+            bins[k] = noise + 25.0
+        hint = sig.observe("x", center, t0 + i * 2.0, bins, energy, noise)
+    return hint
+
+
+def test_sig_hint_null_until_enough_observations():
+    # Hopping pattern, but only 2 observations (< min_obs=3).
+    assert _sig_hint(2437.0, [[0], [5]]) is None
+
+
+def test_sig_hint_null_on_quiet():
+    assert _sig_hint(2437.0, [[]] * 5) is None
+    assert _sig_hint(5780.0, [[]] * 5, energy=-80.0) is None
+
+
+def test_sig_hint_fhss_2g4():
+    hint = _sig_hint(2437.0, [[0], [3], [6], [1], [4]])
+    assert hint == "fhss-2g4", hint
+
+
+def test_sig_hint_fhss_900m():
+    hint = _sig_hint(915.0, [[0], [3], [6], [1], [4]])
+    assert hint == "fhss-900m", hint
+
+
+def test_sig_hint_ofdm_5g():
+    # All sub-bands hot at once AND the median lifted: wideband OFDM.
+    hint = _sig_hint(5780.0, [list(range(8))] * 3, energy=-60.0)
+    assert hint == "ofdm-5g", hint
+
+
+def test_sig_hint_tone_5g8():
+    # One sub-band persistently hot in the 5.8 GHz video band.
+    hint = _sig_hint(5780.0, [[5]] * 4)
+    assert hint == "tone-5g8", hint
+
+
+def test_sig_hint_null_for_static_tone_on_2g4():
+    # A static tone is not frequency hopping, whatever the band.
+    assert _sig_hint(2437.0, [[2]] * 4) is None
+
+
+def test_sig_hint_null_for_broadband_noise_on_2g4():
+    # All sub-bands always hot = broadband noise, not hopping.
+    assert _sig_hint(2437.0, [list(range(8))] * 3, energy=-60.0) is None
+
+
+def test_sig_hint_null_outside_known_band_families():
+    # Hopping on 433 MHz matches no known signature vocabulary.
+    assert _sig_hint(433.92, [[0], [3], [6], [1]]) is None
+
+
+def test_sig_hint_ofdm_needs_quiet_reference():
+    # Honest limit: a burst already active at startup has no quiet
+    # reference to recognize the lift against -- null, not a guess.
+    sig = b.SigHistory(window_s=30.0, min_obs=3)
+    hint = None
+    for i in range(3):
+        bins = [-63.0] * 8      # burst-level everywhere, from the start
+        hint = sig.observe("x", 5780.0, 1000.0 + i * 2.0, bins,
+                           energy=-63.0, noise=-65.0)
+    assert hint is None, hint
+
+
+def test_sim_hopper_produces_fhss_hint():
+    # End to end: the sim's 2.4 GHz hopper drives the detector.
+    # Fresh sim starts inside the hop window; hop slots advance per
+    # capture, so no clock games are needed.
+    sim = b.SimBackend()
+    sim.tune(2437.0, 20.0, 40)
+    sig = b.SigHistory(window_s=120.0, min_obs=3)
+    hint = None
+    base = time.time()
+    for i in range(4):
+        m = b.band_measurement(sim.capture(N), SR, 20.0)
+        assert m is not None
+        hint = sig.observe("2437", 2437.0, base + i * 2.0,
+                           m["bins"], m["energy"], m["noise"])
+    assert hint == "fhss-2g4", hint
+
+
+def test_sim_ofdm_burst_produces_ofdm_hint():
+    # End to end: the sim's 5.8 GHz OFDM burst drives the detector.
+    # The first two observations are quiet (the detector needs a calm
+    # reference); the burst then arrives.
+    sim = b.SimBackend()
+    sim.tune(5780.0, 20.0, 40)
+    sig = b.SigHistory(window_s=120.0, min_obs=3)
+    hint = None
+    base = time.time()
+    for i, el in enumerate([100.0, 101.0, 5.0, 6.0]):
+        sim.t0 = base - el
+        m = b.band_measurement(sim.capture(N), SR, 20.0)
+        assert m is not None
+        hint = sig.observe("5780", 5780.0, base + i * 2.0,
+                           m["bins"], m["energy"], m["noise"])
+    assert hint == "ofdm-5g", hint
 
 
 if __name__ == "__main__":

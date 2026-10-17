@@ -33,12 +33,21 @@ Protocol (UDP JSON datagrams to the Shepherd host, default 127.0.0.1:49161):
      "energy_dbfs":-52.3,"noise_dbfs":-81.2,
      "bins_dbfs":[-53.1,... 8 values ...],
      "peak_mhz":433.97,"peak_dbfs":-48.2,"span_mhz":1.0,
+     "sig_hint":"fhss-2g4",
      "t":1729123456.789}
 
   (peak_mhz is the absolute frequency of the strongest non-DC bin in the
   measured span, peak_dbfs its level, span_mhz the width actually
   measured -- see "Band width" below. All three are optional extras;
   older Shepherd builds ignore them.)
+
+  (sig_hint is an emitter *signature* hint: "fhss-2g4", "fhss-900m",
+  "ofdm-5g", "tone-5g8", or null. It describes a PATTERN of energy over
+  frequency and time -- e.g. frequency-hopping the way ELRS-style
+  control links hop -- never an identification, and never a drone
+  claim. It needs several observations of the band (a few seconds at
+  least); null means "nothing signature-like seen". Additive: older
+  Shepherd builds ignore the field.)
 
   beacon packet (every 3 s, lets Shepherd show bridge status):
     {"v":1,"kind":"beacon","radio":"rtlsdr0","backend":"rtlsdr",
@@ -50,6 +59,8 @@ measured over its usable centre only and span_mhz says so honestly.
 
 Examples:
   python sdr_bridge.py --simulate
+  python sdr_bridge.py --simulate --plan fpv
+  python sdr_bridge.py --backend rtlsdr --plan lora
   python sdr_bridge.py --backend rtlsdr
   python sdr_bridge.py --backend soapy --soapy-driver hackrf
   python sdr_bridge.py --backend pluto --pluto-uri ip:192.168.2.1
@@ -62,6 +73,7 @@ import math
 import socket
 import sys
 import time
+from collections import deque
 
 try:
     import numpy as np
@@ -86,6 +98,38 @@ DEFAULT_BANDS = [
     ("2437", 2437.0, 20.0),  # 2.4 GHz ISM center
     ("5780", 5780.0, 20.0),  # 5.8 GHz FPV video
 ]
+
+# Named band plans: (label, center MHz, bandwidth MHz).
+# WHY each plan watches what it watches:
+#   fpv ....... the full FPV-drone RF footprint: 1.3 GHz video,
+#               2.4 GHz ELRS control link, 5.8 GHz video downlink
+#   dji ....... DJI OcuSync/O4: control link (2.4 GHz ISM) + video
+#               downlink (5 GHz ISM)
+#   longrange . sub-GHz long-range control: 433 LoRa, 868 (EU SRD),
+#               915 (US ISM) -- Crossfire / ELRS-900 country
+#   lora ...... pure sub-GHz LoRa/Meshtastic watch (same bands as
+#               longrange; the name says what you're looking for)
+PLANS = {
+    "fpv": [
+        ("1290", 1290.0, 8.0),
+        ("2437", 2437.0, 20.0),
+        ("5780", 5780.0, 20.0),
+    ],
+    "dji": [
+        ("2437", 2437.0, 20.0),
+        ("5780", 5780.0, 20.0),
+    ],
+    "longrange": [
+        ("433", 433.92, 1.0),
+        ("868", 868.0, 1.0),
+        ("915", 915.0, 2.0),
+    ],
+    "lora": [
+        ("433", 433.92, 1.0),
+        ("868", 868.0, 1.0),
+        ("915", 915.0, 2.0),
+    ],
+}
 
 PLUTO_MAX_MHZ = 3800.0   # AD9363 official ceiling (the 6 GHz hack is unreliable)
 USRP_MAX_MHZ = 6000.0
@@ -341,9 +385,16 @@ class SoapyBackend(RadioBackend):
 class SimBackend(RadioBackend):
     """Synthetic spectrum: scripted emitters over a drifting noise floor.
 
-    Lets the full pipeline be verified with no hardware. An emitter on
-    2437 MHz appears 20 s after start, lasts 20 s, repeats every 90 s;
-    a weak always-on carrier sits on 433 MHz like a LoRa beacon.
+    Lets the full pipeline be verified with no hardware:
+      2437 MHz: ELRS-like FHSS hopper (first 20 s of each 2 min;
+                new sub-band every capture), then a wideband FPV/Wi-Fi-like
+                burst 20-40 s of each 90 s
+      915 MHz:  LoRa-like narrowband burst 5-9 s of each 47 s
+      5780 MHz: DJI O4-like wideband OFDM burst (first 20 s of each
+                150 s, after one quiet capture so the detector learns
+                a baseline), then an analog-FPV-like static carrier
+                60-80 s
+      433 MHz:  weak always-on LoRa-like carrier
     """
 
     name = "simulate"
@@ -353,27 +404,47 @@ class SimBackend(RadioBackend):
         self.t0 = time.time()
         self.center = 2437.0
         self.rng = np.random.default_rng(7)
+        self._cap_n = 0            # total captures (drives the hop slot)
+        self._band_caps = {}       # center MHz -> completed captures
 
     def tune(self, center_mhz, bw_mhz, gain_db):
         self.center = center_mhz
         self.bw = bw_mhz
 
     def _emitter(self, now):
-        """(level dB above floor, wideband?) for the tuned band right now."""
+        """(level dB above floor, kind) for the tuned band right now.
+
+        kind: "wide" (wideband burst), "tone" (static narrowband),
+              "hop" (frequency-hopping narrowband), or None.
+        """
         el = now - self.t0
-        lvl, wide = 0.0, False
         if abs(self.center - 2437.0) < 1.0:
-            # FPV/Wi-Fi-like wideband burst: raises the band MEDIAN.
+            if (el % 120.0) < 20.0:
+                return 25.0, "hop"    # ELRS-like FHSS hopper
             if 20.0 <= (el % 90.0) < 40.0:
-                lvl, wide = 28.0, True
+                # FPV/Wi-Fi-like wideband burst: raises the band MEDIAN.
+                return 28.0, "wide"
+            return 0.0, None
         if abs(self.center - 915.0) < 1.0:
-            # LoRa-like narrowband burst: visible in sub-band peaks and
-            # peak_mhz, deliberately NOT in the median (honest limit).
             if 5.0 <= (el % 47.0) < 9.0:
-                lvl, wide = max(lvl, 18.0), False
+                # LoRa-like narrowband burst: visible in sub-band peaks
+                # and peak_mhz, deliberately NOT in the median.
+                return 18.0, "tone"
+            return 0.0, None
+        if abs(self.center - 5780.0) < 1.0:
+            # DJI O4-like wideband OFDM burst. Gated on one prior quiet
+            # capture of this band: the OFDM detector needs a calm
+            # reference to recognize the lift, and this makes the
+            # demo deterministic on any machine speed.
+            if (self._band_caps.get(5780.0, 0) >= 1
+                    and (el % 150.0) < 20.0):
+                return 22.0, "wide"
+            if 60.0 <= (el % 150.0) < 80.0:
+                return 20.0, "tone"   # analog-FPV-like static carrier
+            return 0.0, None
         if abs(self.center - 433.92) < 1.0:
-            lvl = max(lvl, 12.0)  # always-on weak narrowband carrier
-        return lvl, wide
+            return 12.0, "tone"       # always-on weak narrowband carrier
+        return 0.0, None
 
     def capture(self, n):
         now = time.time()
@@ -382,19 +453,30 @@ class SimBackend(RadioBackend):
         floor_lin = 10 ** (floor_db / 20.0)
         x = (self.rng.standard_normal(n) + 1j * self.rng.standard_normal(n))
         x = (x / np.sqrt(2.0)).astype(np.complex64) * floor_lin
-        lvl_db, wide = self._emitter(now)
+        lvl_db, kind = self._emitter(now)
         if lvl_db > 0:
             amp = floor_lin * (10 ** (lvl_db / 20.0))
-            if wide:
+            t = np.arange(n) / self.sample_rate
+            if kind == "wide":
                 # Wideband: extra noise-like power across the whole span.
                 w = (self.rng.standard_normal(n)
                      + 1j * self.rng.standard_normal(n)) / np.sqrt(2.0)
                 x = x + (w * amp).astype(np.complex64)
+            elif kind == "hop":
+                # FHSS: narrow tone, new sub-band every capture (hop slot
+                # advances per capture, so the hop pattern is
+                # deterministic whatever the sweep rate).
+                hop = (self._cap_n * 5 + 1) % 8
+                off_hz = (hop - 3.5) * 350e3
+                ph = 2 * np.pi * off_hz * t
+                x = x + (np.exp(1j * ph) * amp).astype(np.complex64)
             else:
                 # Narrowband: tone 150 kHz off centre with FM wobble.
-                t = np.arange(n) / self.sample_rate
-                ph = 2 * np.pi * 150e3 * t + 2.0 * np.sin(2 * np.pi * 37.0 * t)
+                ph = (2 * np.pi * 150e3 * t
+                      + 2.0 * np.sin(2 * np.pi * 37.0 * t))
                 x = x + (np.exp(1j * ph) * amp).astype(np.complex64)
+        self._cap_n += 1
+        self._band_caps[self.center] = self._band_caps.get(self.center, 0) + 1
         return x
 
 
@@ -469,6 +551,110 @@ def band_measurement(x, sample_rate=SAMPLE_RATE, bw_mhz=None):
         "peak_off_mhz": float(fs[k]) / 1e6, "peak_dbfs": float(ps[k]),
         "span_mhz": 2.0 * half / 1e6,
     }
+
+
+# ---------------------------------------------------------------- signature hints
+
+# Emitter-signature detection tuning. A "hot" sub-band is this far above
+# the band's own noise floor (10th percentile -- self-calibrating per
+# band, so it survives gain differences).
+SIG_WINDOW_S = 30.0     # how far back the statistics look, per band
+SIG_MIN_OBS = 3         # observations needed before any hint is emitted
+SIG_HOT_DB = 10.0       # sub-band "hot" threshold above the noise floor
+SIG_FHSS_MIN_BINS = 3   # distinct hot sub-bands => hopping, not a tone
+SIG_FHSS_MAX_DUTY = 0.6  # no single sub-band may dominate (else: static)
+SIG_FHSS_MIN_ACTIVE = 0.3  # fraction of observations showing any hop
+SIG_OFDM_MIN_BINS = 6   # hot sub-bands at once => wideband OFDM-like
+SIG_OFDM_RISE_DB = 6.0  # ...with the median up this far (else: spurs)
+SIG_TONE_MIN_DUTY = 0.7  # one sub-band persistently hot => carrier-like
+
+
+class SigHistory:
+    """Rolling per-band sub-band activity -> emitter *signature* hints.
+
+    A signature is a pattern of energy over frequency and time, NOT an
+    identification: "fhss-2g4" means "something is frequency-hopping in
+    the 2.4 GHz ISM band the way ELRS-style control links hop", never
+    "this is an ELRS drone" and never a drone claim of any kind.
+
+    Hints (else None):
+      fhss-2g4 .. 2.4 GHz band, energy hopping between sub-bands
+                   (ELRS-style FHSS control link)
+      fhss-900m . 900 MHz band, same hopping behaviour
+                   (ELRS-900 / Crossfire-style)
+      ofdm-5g ... 5 GHz band, energy elevated across most sub-bands at
+                   once with the median lifted (DJI O4-style OFDM video)
+      tone-5g8 .. 5.8 GHz band, one sub-band persistently hot
+                   (analog-FPV-style video carrier)
+
+    Needs several observations of the band (a few seconds at least);
+    returns None until then and for anything that matches no pattern.
+    """
+
+    def __init__(self, window_s=SIG_WINDOW_S, min_obs=SIG_MIN_OBS):
+        self.window_s = window_s
+        self.min_obs = min_obs
+        self._hist = {}  # band label -> deque of (t, bins[8], energy, noise)
+
+    def observe(self, label, center_mhz, t, bins, energy, noise):
+        """Record one band measurement; return this band's sig_hint."""
+        dq = self._hist.setdefault(label, deque())
+        dq.append((t, list(bins), float(energy), float(noise)))
+        while dq and t - dq[0][0] > self.window_s:
+            dq.popleft()
+        return self._classify(center_mhz, dq)
+
+    @staticmethod
+    def _family(center_mhz):
+        if 2400.0 <= center_mhz < 2500.0:
+            return "2g4"
+        if 850.0 <= center_mhz < 960.0:
+            return "900m"
+        if 5000.0 <= center_mhz < 6000.0:
+            return "5g"
+        return None
+
+    def _classify(self, center_mhz, dq):
+        if len(dq) < self.min_obs:
+            return None
+        family = self._family(center_mhz)
+        if family is None:
+            return None
+        # hot[i][k]: sub-band k hot in observation i.
+        hots = [[b > n + SIG_HOT_DB for b in bins]
+                for _, bins, _, n in dq]
+        n = len(hots)
+        duty = [sum(h[k] for h in hots) / n for k in range(8)]
+        distinct = sum(1 for k in range(8) if duty[k] > 0)
+        _, _, energy, _ = dq[-1]
+
+        if family == "5g":
+            # Quiet reference: the calmest floor seen in the window. A
+            # wideband burst is only recognizable against quiet the
+            # bridge has actually observed -- at startup with an
+            # already-active emitter there is no reference yet (None).
+            quiet = min(n for _, _, _, n in dq)
+            bins_now = dq[-1][1]
+            wide_hot = sum(1 for b in bins_now if b > quiet + SIG_HOT_DB)
+            # DJI O4-like: wideband OFDM lifts the whole band -- median
+            # up against the quiet floor, most sub-bands hot with it.
+            if (energy > quiet + SIG_OFDM_RISE_DB
+                    and wide_hot >= SIG_OFDM_MIN_BINS):
+                return "ofdm-5g"
+            # Analog-FPV-like: one carrier sitting in the 5.8 GHz video
+            # band, present most of the time.
+            if (center_mhz >= 5650.0 and distinct <= 2
+                    and max(duty) >= SIG_TONE_MIN_DUTY):
+                return "tone-5g8"
+            return None
+        # ELRS/Crossfire-like: the energy hops between sub-bands --
+        # several visited, none dominant, activity sustained.
+        active_frac = sum(1 for h in hots if any(h)) / n
+        if (distinct >= SIG_FHSS_MIN_BINS
+                and max(duty) < SIG_FHSS_MAX_DUTY
+                and active_frac >= SIG_FHSS_MIN_ACTIVE):
+            return "fhss-" + family
+        return None
 
 
 # ---------------------------------------------------------------- main
@@ -569,6 +755,11 @@ def main():
                     help="extra captures per band per sweep (default 1)")
     ap.add_argument("--bands", default="",
                     help="custom band list like 433.92/1,915/2,2437/20")
+    ap.add_argument("--plan", default="", choices=["", "fpv", "dji",
+                    "longrange", "lora"],
+                    help="named band plan: fpv (drone FPV footprint), dji "
+                    "(OcuSync/O4), longrange (sub-GHz RC), lora (LoRa watch). "
+                    "Explicit --bands/--stare win over --plan.")
     ap.add_argument("--print", dest="print_only", action="store_true",
                     help="print packets as JSON lines instead of sending UDP")
     ap.add_argument("--sweeps", type=int, default=0,
@@ -589,7 +780,8 @@ def main():
     print(f"[bridge] backend={bname} radio={radio} "
           f"gain={args.gain} dB (manual, fixed) dest={args.dest} -- RX ONLY")
 
-    # ---- bands (skip anything above this radio's ceiling)
+    # ---- bands (skip anything above this radio's ceiling).
+    # Precedence: explicit --bands > --stare > --plan > default sweep.
     if args.bands:
         bands = []
         for item in args.bands.split(","):
@@ -604,6 +796,8 @@ def main():
                          "e.g. 433.92/1,915/2,2437/20")
     elif args.stare:
         bands = [(f"{args.stare:g}", args.stare, 20.0)]
+    elif args.plan:
+        bands = list(PLANS[args.plan])
     else:
         bands = list(DEFAULT_BANDS)
     kept = [b for b in bands if b[1] <= backend.max_mhz]
@@ -640,6 +834,7 @@ def main():
     sweeps_done = 0
     dropped = 0
     last_warn = 0.0
+    sig_hist = SigHistory()  # emitter-signature hints, per band
 
     def finite_all(vals):
         return all(math.isfinite(v) for v in vals)
@@ -678,6 +873,9 @@ def main():
                 if not finite_all(vals):
                     dropped += 1
                     continue
+                now = time.time()
+                sig_hint = sig_hist.observe(label, center, now,
+                                            bins, energy, noise)
                 pkt = {"v": 1, "kind": "band", "radio": radio, "band": label,
                        "center_mhz": center, "bw_mhz": bw,
                        "energy_dbfs": round(energy, 1),
@@ -686,7 +884,8 @@ def main():
                        "peak_mhz": round(peak_mhz, 3),
                        "peak_dbfs": round(top["peak_dbfs"], 1),
                        "span_mhz": round(top["span_mhz"], 3),
-                       "t": time.time()}
+                       "sig_hint": sig_hint,
+                       "t": now}
                 emit(pkt)
             sweeps_done += 1
             now = time.time()
