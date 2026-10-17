@@ -49,6 +49,30 @@ Protocol (UDP JSON datagrams to the Shepherd host, default 127.0.0.1:49161):
   least); null means "nothing signature-like seen". Additive: older
   Shepherd builds ignore the field.)
 
+  elrs_chirp packet (throttled, max ~1 per band per 2 s):
+    {"v":1,"kind":"elrs_chirp","radio":"rtlsdr0","band":"2437",
+     "center_mhz":2437.0,"freq_mhz":2441.23,"sf":5,"bw_khz":812.5,
+     "snr_db":14.2,"t":1729123456.789}
+
+  (One detected LoRa chirp train: the dechirp detector found a
+  preamble-like train of back-to-back upchirps at freq_mhz. LoRa
+  MODULATION evidence, not an ELRS identification -- any LoRa emitter
+  in the (SF, BW) grid lights this up. Shepherd correlates these
+  across radios/bands for the Gemini signature and treats them as
+  corroboration only.)
+
+  elrs_signature packet (bridge-local dual-frequency coincidence):
+    {"v":1,"kind":"elrs_signature","radio":"usrp0","mode":"gemini-2g4",
+     "score":0.62,"obs":7,"bands":["2437"],
+     "freqs_mhz":[2441.2,2481.3],"t":1729123456.789}
+
+  (mode "gemini-2g4"/"gemini-900m": time-correlated chirp trains on two
+  frequencies with the documented Gemini separation, seen in ONE
+  capture -- needs >= ~50 MHz instantaneous bandwidth, so most radios
+  never emit this. score 0..1 grows with repeated coincidences;
+  "obs" counts them. Language contract: "signature consistent with
+  ELRS Gemini", NEVER "confirmed ELRS".)
+
   beacon packet (every 3 s, lets Shepherd show bridge status):
     {"v":1,"kind":"beacon","radio":"rtlsdr0","backend":"rtlsdr",
      "bands":["433","915"],"dropped":0,"t":1729123456.789}
@@ -74,6 +98,8 @@ import socket
 import sys
 import time
 from collections import deque
+
+import elrs_detect
 
 try:
     import numpy as np
@@ -388,8 +414,14 @@ class SimBackend(RadioBackend):
     Lets the full pipeline be verified with no hardware:
       2437 MHz: ELRS-like FHSS hopper (first 20 s of each 2 min;
                 new sub-band every capture), then a wideband FPV/Wi-Fi-like
-                burst 20-40 s of each 90 s
-      915 MHz:  LoRa-like narrowband burst 5-9 s of each 47 s
+                burst 20-40 s of each 90 s, then LoRa chirp trains
+                100-108 s of each 180 s (ELRS-demo: wall-clock-gated,
+                time-correlated with
+                the 915 MHz chirp window so two bridge instances demo the
+                app-level GemX correlation)
+      915 MHz:  LoRa-like narrowband burst 5-9 s of each 47 s, plus LoRa
+                chirp trains 100-108 s of each 180 s (GemX-demo partner
+                to the 2437 MHz window)
       5780 MHz: DJI O4-like wideband OFDM burst (first 20 s of each
                 150 s, after one quiet capture so the detector learns
                 a baseline), then an analog-FPV-like static carrier
@@ -418,7 +450,14 @@ class SimBackend(RadioBackend):
               "hop" (frequency-hopping narrowband), or None.
         """
         el = now - self.t0
+        # Chirp windows are gated on WALL-CLOCK epoch, not instance
+        # time, so two --simulate instances (e.g. 2437 + 915 stares)
+        # emit time-correlated trains for the app-level GemX demo
+        # however far apart they were started.
+        epoch180 = now % 180.0
         if abs(self.center - 2437.0) < 1.0:
+            if 100.0 <= epoch180 < 108.0:
+                return 20.0, "chirp"  # ELRS-demo chirp trains (GemX pair)
             if (el % 120.0) < 20.0:
                 return 25.0, "hop"    # ELRS-like FHSS hopper
             if 20.0 <= (el % 90.0) < 40.0:
@@ -426,6 +465,8 @@ class SimBackend(RadioBackend):
                 return 28.0, "wide"
             return 0.0, None
         if abs(self.center - 915.0) < 1.0:
+            if 100.0 <= epoch180 < 108.0:
+                return 20.0, "chirp"  # ELRS-demo chirp trains (GemX pair)
             if 5.0 <= (el % 47.0) < 9.0:
                 # LoRa-like narrowband burst: visible in sub-band peaks
                 # and peak_mhz, deliberately NOT in the median.
@@ -475,6 +516,22 @@ class SimBackend(RadioBackend):
                 off_hz = (hop - 3.5) * 350e3
                 ph = 2 * np.pi * off_hz * t
                 x = x + (np.exp(1j * ph) * amp).astype(np.complex64)
+            elif kind == "chirp":
+                # ELRS-demo: real LoRa upchirp trains (SF5, 812.5 kHz --
+                # the ELRS 2.4 GHz LoRa-mode grid), hopping offsets, at
+                # a deterministic wall-clock slot so two bridge
+                # instances (2.4 GHz + 900 MHz stares) emit
+                # time-correlated trains for the app-level GemX demo.
+                up = elrs_detect.lora_upchirp(5, 812_500.0,
+                                              self.sample_rate)
+                sig = np.tile(up, 6)
+                hop = (self._cap_n * 3 + 2) % 6
+                off_hz = (hop - 2.5) * 400e3
+                tseg = np.arange(len(sig)) / self.sample_rate
+                sig = (sig * np.exp(2j * np.pi * off_hz * tseg) * amp
+                       ).astype(np.complex64)
+                start = (self._cap_n * 7919) % (n - len(sig))
+                x[start:start + len(sig)] += sig
             else:
                 # Narrowband: tone 150 kHz off centre with FM wobble.
                 ph = (2 * np.pi * 150e3 * t
@@ -807,6 +864,9 @@ def main():
                     "Explicit --bands/--stare win over --plan.")
     ap.add_argument("--print", dest="print_only", action="store_true",
                     help="print packets as JSON lines instead of sending UDP")
+    ap.add_argument("--no-elrs", action="store_true",
+                    help="disable the ELRS chirp/Gemini signature detector "
+                    "(runs by default on 2.4 GHz / 900 MHz captures)")
     ap.add_argument("--sweeps", type=int, default=0,
                     help="run N sweeps then exit (0 = run forever)")
     args = ap.parse_args()
@@ -880,6 +940,7 @@ def main():
     dropped = 0
     last_warn = 0.0
     sig_hist = SigHistory()  # emitter-signature hints, per band
+    elrs = None if args.no_elrs else elrs_detect.ElrsDetector()
 
     def finite_all(vals):
         return all(math.isfinite(v) for v in vals)
@@ -889,6 +950,7 @@ def main():
             for label, center, bw in bands:
                 backend.tune(center, bw, args.gain)
                 ms = []
+                x_last = None
                 for _ in range(max(1, args.dwell)):
                     x = backend.capture(CAPTURE_N)
                     if x is None or len(x) < MIN_CAPTURE_N:
@@ -896,6 +958,7 @@ def main():
                     m = band_measurement(x, backend.sample_rate, bw)
                     if m is not None:
                         ms.append(m)
+                        x_last = x
                 if not ms:
                     # Reporting a fake "-120 dBFS" here would poison
                     # Shepherd's baseline and cause a phantom emitter on
@@ -932,6 +995,23 @@ def main():
                        "sig_hint": sig_hint,
                        "t": now}
                 emit(pkt)
+                # ELRS chirp / Gemini-signature detection (RX-only DSP;
+                # corroboration, never an identification). Runs on the
+                # 2.4 GHz and 900 MHz families only; the detector gates
+                # itself on narrowband activity.
+                if elrs is not None and x_last is not None:
+                    meas = {"peak_dbfs": top["peak_dbfs"], "noise": noise}
+                    try:
+                        chirps, sigs = elrs.observe(
+                            radio, label, center, now, x_last,
+                            backend.sample_rate, meas)
+                    except Exception as ex:  # DSP must never kill the sweep
+                        chirps, sigs = [], []
+                        if now - last_warn > 60.0:
+                            last_warn = now
+                            print(f"[bridge] elrs detector error: {ex}")
+                    for p in chirps + sigs:
+                        emit(p)
             sweeps_done += 1
             now = time.time()
             if now - last_beacon >= BEACON_S:
