@@ -17,8 +17,11 @@ import '../services/tracker.dart';
 import '../services/tripwire.dart';
 import '../services/field_activity.dart';
 import '../services/radio_driver.dart';
+import '../services/recorder.dart';
+import '../services/replay_driver.dart';
 import '../services/ai_classifier.dart';
 import '../services/track_stitcher.dart';
+import '../services/zmeta_adapter.dart';
 import '../utils/node_ids.dart';
 import '../services/wifi_aware.dart';
 import '../services/wifi_rtt.dart';
@@ -57,6 +60,11 @@ class AppSettings {
     this.baselineWindow = 120,
     this.simulatedMode = true,
     this.wifiDipThresholdDb = 6.0,
+    this.zmetaEnabled = false,
+    this.zmetaHost = '127.0.0.1',
+    this.zmetaPort = 5555,
+    this.zmetaPlatformId = 'shepherd-mesh-1',
+    this.zmetaSecured = false,
   });
 
   String radioIp;
@@ -70,6 +78,20 @@ class AppSettings {
   /// WiFi dip depth (dB below rolling median) that counts as a disturbance.
   double wifiDipThresholdDb;
 
+  /// ZMeta export: emit OBSERVATION/INFERENCE events per detection over
+  /// UDP to a ZMeta gateway (emit-only). One Shepherd mesh = one ZMeta
+  /// platform_id; the gateway fuses across meshes.
+  bool zmetaEnabled;
+  String zmetaHost;
+  int zmetaPort;
+  String zmetaPlatformId;
+
+  /// Operator's acknowledgment that the ZMeta link is secured (WireGuard
+  /// tunnel). The app can't verify the tunnel itself — this is the
+  /// operator's attestation, and the UI warns when export targets a
+  /// non-local host without it.
+  bool zmetaSecured;
+
   TripwireConfig get tripwireConfig => TripwireConfig(
         baselineWindow: baselineWindow,
         dipThreshold: dipThreshold,
@@ -79,6 +101,29 @@ class AppSettings {
 
 /// Central state: polling loop, tripwire processing, tracking fusion,
 /// chart history, events, node layout, and persistence.
+/// Per-node link-freshness health for the tracking map overlay.
+enum NodeHealthStatus {
+  /// Every link touching the node is live.
+  ok,
+  /// Some touching links are stale.
+  degraded,
+  /// Links exist but all are stale.
+  dead,
+  /// No links touch this node yet.
+  unknown,
+}
+
+/// Result of a camera-confirmation request. Upgrade-only by contract:
+/// camera evidence may raise displayed confidence, never suppress a
+/// detection.
+class CameraConfirmationResult {
+  const CameraConfirmationResult(this.status, this.note);
+
+  /// 'NOT_CONFIGURED' until a camera integration ships.
+  final String status;
+  final String note;
+}
+
 class AppState extends ChangeNotifier {
   AppState() {
     _loadLayout();
@@ -112,6 +157,21 @@ class AppState extends ChangeNotifier {
   /// Embedded disturbance classifier (tiny trained net). Null until the
   /// bundled model asset loads — or if the asset is missing.
   DisturbanceClassifier? _classifier;
+
+  /// ZMeta emit-only exporter. Created lazily on first use so a disabled
+  /// export path holds no socket.
+  ZMetaEmitter? _zmeta;
+
+  ZMetaEmitter _zmetaEmitter() {
+    final cur = _zmeta;
+    if (cur != null && cur.host == settings.zmetaHost && cur.port == settings.zmetaPort) {
+      return cur;
+    }
+    cur?.close();
+    final next = ZMetaEmitter(host: settings.zmetaHost, port: settings.zmetaPort);
+    _zmeta = next;
+    return next;
+  }
 
   /// Track-stitching specialist (tiny trained net). Starts model-less;
   /// swapped for the loaded one when the asset arrives. Without a model
@@ -232,6 +292,67 @@ class AppState extends ChangeNotifier {
 
   final List<CrossingEvent> events = [];
 
+  // ---- Alert triage ----
+  // Operator verdicts on crossing events. Keyed by [triageKeyFor]
+  // (`linkKey|timestampISO`); values are [triageAcked] or
+  // [triageFalseAlarm]. Triage never deletes or reclassifies an event —
+  // it only records the operator's verdict for review and tuning.
+  // Entries for evicted events are pruned when the event list is trimmed.
+  static const triageAcked = 'acked';
+  static const triageFalseAlarm = 'false_alarm';
+
+  final Map<String, String> triage = {};
+
+  /// Stable identity key for one crossing event.
+  static String triageKeyFor(CrossingEvent e) =>
+      '${e.linkKey}|${e.timestamp.toIso8601String()}';
+
+  /// Record a triage verdict for an event; tapping the same verdict
+  /// again clears it.
+  void triageEvent(CrossingEvent e, String verdict) {
+    final k = triageKeyFor(e);
+    if (triage[k] == verdict) {
+      triage.remove(k);
+    } else {
+      triage[k] = verdict;
+    }
+    notifyListeners();
+  }
+
+  /// Counts of {acked, falseAlarm, unreviewed} across the live event list.
+  Map<String, int> get triageStats {
+    var acked = 0;
+    var falseAlarm = 0;
+    for (final e in events) {
+      final v = triage[triageKeyFor(e)];
+      if (v == triageAcked) {
+        acked++;
+      } else if (v == triageFalseAlarm) {
+        falseAlarm++;
+      }
+    }
+    return {
+      'acked': acked,
+      'falseAlarm': falseAlarm,
+      'unreviewed': events.length - acked - falseAlarm,
+    };
+  }
+
+  /// Fraction of triaged events marked false alarm. Exposed for future
+  /// threshold auto-tuning — the app never auto-tunes today; a human
+  /// reads this number and adjusts the detector.
+  double get falseAlarmRate {
+    final s = triageStats;
+    final triaged = s['acked']! + s['falseAlarm']!;
+    if (triaged == 0) return 0.0;
+    return s['falseAlarm']! / triaged;
+  }
+
+  void _pruneTriage() {
+    final live = {for (final e in events) triageKeyFor(e)};
+    triage.removeWhere((k, _) => !live.contains(k));
+  }
+
   /// Live-mode node layout, field-local meters. Auto-grows with the mesh;
   /// no node-count limit. Persisted across restarts.
   final Map<String, NodePosition> nodePositions = {};
@@ -282,6 +403,70 @@ class AppState extends ChangeNotifier {
     });
     return out;
   }
+
+  /// All SDR band readings across live pollers (for the spectrum panel).
+  List<SdrBand> get sdrBands {
+    final out = <SdrBand>[];
+    for (final p in _pollers) {
+      final d = p.driver;
+      if (d is SdrDriver) out.addAll(d.latestBands);
+    }
+    return out;
+  }
+
+  /// True when at least one SDR driver is polling.
+  bool get hasSdrDriver => _pollers.any((p) => p.driver is SdrDriver);
+
+  /// Per-positioned-node health from link freshness, for the tracking
+  /// map's health overlay: ok = every touching link live, degraded =
+  /// some stale, dead = links exist but all stale, unknown = no links
+  /// touch this node yet.
+  Map<String, NodeHealthStatus> get nodeHealthMap {
+    final out = <String, NodeHealthStatus>{};
+    final now = DateTime.now();
+    for (final n in effectiveNodes.values) {
+      final id = n.nodeId;
+      var total = 0;
+      var live = 0;
+      history.forEach((key, samples) {
+        if (samples.isEmpty) return;
+        final parts = key.split(' → ');
+        if (parts.length == 2 && (parts[0] == id || parts[1] == id)) {
+          total++;
+          if (_isLive(samples.last, now)) live++;
+        }
+      });
+      out[id] = total == 0
+          ? NodeHealthStatus.unknown
+          : live == total
+              ? NodeHealthStatus.ok
+              : live > 0
+                  ? NodeHealthStatus.degraded
+                  : NodeHealthStatus.dead;
+    }
+    return out;
+  }
+
+  // ---- Camera confirmation (UPGRADE stub) ----
+  // No camera code exists yet. When a real integration ships, camera
+  // evidence may UPGRADE the displayed confidence of a detection — it
+  // must NEVER veto or suppress one. A detection stands on RF evidence
+  // alone; the camera can only add context.
+  bool cameraConfirmationEnabled = false;
+
+  void toggleCameraConfirmation(bool on) {
+    cameraConfirmationEnabled = on;
+    notifyListeners();
+  }
+
+  /// Upgrade-only camera confirmation request. STUB: always returns
+  /// NOT_CONFIGURED until a camera integration is wired in.
+  CameraConfirmationResult requestCameraConfirmation(CrossingEvent e) =>
+      const CameraConfirmationResult(
+        'NOT_CONFIGURED',
+        'No camera integration configured. '
+        'Detection stands on RF evidence alone.',
+      );
 
   void applySettings(AppSettings s) {
     final wasPolling = polling;
@@ -421,6 +606,67 @@ class AppState extends ChangeNotifier {
     _pollers.add(_DriverPoller(config: config, driver: driver));
   }
 
+  /// The session recorder. Toggle from Settings; records raw samples.
+  final RecordingService recorder = RecordingService();
+
+  bool get isRecording => recorder.isRecording;
+
+  /// True while a recording is being replayed instead of live radios.
+  bool replaying = false;
+
+  Future<String> startRecording() async {
+    final path = await recorder.start();
+    notifyListeners();
+    return path;
+  }
+
+  Future<String> stopRecording() async {
+    final summary = await recorder.stop();
+    notifyListeners();
+    return summary;
+  }
+
+  /// Replay a recording through the live detector pipeline: stops live
+  /// pollers, runs the CSV on its own clock with a fresh tripwire.
+  Future<void> startReplay(String path, {double speed = 1.0}) async {
+    stop();
+    replaying = true;
+    _tripwire = Tripwire(config: settings.tripwireConfig);
+    _tracker.reset();
+    track = null;
+    history.clear();
+    events.clear();
+    _latestByPoller.clear();
+    _lastSampleTs.clear();
+    final driver = ReplayDriver(path: path, speed: speed);
+    _addPoller(
+      RadioConfig(
+        driverId: 'replay',
+        address: path,
+        label: 'REPLAY ${speed}x',
+        pollInterval: 0.25,
+      ),
+      driver,
+    );
+    polling = true;
+    connectionLabel = 'Replaying recording…';
+    notifyListeners();
+    for (final p in _pollers) {
+      _tickPoller(p);
+      p.timer = Timer.periodic(
+        const Duration(milliseconds: 250),
+        (_) => _tickPoller(p),
+      );
+    }
+  }
+
+  void stopReplay() {
+    replaying = false;
+    stop();
+    connectionLabel = 'Idle — press Start';
+    notifyListeners();
+  }
+
   void stop() {
     _startPending = false;
     for (final p in _pollers) {
@@ -449,6 +695,11 @@ class AppState extends ChangeNotifier {
       // restart) while this poll was in flight. Its samples belong to a
       // session that no longer exists; don't let them into the new one.
       if (!polling || !_pollers.contains(p)) return;
+      if (recorder.isRecording) {
+        for (final r in raw) {
+          recorder.record(r);
+        }
+      }
       p.status.lastPoll = DateTime.now();
       p.status.linkCount = raw.length;
       p.status.error = raw.isEmpty ? p.driver.emptyHint : null;
@@ -479,9 +730,14 @@ class AppState extends ChangeNotifier {
       ];
       if (classified.isNotEmpty) unawaited(_alert(AlertKind.detection));
       events.insertAll(0, classified);
+      if (settings.zmetaEnabled && classified.isNotEmpty) {
+        // Emit-only ZMeta export: must never disturb detection.
+        unawaited(_emitZmeta(classified));
+      }
       if (events.length > 200) {
         events.removeRange(200, events.length);
       }
+      _pruneTriage();
       if (!settings.simulatedMode) _ensureNodes(raw);
       _updateFusedTrack();
       _refreshConnectionLabel();
@@ -525,13 +781,15 @@ class AppState extends ChangeNotifier {
         for (final s in batch)
           if (_isLive(s, now)) s,
     ];
-    // Spectrum-band virtual links (SDR energy watch) feed the tripwire
-    // and alerts like any link, but they carry no geometry -- a hot band
-    // is not a position. Keep them out of the position solver, the
+    // Spectrum-band virtual links (SDR energy watch) and KrakenSDR
+    // bearings feed the tripwire and alerts like any link, but they carry
+    // no geometry -- a hot band is not a position, and one bearing is a
+    // direction, not a fix. Keep them out of the position solver, the
     // shadow grid, and the stitcher so they can't drag the track.
     final geo = [
       for (final s in all)
-        if (driverOf(s.fromNode) != 'sdr') s,
+        if (driverOf(s.fromNode) != 'sdr' && driverOf(s.fromNode) != 'kraken')
+          s,
     ];
     track = _tracker.update(
       now: now,
@@ -655,6 +913,95 @@ class AppState extends ChangeNotifier {
       return e.copyWith(aiLabel: label, aiConfidence: conf);
     } catch (_) {
       return e;
+    }
+  }
+
+  /// ZMeta export (emit-only): one OBSERVATION_EVENT per crossing, plus
+  /// an INFERENCE_EVENT when the embedded classifier labeled it. Never
+  /// throws — a down gateway must not disturb detection.
+  Future<void> _emitZmeta(List<CrossingEvent> evts) async {
+    try {
+      final emitter = _zmetaEmitter();
+      final platform = settings.zmetaPlatformId.trim().isEmpty
+          ? 'shepherd-mesh-1'
+          : settings.zmetaPlatformId.trim();
+      for (final e in evts) {
+        final rf = _zmetaRf(e.linkKey);
+        if (rf == null) continue; // refuse rather than fabricate
+        final obs = zmetaObservation(
+          platformId: platform,
+          sensorId: e.linkKey,
+          ts: e.timestamp,
+          linkKey: e.linkKey,
+          driverId: driverOf(e.linkKey.split(' → ').first),
+          dipDepthDb: e.dipDepth,
+          direction: e.direction,
+          durationSecs: e.durationSecs,
+          sizeEstimate: e.sizeEstimate,
+          freqHz: rf.freqHz,
+          bwHz: rf.bwHz,
+          viaVariance: e.viaVariance,
+          energyDbfs: rf.energyDbfs,
+          doaArrayRelativeDeg: rf.doaDeg,
+        );
+        await emitter.send(obs);
+        if (e.aiLabel != null && e.aiConfidence != null) {
+          final obsId = (obs['event'] as Map)['event_id'] as String;
+          await emitter.send(zmetaInference(
+            platformId: platform,
+            observationId: obsId,
+            ts: e.timestamp,
+            label: e.aiLabel!,
+            confidence: e.aiConfidence!,
+          ));
+        }
+      }
+    } catch (_) {}
+  }
+
+  /// Honest RF parameters for a link key, or null when they can't be
+  /// established (the event is then refused, not fabricated).
+  _ZmetaRf? _zmetaRf(String linkKey) {
+    final parts = linkKey.split(' → ');
+    final driver = driverOf(parts.first);
+    switch (driver) {
+      case 'silvus':
+      case 'sim':
+        // His Silvus pair: 2440 MHz, 10 MHz channel.
+        return const _ZmetaRf(2440000000, 10000000);
+      case 'sdr':
+        // Virtual link `sdr:<radio> → sdr:band-<label>`: look up the
+        // band the bridge last reported.
+        if (parts.length < 2) return null;
+        final label = parts[1].startsWith('sdr:band-')
+            ? parts[1].substring('sdr:band-'.length)
+            : parts[1];
+        for (final p in _pollers) {
+          final d = p.driver;
+          if (d is SdrDriver) {
+            for (final b in d.latestBands) {
+              if (b.band == label) {
+                return _ZmetaRf(
+                  b.centerMhz * 1e6,
+                  b.bwMhz * 1e6,
+                  energyDbfs: b.energyDbfs,
+                );
+              }
+            }
+          }
+        }
+        return null;
+      case 'kraken':
+        // Virtual link `kraken:doa → kraken:<freq>MHz`.
+        if (parts.length < 2) return null;
+        final m = RegExp(r'([\d.]+)MHz').firstMatch(parts[1]);
+        final mhz = m == null ? null : double.tryParse(m.group(1)!);
+        if (mhz == null) return null;
+        final h = history[linkKey];
+        final doa = (h != null && h.isNotEmpty) ? h.last.bearingDeg : null;
+        return _ZmetaRf(mhz * 1e6, 0.0, doaDeg: doa);
+      default:
+        return null;
     }
   }
 
@@ -970,6 +1317,8 @@ class AppState extends ChangeNotifier {
     _disposed = true;
     _watchdog?.cancel();
     _watchdog = null;
+    _zmeta?.close();
+    _zmeta = null;
     for (final p in _pollers) {
       p.timer?.cancel();
       try {
@@ -983,6 +1332,15 @@ class AppState extends ChangeNotifier {
 }
 
 /// One driver's poll loop state.
+/// Honest RF parameters for one link, resolved for ZMeta export.
+class _ZmetaRf {
+  const _ZmetaRf(this.freqHz, this.bwHz, {this.doaDeg, this.energyDbfs});
+  final double freqHz;
+  final double bwHz;
+  final double? doaDeg;
+  final double? energyDbfs;
+}
+
 class _DriverPoller {
   _DriverPoller({required this.config, required this.driver})
       : status = DriverStatus(

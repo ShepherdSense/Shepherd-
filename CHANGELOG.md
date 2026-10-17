@@ -1,5 +1,80 @@
 # Changelog
 
+## 0.15.0 — capabilities build ("do it all")
+
+New sensing, fusion, and operator-interface capabilities from the
+2026-10-16 research pass, plus the ZMeta integration. All validated:
+`flutter analyze` clean, 51/51 Dart tests, 20/20 SDR bridge tests,
+firmware compiles in all 5 flag configs (50-51% flash / 19-20% RAM).
+
+### Detection: fade-aware tripwire + VRTI second channel
+
+- **Fade-signed detection.** Links now carry a fade level (link baseline
+  median vs. network median of link medians); disturbances are judged
+  against their *expected* direction — deep-fade links are expected to
+  RISE when disturbed, others to DIP. Gate ±3.0 dB. (Wilson & Patwari
+  2012; Kaltiokallio et al. 2014.)
+- **VRTI variance channel.** A second detection channel fires when the
+  mean is quiet but RSS variance jumps (varWindow 12, varK 3.0) —
+  catches slow movers the mean channel misses. Firing samples are
+  excluded from the variance window so one blip can't pollute it.
+- `CrossingEvent` gains `direction` ('dip'/'rise') and `viaVariance`;
+  summaries and the evidence view render both honestly.
+
+### SDR bridge: band plans + FHSS signature detector
+
+- `--plan {fpv,dji,longrange,lora}` presets (fpv: 1290/2437/5780 MHz;
+  dji: 2437/5780; longrange/lora: 433/868/915).
+- Rolling sub-band occupancy detector emits additive `sig_hint`:
+  `fhss-2g4` (ELRS-like), `fhss-900m`, `ofdm-5g` (DJI O4-like),
+  `tone-5g8` (analog FPV). Signatures, never identity — documented
+  honest limits. 20/20 bridge tests pass.
+
+### ZMeta integration (tactical → operational)
+
+- **Emit-only adapter** (`lib/services/zmeta_adapter.dart`):
+  CrossingEvent → `OBSERVATION_EVENT`/`RF`, AI label →
+  `INFERENCE_EVENT`/`CLASSIFICATION` with genuine lineage, over UDP to
+  the gateway (default 127.0.0.1:5555). Validated against ZMeta's own
+  `tools/validate.py --strict`: 3/3 pass.
+- Documented `power_dbm: 0.0` sentinel (passive link sensors don't
+  measure emitter power — follows ZMeta's own sentinel precedent),
+  flagged in `quality.shepherd_power_sentinel`.
+- **Secured transport (required):** WireGuard hub-and-spoke package in
+  `field_kit/zmeta_secure/` (double-click keygen, mesh/gateway configs,
+  peer registry). Architecture: Shepherd at the tactical level, ZMeta
+  fusing at the operational/strategic level. Full doc:
+  `docs/zmeta_deployment.md`. Settings gains a link-secured
+  acknowledgment with an honest warning on unsecured non-local targets.
+
+### Firmware (ESP32 node)
+
+- LD2450 24 GHz mmWave radar support (`LD2450_ON`, default off).
+- GPS PPS time sync + position in beacons (always on, silent if absent).
+- ESP-NOW relay with dedup cache and TTL (default off).
+- MPU6050 IMU motion channel (default off) — carrier-motion context,
+  never an intrusion signal. All 5 flag combos compile.
+
+### Operator interface
+
+- Event timeline scrubber (tap any event → evidence sheet).
+- Honest confidence qualifiers on the alert panel and event rows.
+- Alert triage: ACK / FALSE ALARM per event, triage stats, and
+  `falseAlarmRate` exposed for human-led threshold tuning (the app
+  never auto-tunes).
+- Spectrum-band panel (per-band energy bars, SDR only).
+- Node health map overlay on the tracking screen.
+- Camera confirmation hook (upgrade-only stub; camera may upgrade
+  confidence display, never veto a detection).
+
+### R&D tools (offline, not shipped in the app)
+
+- `field_kit/passive_radar/`: passive coherent location demo
+  (DVB-T-like illuminator, ECA clutter cancel, CAF + CFAR) — synthetic
+  target detected at 0.0% range/Doppler error; honest-scope README.
+- `tools/stone_soup_bench/`: Stone Soup tracker prototyping against
+  Shepherd-schema CSVs (24/28 tracks matched, purity 0.86 on synthetic).
+
 ## 0.14.5 — review pass
 
 Bug fixes and hardening from a full read-through. Dart changes were made

@@ -16,6 +16,10 @@ Built by **Draco**.
 - **Nearby wireless** — passive BLE advertisement scanning with vendor decoding, plus LAN device sweep.
 - **Embedded tiny AI (offline)** — pure-Dart neural nets running fully on-device: a crossing-event classifier and a track-stitching specialist, both trained on synthetic scenarios. No cloud, no LLM.
 - **GPS positioning** — walk to each node and capture its position; defended-point marker with INBOUND / OUTBOUND / TRANSITING readouts.
+- **ZMeta export (tactical → operational)** — emit-only ZMeta event adapter: detections ship as `OBSERVATION_EVENT`/`INFERENCE_EVENT` over UDP to a ZMeta gateway, which fuses across Shepherd meshes. The tactical→operational link is secured with WireGuard (`field_kit/zmeta_secure/`).
+- **Fade-aware tripwire + VRTI** — per-link fade levels judge disturbances against their expected direction (dip vs. rise); a variance channel catches slow movers the mean misses.
+- **SDR FHSS signature detector** — band-plan presets (`--plan fpv/dji/longrange/lora`) and rolling sub-band occupancy hints (`fhss-2g4`, `ofdm-5g`, …): signatures, never identity.
+- **Operator tools** — event timeline scrubber, alert triage (ACK / false-alarm with tuning stats), spectrum-band panel, node health map, record/replay with "why did it alert" evidence view.
 
 ## What it works with
 
@@ -26,6 +30,7 @@ Built by **Draco**.
 | MPU5 / Wave Relay | **Planned** | Driver stub in the multi-driver framework |
 | Meshtastic nodes | **Planned** | Cheap GPS/PIR field nodes; driver wakes when hardware is on hand |
 | This device's Wi-Fi + BLE | **Live** | Windows via `netsh`; passive scan only |
+| ZMeta gateway | **Live** | Emit-only event export (Settings → ZMeta export); gateway fuses across meshes; link secured via WireGuard |
 
 Two mesh nodes = one link = tripwire. Three or more nodes unlock tracking.
 
