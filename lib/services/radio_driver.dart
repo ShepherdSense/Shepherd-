@@ -10,6 +10,9 @@
 /// across vendors, and per-link tripwire baselines stay independent.
 library;
 
+import 'dart:convert';
+import 'dart:io';
+
 import '../models/link_sample.dart';
 import '../models/tracking.dart';
 import 'silvus_api.dart';
@@ -25,7 +28,7 @@ class RadioConfig {
     this.pollInterval = 0.25,
   });
 
-  /// 'silvus' | 'mpu5' | 'harris' | 'simulated'.
+  /// 'silvus' | 'mpu5' | 'harris' | 'ad936x' | 'simulated'.
   final String driverId;
 
   /// IP/host for network drivers; '' for simulated.
@@ -76,7 +79,7 @@ class DriverStatus {
 
 /// The contract every radio family implements.
 abstract class RadioDriver {
-  /// 'silvus' | 'mpu5' | 'harris' | 'simulated'.
+  /// 'silvus' | 'mpu5' | 'harris' | 'ad936x' | 'simulated'.
   String get driverId;
 
   /// Human label, e.g. 'SILVUS'.
@@ -226,6 +229,215 @@ class L3HarrisDriver extends RadioDriver {
   Future<bool> probe() async => false;
 }
 
+/// One band-energy reading from the PC-side `ad936x_bridge.py`.
+/// Pure data + parsing; unit-tested in test/ad936x_packet_test.dart.
+class Ad936xBand {
+  Ad936xBand({
+    required this.radio,
+    required this.band,
+    required this.centerMhz,
+    required this.bwMhz,
+    required this.energyDbfs,
+    required this.noiseDbfs,
+    required this.binsDbfs,
+    required this.t,
+  });
+
+  final String radio;
+  final String band;
+  final double centerMhz;
+  final double bwMhz;
+
+  /// Band-median PSD in dBFS (negative). The stable wideband metric.
+  final double energyDbfs;
+
+  /// 10th-percentile PSD: the band's noise floor estimate, dBFS.
+  final double noiseDbfs;
+
+  /// Per-sub-band (8) PEAK PSD, dBFS. Catches narrowband emitters the
+  /// median ignores; peak-based, so spur-sensitive.
+  final List<double> binsDbfs;
+
+  final DateTime t;
+
+  /// Parse a decoded bridge datagram. Returns null for beacons,
+  /// wrong versions, and malformed packets (never throws).
+  static Ad936xBand? tryParse(Map<String, dynamic> j) {
+    try {
+      if (j['v'] != 1 || j['kind'] != 'band') return null;
+      final bins = (j['bins_dbfs'] as List)
+          .map((e) => (e as num).toDouble())
+          .toList();
+      return Ad936xBand(
+        radio: '${j['radio']}',
+        band: '${j['band']}',
+        centerMhz: (j['center_mhz'] as num).toDouble(),
+        bwMhz: (j['bw_mhz'] as num).toDouble(),
+        energyDbfs: (j['energy_dbfs'] as num).toDouble(),
+        noiseDbfs: (j['noise_dbfs'] as num).toDouble(),
+        binsDbfs: bins,
+        t: DateTime.fromMillisecondsSinceEpoch(
+            ((j['t'] as num).toDouble() * 1000).round()),
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Virtual link `ad936x:<radio> → ad936x:band-<label>`.
+  ///
+  /// Polarity convention (shared with the bridge): bridge energy is dBFS
+  /// (negative). Negated into [LinkSample.snr], an emitter APPEARING in
+  /// the band reads as a positive "dip" in dB for the tripwire:
+  /// dip = baseline - snr = energy_now - energy_baseline. Sub-band peaks
+  /// ride along in [LinkSample.pcns] for investigation.
+  LinkSample toLinkSample() => LinkSample(
+        timestamp: t,
+        fromNode: 'ad936x:$radio',
+        toNode: 'ad936x:band-$band',
+        snr: -energyDbfs,
+        noiseFrom: -noiseDbfs,
+        pcns: [for (final b in binsDbfs) -b],
+      );
+}
+
+/// AD936x spectrum-sensor driver: listens for the PC-side bridge
+/// (`field_kit/ad936x_bridge/ad936x_bridge.py`, driving an ADALM-Pluto or
+/// Ettus USRP B200/B210 — RX only, never transmits) on UDP.
+///
+/// Each watched band becomes a virtual tripwire link, so the whole
+/// downstream pipeline (adaptive thresholds, baseline hold, alerts,
+/// event log) works unchanged. Honest scope: one radio reports band
+/// ENERGY, not direction, range, or identity — and these virtual links
+/// carry no geometry, so app_state keeps them out of the position
+/// solver, shadow grid, and stitcher. Alerts still fire.
+class Ad936xDriver extends RadioDriver {
+  Ad936xDriver({required this.host, required this.port});
+
+  /// The bridge's destination, i.e. where THIS app listens:
+  /// "127.0.0.1:49161" (default), "host", or "host:port".
+  factory Ad936xDriver.fromAddress(String address) {
+    var host = '127.0.0.1';
+    var port = defaultBridgePort;
+    final addr = address.trim();
+    if (addr.isNotEmpty) {
+      final i = addr.lastIndexOf(':');
+      if (i > 0) {
+        host = addr.substring(0, i);
+        port = int.tryParse(addr.substring(i + 1)) ?? port;
+      } else {
+        host = addr;
+      }
+    }
+    return Ad936xDriver(host: host, port: port);
+  }
+
+  /// UDP port the bridge sends to (and this driver listens on).
+  static const int defaultBridgePort = 49161;
+
+  final String host;
+  final int port;
+
+  RawDatagramSocket? _socket;
+  DateTime? _lastBeaconAt;
+  String _bridgeBackend = '';
+  final Map<String, Ad936xBand> _latest = {};
+  final Map<String, DateTime> _arrivedAt = {};
+  DateTime _lastPoll = DateTime.fromMillisecondsSinceEpoch(0);
+
+  /// What the bridge last announced itself as ('' until first beacon).
+  String get bridgeBackend => _bridgeBackend;
+
+  Future<void> _ensureSocket() async {
+    _socket ??= await RawDatagramSocket.bind(InternetAddress(host), port);
+  }
+
+  void _handle(List<int> data) {
+    Map<String, dynamic>? j;
+    try {
+      j = jsonDecode(utf8.decode(data)) as Map<String, dynamic>;
+    } catch (_) {
+      return;
+    }
+    if (j['v'] != 1) return;
+    if (j['kind'] == 'beacon') {
+      _lastBeaconAt = DateTime.now();
+      final b = j['backend'];
+      if (b is String) _bridgeBackend = b;
+      return;
+    }
+    final band = Ad936xBand.tryParse(j);
+    if (band == null) return;
+    final key = '${band.radio}:${band.band}';
+    _latest[key] = band;
+    _arrivedAt[key] = DateTime.now();
+  }
+
+  void _drain() {
+    final s = _socket;
+    if (s == null) return;
+    Datagram? d;
+    while ((d = s.receive()) != null) {
+      _handle(d!.data);
+    }
+  }
+
+  @override
+  String get driverId => 'ad936x';
+
+  @override
+  String get label => 'AD936X';
+
+  @override
+  bool get isImplemented => true;
+
+  @override
+  Future<List<LinkSample>> poll() async {
+    await _ensureSocket();
+    _drain();
+    final now = DateTime.now();
+    final out = <LinkSample>[];
+    for (final e in _latest.entries) {
+      final arrived = _arrivedAt[e.key];
+      if (arrived != null && arrived.isAfter(_lastPoll)) {
+        out.add(e.value.toLinkSample());
+      }
+    }
+    _lastPoll = now;
+    return out;
+  }
+
+  @override
+  Future<bool> probe() async {
+    try {
+      await _ensureSocket();
+    } catch (_) {
+      return false;
+    }
+    // Listen briefly for a bridge beacon; the bridge is a separate
+    // process the user starts, so "not heard yet" is not a failure of
+    // this endpoint -- but probe() reports what setup validation needs:
+    // true only when the bridge is actually talking.
+    final deadline = DateTime.now().add(const Duration(seconds: 2));
+    while (DateTime.now().isBefore(deadline)) {
+      _drain();
+      final heard = _lastBeaconAt;
+      if (heard != null &&
+          DateTime.now().difference(heard) < const Duration(seconds: 30)) {
+        return true;
+      }
+      await Future.delayed(const Duration(milliseconds: 100));
+    }
+    return false;
+  }
+
+  @override
+  void dispose() {
+    _socket?.close();
+    _socket = null;
+  }
+}
+
 /// Build a driver from a config. Throws for unimplemented families.
 RadioDriver driverFor(RadioConfig config) {
   switch (config.driverId) {
@@ -235,6 +447,8 @@ RadioDriver driverFor(RadioConfig config) {
       return Mpu5Driver();
     case 'harris':
       return L3HarrisDriver();
+    case 'ad936x':
+      return Ad936xDriver.fromAddress(config.address);
     default:
       throw ArgumentError('Unknown driver: ${config.driverId}');
   }
@@ -243,6 +457,7 @@ RadioDriver driverFor(RadioConfig config) {
 /// Driver types the user can pick in the radio manager.
 const List<({String id, String label, bool implemented})> driverTypes = [
   (id: 'silvus', label: 'SILVUS', implemented: true),
+  (id: 'ad936x', label: 'AD936X (Pluto / USRP)', implemented: true),
   (id: 'mpu5', label: 'MPU5 (Wave Relay)', implemented: false),
   (id: 'harris', label: 'L3HARRIS', implemented: false),
 ];

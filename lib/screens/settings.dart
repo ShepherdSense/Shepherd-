@@ -178,8 +178,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             '${t.label}${t.implemented ? '' : ' (SOON)'}'),
                       ),
                   ],
-                  onChanged: (v) =>
-                      setState(() => _newDriverId = v ?? 'silvus'),
+                  onChanged: (v) => setState(() {
+                    _newDriverId = v ?? 'silvus';
+                    // The AD936x bridge talks to this app on UDP; prefill
+                    // the listen endpoint so it is one tap, not a guess.
+                    if (_newDriverId == 'ad936x' &&
+                        _newAddress.text.trim().isEmpty) {
+                      _newAddress.text = '127.0.0.1:49161';
+                    }
+                  }),
                 ),
               ),
               const SizedBox(width: 8),

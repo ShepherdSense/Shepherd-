@@ -477,15 +477,23 @@ class AppState extends ChangeNotifier {
         for (final s in batch)
           if (_isLive(s, now)) s,
     ];
+    // Spectrum-band virtual links (AD936x energy watch) feed the tripwire
+    // and alerts like any link, but they carry no geometry -- a hot band
+    // is not a position. Keep them out of the position solver, the
+    // shadow grid, and the stitcher so they can't drag the track.
+    final geo = [
+      for (final s in all)
+        if (driverOf(s.fromNode) != 'ad936x') s,
+    ];
     track = _tracker.update(
       now: now,
-      samples: all,
+      samples: geo,
       nodes: effectiveNodes,
       dipThreshold: settings.dipThreshold,
       defended: defended,
     );
     shadow = _tracker.shadowGrid(
-      samples: all,
+      samples: geo,
       nodes: effectiveNodes,
       dipThreshold: settings.dipThreshold,
     );
@@ -495,13 +503,13 @@ class AppState extends ChangeNotifier {
     // another — and scores P(same mover).
     _stitcher.observe(
       now: now,
-      samples: all,
+      samples: geo,
       nodes: effectiveNodes,
       dipThreshold: settings.dipThreshold,
     );
     if (track != null) {
       final activeDrivers = <String>{};
-      for (final s in all) {
+      for (final s in geo) {
         if (s.isDisturbed(settings.dipThreshold)) {
           activeDrivers.add(driverOf(s.fromNode));
         }

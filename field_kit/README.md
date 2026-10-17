@@ -26,6 +26,26 @@ layer, not Silvus-grade MIMO. It reports link disturbances, never
 identities. Event classes (PASSING/LINGERING) are crude duration
 heuristics shown as estimates.
 
+## The AD936x SDR bridge
+
+Got an ADALM-Pluto or Ettus USRP B200/B210? `ad936x_bridge/` turns it into
+a Shepherd sensor. **Receive only — the bridge never transmits.**
+
+Double-click `RUN_AD936X_BRIDGE.bat` on the PC (with `--simulate` for a
+hardware-free test, `--backend pluto` / `--backend uhd` for hardware).
+The bridge sweeps the drone bands (433 / 915 / 1290 / 2437 / 5780 MHz),
+measures per-band RF energy, and ships readings to Shepherd over UDP.
+Shepherd treats each band as a virtual tripwire link — an emitter
+*appearing* in a band reads as a link dip, so adaptive thresholds,
+baseline hold, alerts, and the event log all work unchanged. In the app:
+Settings → add radio → **AD936X (Pluto / USRP)** (address prefills to
+`127.0.0.1:49161`).
+
+**Honest scope:** one radio reports band *energy*, not direction, range,
+or identity. Band links are kept out of the position solver (no geometry)
+— alerts and the event log are the product. Full spec:
+`docs/ad936x_driver_spec.md` in the repo.
+
 ## Automatic detection
 
 Nodes announce themselves two ways: UDP beacons on port 49160 and mDNS

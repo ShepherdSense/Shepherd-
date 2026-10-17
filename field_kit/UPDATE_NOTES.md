@@ -1,6 +1,26 @@
 # Field Kit v1 — update notes (2026-10-16)
 
-## What's new
+## v1.1 — AD936x SDR support (evening)
+
+**AD936x spectrum-sensor bridge** (`field_kit/ad936x_bridge/`) — owners of
+ADALM-Pluto / USRP B200/B210 hardware can now use their radios with
+Shepherd. Receive only, by construction (no TX code path exists).
+
+- `ad936x_bridge.py`: sweeps the drone bands (433/915/1290/2437/5780 MHz)
+  or stares at one; per-band energy + sub-band peaks over UDP to Shepherd.
+  Backends: pluto (pyadi-iio), uhd (B200/B210), simulate (scripted synthetic
+  spectrum — verifies the whole pipeline with no hardware), auto.
+- `RUN_AD936X_BRIDGE.bat`: double-click launcher (venv + deps + run).
+- **In-app driver** (`Ad936xDriver`, in this release's source): each band
+  becomes a virtual tripwire link via a polarity trick — negated dBFS
+  energy makes an emitter *appearing* read as a link dip, so adaptive
+  thresholds, baseline hold, alerts, and the event log work unchanged.
+  Band links are deliberately excluded from the position solver (no
+  geometry); alerts are the product. Add via Settings → AD936X.
+- Honest limits: one radio = energy, not direction; sweep gaps are real
+  (stare mode closes them for one band); dBFS is gain-relative.
+
+## v1.0 — initial field kit (morning)
 
 **ESP32 Shepherd Node firmware** (`field_kit/esp32/`) — flash once, then
 every USB plug-in is just power. The node boots, hosts its own WiFi AP,
