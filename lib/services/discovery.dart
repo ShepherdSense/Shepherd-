@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'silvus_api.dart';
 
@@ -12,11 +13,15 @@ class DiscoveredRadio {
     required this.ip,
     required this.nodeIds,
     required this.nodeNames,
+    this.driverId = 'silvus',
   });
 
   final String ip;
   final List<String> nodeIds;
   final List<String> nodeNames;
+
+  /// 'silvus' | 'meshtastic' — which driver this find is for.
+  final String driverId;
 
   String get label =>
       nodeNames.isEmpty ? ip : '$ip (${nodeNames.join(', ')})';
@@ -70,6 +75,89 @@ class RadioDiscovery {
       return null;
     } finally {
       api.close();
+    }
+  }
+
+  /// Scan a CIDR for Meshtastic nodes (TCP 4403 client API). Same
+  /// host expansion as [scanSubnet]; each host gets a want_config
+  /// handshake and must answer with a framed FromRadio header.
+  static Future<List<DiscoveredRadio>> scanMeshtastic(
+    String cidr, {
+    void Function(int done, int total)? onProgress,
+  }) async {
+    final hosts = _hostsFor(cidr);
+    final found = <DiscoveredRadio>[];
+    var done = 0;
+    const chunk = 32;
+    for (var i = 0; i < hosts.length; i += chunk) {
+      final end = i + chunk > hosts.length ? hosts.length : i + chunk;
+      final slice = hosts.sublist(i, end);
+      final results = await Future.wait(slice.map(_probeMeshtastic));
+      for (final r in results) {
+        if (r != null) found.add(r);
+      }
+      done += slice.length;
+      onProgress?.call(done, hosts.length);
+    }
+    return found;
+  }
+
+  /// TCP 4403 + want_config handshake. A real Meshtastic client API
+  /// answers with framed FromRadio packets (header 0x94 0xC3).
+  static Future<DiscoveredRadio?> _probeMeshtastic(String ip) async {
+    Socket? s;
+    try {
+      s = await Socket.connect(
+        ip,
+        4403,
+        timeout: const Duration(milliseconds: 900),
+      );
+      // ToRadio{want_config_id=42}, framed.
+      s.add(const [0x94, 0xC3, 0x00, 0x02, 0x18, 0x2A]);
+      final completer = Completer<bool>();
+      final seen = BytesBuilder();
+      late StreamSubscription<List<int>> sub;
+      sub = s.listen(
+        (data) {
+          seen.add(data);
+          final b = seen.toBytes();
+          for (var i = 0; i + 1 < b.length; i++) {
+            if (b[i] == 0x94 && b[i + 1] == 0xC3) {
+              if (!completer.isCompleted) completer.complete(true);
+              sub.cancel();
+              return;
+            }
+          }
+          if (seen.length > 2048 && !completer.isCompleted) {
+            completer.complete(false);
+            sub.cancel();
+          }
+        },
+        onError: (_) {
+          if (!completer.isCompleted) completer.complete(false);
+        },
+        onDone: () {
+          if (!completer.isCompleted) completer.complete(false);
+        },
+        cancelOnError: true,
+      );
+      final ok = await completer.future.timeout(
+        const Duration(seconds: 3),
+        onTimeout: () => false,
+      );
+      if (!ok) return null;
+      return DiscoveredRadio(
+        ip: ip,
+        nodeIds: const [],
+        nodeNames: const [],
+        driverId: 'meshtastic',
+      );
+    } catch (_) {
+      return null;
+    } finally {
+      try {
+        s?.destroy();
+      } catch (_) {}
     }
   }
 

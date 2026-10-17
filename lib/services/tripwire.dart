@@ -123,6 +123,15 @@ class Tripwire {
 
   final TripwireConfig config;
 
+  /// Polls of history before the baseline is trusted, clamped to ≥ 1:
+  /// a 0 would open the "trusted" gate on an empty history and
+  /// `_medianSorted([])` would throw a RangeError.
+  int get _minBaseline => config.minBaseline < 1 ? 1 : config.minBaseline;
+
+  /// Variance window actually used: never below 1 poll — a 0/negative
+  /// varWindow would otherwise drain the window on every poll.
+  int get _varWindow => math.max(1, config.varWindow);
+
   final Map<String, ListQueue<double>> _hist = {};
   final Map<String, int> _dipCount = {};
   final Map<String, DateTime> _dipStart = {};
@@ -161,11 +170,19 @@ class Tripwire {
   /// deep-fade links, the larger of the two on intermediate links) —
   /// always ≥ 0 when disturbed.
   LinkSample process(LinkSample raw) {
-    final key = raw.linkKey;
-    final hist = _hist.putIfAbsent(key, () => ListQueue<double>());
     final snr = raw.snr;
 
-    final trusted = hist.length >= config.minBaseline;
+    // Non-finite SNR is never real data: NaN poisons the median
+    // baseline, -inf would confirm a bogus max-depth event. Drop the
+    // sample before it touches any history.
+    if (snr != null && !snr.isFinite) {
+      return raw;
+    }
+
+    final key = raw.linkKey;
+    final hist = _hist.putIfAbsent(key, () => ListQueue<double>());
+
+    final trusted = hist.length >= _minBaseline;
     var baseline = double.nan;
     var threshold = config.dipThreshold;
     var dev = 0.0;
@@ -204,16 +221,23 @@ class Tripwire {
     // when the mean barely moves. It only fires when the mean channel is
     // quiet (|dev| < threshold) — the two channels are complementary:
     // large mean shifts are judged by the signed mean test, subtle
-    // motion by variance.
+    // motion by variance. It also needs a TRUSTED baseline: during
+    // warmup dev is 0.0, which would leave this gate trivially open and
+    // let a variance event confirm before the mean baseline is learned.
     var varDisturbed = false;
     double? vNow;
-    if (snr != null && config.varianceChannel && dev.abs() < threshold) {
+    if (trusted &&
+        snr != null &&
+        config.varianceChannel &&
+        dev.abs() < threshold) {
       final vh = _varHist.putIfAbsent(key, () => ListQueue<double>());
       vh.addLast(snr);
-      while (vh.length > config.varWindow) {
+      while (vh.length > _varWindow) {
         vh.removeFirst();
       }
-      if (vh.length >= 8) {
+      // The confirmation window never exceeds the stored window: a
+      // varWindow below 8 would otherwise silently disable the channel.
+      if (vh.length >= math.min(8, _varWindow)) {
         vNow = _variance(vh);
         final base = _varBase[key];
         if (base != null &&

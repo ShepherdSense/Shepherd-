@@ -1,3 +1,6 @@
+import 'dart:async';
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 
 import '../services/discovery.dart';
@@ -29,10 +32,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late final TextEditingController _zmetaHost;
   late final TextEditingController _zmetaPort;
   late final TextEditingController _zmetaPlatform;
+  late final TextEditingController _zmetaHeartbeatInterval;
+  late final TextEditingController _camPort;
+  late final TextEditingController _camOnvif;
+  late final TextEditingController _camSnap;
   late bool _simulated;
   late bool _wifiVision;
   late bool _zmetaEnabled;
   late bool _zmetaSecured;
+  late bool _zmetaHeartbeatEnabled;
   late bool _camera;
   String _newDriverId = 'silvus';
 
@@ -41,9 +49,26 @@ class _SettingsScreenState extends State<SettingsScreen> {
   List<DiscoveredRadio> _found = [];
   String? _scanError;
 
+  /// Cached replay listing: creating the Future in build() refires the
+  /// disk scan on every rebuild. Refreshed when recordings change.
+  late Future<List<File>> _replayFuture;
+
+  void _refreshReplayList() {
+    _replayFuture = RecordingService.listRecordings();
+  }
+
   /// True for loopback targets, where no wire is involved.
-  static bool _isLocalHost(String h) =>
-      h == '127.0.0.1' || h == '::1' || h.toLowerCase() == 'localhost';
+  /// Canonical definition is [zmetaIsLocalHost] (services/zmeta_adapter.dart,
+  /// imported via state/app_state.dart) — shared with the fail-closed
+  /// emit path so the UI warning and the enforcement gate can never drift.
+  static bool _isLocalHost(String h) => zmetaIsLocalHost(h);
+
+  /// Separator-aware basename: recordings live under the documents dir,
+  /// whose path uses '\' on Windows.
+  static String _fileName(String p) {
+    final i = p.lastIndexOf(RegExp(r'[/\\]'));
+    return i < 0 ? p : p.substring(i + 1);
+  }
 
   @override
   void initState() {
@@ -61,11 +86,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _zmetaHost = TextEditingController(text: s.zmetaHost);
     _zmetaPort = TextEditingController(text: s.zmetaPort.toString());
     _zmetaPlatform = TextEditingController(text: s.zmetaPlatformId);
+    _zmetaHeartbeatInterval = TextEditingController(
+        text: s.zmetaHeartbeatIntervalSec.toString());
     _simulated = s.simulatedMode;
     _zmetaEnabled = s.zmetaEnabled;
     _zmetaSecured = s.zmetaSecured;
+    _zmetaHeartbeatEnabled = s.zmetaHeartbeatEnabled;
     _camera = widget.state.cameraConfirmationEnabled;
     _wifiVision = widget.state.wifiVisionEnabled;
+    final cam = widget.state.cameraSettings;
+    _camPort = TextEditingController(text: cam.webhookPort.toString());
+    _camOnvif = TextEditingController(text: cam.onvifAddress);
+    _camSnap = TextEditingController(text: cam.snapshotUrlTemplate);
+    _refreshReplayList();
   }
 
   @override
@@ -81,6 +114,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _zmetaHost.dispose();
     _zmetaPort.dispose();
     _zmetaPlatform.dispose();
+    _zmetaHeartbeatInterval.dispose();
+    _camPort.dispose();
+    _camOnvif.dispose();
+    _camSnap.dispose();
     super.dispose();
   }
 
@@ -111,8 +148,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ? 'shepherd-mesh-1'
           : _zmetaPlatform.text.trim(),
       zmetaSecured: _zmetaSecured,
+      zmetaHeartbeatEnabled: _zmetaHeartbeatEnabled,
+      zmetaHeartbeatIntervalSec:
+          (int.tryParse(_zmetaHeartbeatInterval.text.trim()) ?? 60)
+              .clamp(15, 600),
     );
     widget.state.applySettings(s);
+    final cam = widget.state.cameraSettings;
+    cam.webhookPort =
+        (int.tryParse(_camPort.text.trim()) ?? 49162).clamp(1024, 65535);
+    cam.onvifAddress = _camOnvif.text.trim();
+    cam.snapshotUrlTemplate = _camSnap.text.trim();
+    unawaited(widget.state.saveCameraSettings(cam));
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('Settings applied')),
     );
@@ -153,15 +200,27 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _scanError = null;
     });
     try {
-      final found = await RadioDiscovery.scanSubnet(
+      final silvus = await RadioDiscovery.scanSubnet(
         _subnet.text.trim(),
         onProgress: (done, total) {
           if (mounted) {
-            setState(() => _scanProgress = total == 0 ? 0 : done / total);
+            // First half of the bar: Silvus HTTP scan.
+            setState(() => _scanProgress =
+                total == 0 ? 0 : (done / total) * 0.5);
           }
         },
       );
-      if (mounted) setState(() => _found = found);
+      final mesh = await RadioDiscovery.scanMeshtastic(
+        _subnet.text.trim(),
+        onProgress: (done, total) {
+          if (mounted) {
+            // Second half: Meshtastic TCP-4403 scan.
+            setState(() => _scanProgress =
+                0.5 + (total == 0 ? 0 : (done / total) * 0.5));
+          }
+        },
+      );
+      if (mounted) setState(() => _found = [...silvus, ...mesh]);
     } catch (e) {
       if (mounted) setState(() => _scanError = 'Scan failed: $e');
     } finally {
@@ -298,9 +357,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
             title: Text('CAMERA CONFIRMATION (UPGRADE)',
                 style: SentryType.rowValue(SentryColors.onDark)),
             subtitle: Text(
-              'STUB — NO CAMERA CODE SHIPS YET. WHEN WIRED, CAMERA '
-              'EVIDENCE MAY UPGRADE DISPLAYED CONFIDENCE BUT MUST '
-              'NEVER VETO OR SUPPRESS A DETECTION.',
+              'MOTION WEBHOOK (POST /motion) OR ONVIF EVENTS. CAMERA '
+              'EVIDENCE MAY UPGRADE DISPLAYED CONFIDENCE BUT NEVER '
+              'VETOES OR SUPPRESSES A DETECTION.',
               style: SentryType.section(10).copyWith(height: 1.6),
             ),
             value: _camera,
@@ -309,6 +368,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
               widget.state.toggleCameraConfirmation(v);
             },
           ),
+          if (_camera) ...[
+            const SizedBox(height: 10),
+            _field(_camPort, 'Motion webhook port', 'e.g. 49162',
+                numeric: true),
+            const SizedBox(height: 10),
+            _field(_camOnvif, 'ONVIF address (optional)',
+                'e.g. 192.168.1.50:80'),
+            const SizedBox(height: 10),
+            _field(_camSnap, 'Snapshot URL template (optional)',
+                'e.g. http://192.168.1.50/shot.jpg'),
+          ],
         ]),
         _section('Record & replay', [
           _recordRow(),
@@ -329,10 +399,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
           if (_zmetaEnabled) ...[
             const SizedBox(height: 10),
-            _field(_zmetaHost, 'Gateway host', 'e.g. 127.0.0.1'),
+            _field(_zmetaHost, 'Gateway host', 'e.g. 127.0.0.1',
+                onChanged: (_) => setState(() {})),
             const SizedBox(height: 10),
             _field(_zmetaPort, 'Gateway UDP port', 'e.g. 5555',
-                numeric: true),
+                numeric: true, onChanged: (_) => setState(() {})),
             const SizedBox(height: 10),
             _field(_zmetaPlatform, 'Platform ID (this mesh)',
                 'e.g. shepherd-mesh-1'),
@@ -348,6 +419,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
               value: _zmetaSecured,
               onChanged: (v) => setState(() => _zmetaSecured = v),
             ),
+            const SizedBox(height: 10),
+            SwitchListTile(
+              title: Text('MESH HEARTBEAT (PLATFORM_STATUS)',
+                  style: SentryType.rowValue(SentryColors.onDark)),
+              subtitle: Text(
+                'PERIODIC "ALIVE, HERE IS THE PLATFORM" TO THE GATEWAY '
+                '(SYSTEM_EVENT). FOR TEAMS ON THE MOVE. DEFAULT OFF.',
+                style: SentryType.section(10).copyWith(height: 1.6),
+              ),
+              value: _zmetaHeartbeatEnabled,
+              onChanged: (v) => setState(() => _zmetaHeartbeatEnabled = v),
+            ),
+            if (_zmetaHeartbeatEnabled) ...[
+              const SizedBox(height: 10),
+              _field(_zmetaHeartbeatInterval, 'Heartbeat interval (seconds)',
+                  'e.g. 60 (15–600)', numeric: true),
+            ],
             if (_zmetaHost.text.trim().isNotEmpty &&
                 !_isLocalHost(_zmetaHost.text.trim()) &&
                 !_zmetaSecured)
@@ -385,11 +473,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
               contentPadding: EdgeInsets.zero,
               leading: const Icon(Icons.router, color: SentryColors.blue),
               title: Text(r.label, style: SentryType.rowValue(SentryColors.onDark)),
-              subtitle: Text('TAP TO ADD AS SILVUS RADIO',
+              subtitle: Text(
+                  'TAP TO ADD AS ${r.driverId.toUpperCase()} RADIO',
                   style: SentryType.section(10)),
               onTap: () async {
                 await widget.state.addRadio(RadioConfig(
-                  driverId: 'silvus',
+                  driverId: r.driverId,
                   address: r.ip,
                   label: r.label,
                   pollInterval: (double.tryParse(_interval.text.trim()) ?? 0.25)
@@ -501,6 +590,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           onPressed: () async {
             if (recording) {
               final summary = await st.stopRecording();
+              _refreshReplayList();
               if (mounted) {
                 ScaffoldMessenger.of(context)
                     .showSnackBar(SnackBar(content: Text(summary)));
@@ -508,7 +598,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
               }
             } else {
               await st.startRecording();
-              if (mounted) setState(() {});
+              if (mounted) {
+                final err = st.recorder.lastError;
+                if (err != null) {
+                  ScaffoldMessenger.of(context)
+                      .showSnackBar(SnackBar(content: Text(err)));
+                }
+                setState(() {});
+              }
             }
           },
           child: Text(recording ? 'STOP' : 'RECORD',
@@ -521,7 +618,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Widget _replayList() {
     final st = widget.state;
     return FutureBuilder(
-      future: RecordingService.listRecordings(),
+      future: _replayFuture,
       builder: (context, snap) {
         final files = snap.data ?? [];
         return Column(
@@ -570,7 +667,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       const SizedBox(width: 8),
                       Expanded(
                         child: Text(
-                          f.path.split('/').last,
+                          _fileName(f.path),
                           style: SentryType.rowValue(SentryColors.onDark)
                               .copyWith(fontSize: 12),
                         ),
@@ -599,9 +696,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Widget _field(TextEditingController c, String label, String hint,
-      {bool numeric = false}) {
+      {bool numeric = false, ValueChanged<String>? onChanged}) {
     return TextField(
       controller: c,
+      onChanged: onChanged,
       style: SentryType.rowValue(SentryColors.onDark),
       decoration:
           InputDecoration(labelText: label.toUpperCase(), hintText: hint),

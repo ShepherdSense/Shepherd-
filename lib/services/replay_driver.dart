@@ -26,6 +26,11 @@ class ReplayDriver extends RadioDriver {
 
   int get totalRows => _rows.length;
 
+  /// True once every row has been emitted. A sparse recording has real
+  /// gaps between rows; only this flag (not an empty poll) means the
+  /// replay is over.
+  bool get isExhausted => _loaded && _next >= _rows.length;
+
   Future<void> _load() async {
     if (_loaded) return;
     _loaded = true;
@@ -70,11 +75,17 @@ class ReplayDriver extends RadioDriver {
     if (rs == null) return [];
     _playStart ??= DateTime.now();
     final cutoff = rs.add(_playElapsed);
+    // Re-base recording timestamps onto the wall clock. The freshness
+    // pipeline treats any sample older than ~2s as stale, so emitting
+    // the original capture times would make every replayed sample
+    // instantly dead (no detections, blind health, red node map).
+    // Relative offsets between rows are preserved exactly.
+    final rebase = DateTime.now().difference(rs);
     final out = <LinkSample>[];
     while (_next < _rows.length && !_rows[_next].t.isAfter(cutoff)) {
       final r = _rows[_next++];
       out.add(LinkSample(
-        timestamp: r.t,
+        timestamp: r.t.add(rebase),
         fromNode: r.from,
         toNode: r.to,
         snr: r.snr,
@@ -90,8 +101,15 @@ class ReplayDriver extends RadioDriver {
   }
 
   @override
-  String get emptyHint =>
-      _error.isNotEmpty ? _error : 'Replay finished — no more samples.';
+  String get emptyHint {
+    if (_error.isNotEmpty) return _error;
+    // A gap in sparse data is not the end of the recording — only claim
+    // "finished" once the rows are actually exhausted. The poller shows
+    // this hint whenever a poll returns no links, so a bogus "finished"
+    // here would flash red on every sparse gap.
+    if (isExhausted) return 'Replay finished — no more samples.';
+    return 'Replay: waiting for next samples…';
+  }
 
   @override
   void dispose() {}

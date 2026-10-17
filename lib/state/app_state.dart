@@ -17,6 +17,11 @@ import '../services/tracker.dart';
 import '../services/tripwire.dart';
 import '../services/field_activity.dart';
 import '../services/radio_driver.dart';
+import '../services/meshtastic_driver.dart';
+import '../services/esp32_driver.dart';
+import '../services/camera_driver.dart';
+import '../services/generic_sensor_driver.dart';
+import '../models/sensor_observation.dart';
 import '../services/recorder.dart';
 import '../services/replay_driver.dart';
 import '../services/ai_classifier.dart';
@@ -30,6 +35,10 @@ import '../services/wifi_sense.dart';
 /// Short display ID: strips the driver namespace (`silvus:90550` → `90550`).
 /// (Moved to utils/node_ids.dart; re-exported here for existing callers.)
 export '../utils/node_ids.dart';
+
+/// Loopback test shared by the settings UI warning and the fail-closed
+/// ZMeta emit gate (canonical definition in services/zmeta_adapter.dart).
+export '../services/zmeta_adapter.dart' show zmetaIsLocalHost;
 
 /// Map color per radio driver for the unified map.
 Color driverColor(String driverId) {
@@ -65,6 +74,8 @@ class AppSettings {
     this.zmetaPort = 5555,
     this.zmetaPlatformId = 'shepherd-mesh-1',
     this.zmetaSecured = false,
+    this.zmetaHeartbeatEnabled = false,
+    this.zmetaHeartbeatIntervalSec = 60,
   });
 
   String radioIp;
@@ -92,11 +103,48 @@ class AppSettings {
   /// non-local host without it.
   bool zmetaSecured;
 
+  /// Opt-in mesh heartbeat: periodic SYSTEM_EVENT / PLATFORM_STATUS
+  /// ("alive, here is the platform") for teams on the move. Default off.
+  bool zmetaHeartbeatEnabled;
+
+  /// Heartbeat cadence in seconds, clamped 15..600 at apply time.
+  int zmetaHeartbeatIntervalSec;
+
   TripwireConfig get tripwireConfig => TripwireConfig(
         baselineWindow: baselineWindow,
         dipThreshold: dipThreshold,
         confirmPolls: confirmPolls,
       );
+
+  /// ZMeta settings block, persisted to SharedPreferences (the only
+  /// settings block currently stored — radio configs, node layout and
+  /// the GPS origin have their own keys). Missing keys keep defaults.
+  Map<String, dynamic> toJson() => {
+        'zmetaEnabled': zmetaEnabled,
+        'zmetaHost': zmetaHost,
+        'zmetaPort': zmetaPort,
+        'zmetaPlatformId': zmetaPlatformId,
+        'zmetaSecured': zmetaSecured,
+        'zmetaHeartbeatEnabled': zmetaHeartbeatEnabled,
+        'zmetaHeartbeatIntervalSec': zmetaHeartbeatIntervalSec,
+      };
+
+  void applyJson(Map<String, dynamic> j) {
+    final e = j['zmetaEnabled'];
+    if (e is bool) zmetaEnabled = e;
+    final h = j['zmetaHost'];
+    if (h is String && h.isNotEmpty) zmetaHost = h;
+    final p = j['zmetaPort'];
+    if (p is int && p > 0 && p < 65536) zmetaPort = p;
+    final id = j['zmetaPlatformId'];
+    if (id is String && id.isNotEmpty) zmetaPlatformId = id;
+    final s = j['zmetaSecured'];
+    if (s is bool) zmetaSecured = s;
+    final hb = j['zmetaHeartbeatEnabled'];
+    if (hb is bool) zmetaHeartbeatEnabled = hb;
+    final hbi = j['zmetaHeartbeatIntervalSec'];
+    if (hbi is int) zmetaHeartbeatIntervalSec = hbi.clamp(15, 600);
+  }
 }
 
 /// Central state: polling loop, tripwire processing, tracking fusion,
@@ -128,6 +176,8 @@ class AppState extends ChangeNotifier {
   AppState() {
     _loadLayout();
     _loadGpsOrigin();
+    _loadZmetaSettings();
+    _initCameraDriver();
     _radiosReady = _loadRadios();
     // Fire-and-forget: events simply carry no AI label until it lands.
     DisturbanceClassifier.load().then((c) => _classifier = c);
@@ -162,6 +212,13 @@ class AppState extends ChangeNotifier {
   /// export path holds no socket.
   ZMetaEmitter? _zmeta;
 
+  /// Serializes ZMeta sends: one flight at a time, so concurrent poll
+  /// ticks can't interleave datagrams or churn sockets. Batches that
+  /// arrive while a send is in flight queue here instead of being
+  /// dropped.
+  final List<CrossingEvent> _zmetaQueue = [];
+  bool _emitting = false;
+
   ZMetaEmitter _zmetaEmitter() {
     final cur = _zmeta;
     if (cur != null && cur.host == settings.zmetaHost && cur.port == settings.zmetaPort) {
@@ -171,6 +228,150 @@ class AppState extends ChangeNotifier {
     final next = ZMetaEmitter(host: settings.zmetaHost, port: settings.zmetaPort);
     _zmeta = next;
     return next;
+  }
+
+  /// Last known phone position (best-effort cache). Refreshed whenever
+  /// the operator captures a node position and periodically while ZMeta
+  /// export is on, so per-observation geo and the heartbeat move with a
+  /// dismounted team. Null until the first successful fix.
+  ({double lat, double lon, double altM, double accuracyM, DateTime at})?
+      _lastPhoneFix;
+
+  /// Best-effort phone fix refresh. Never throws; a failure just leaves
+  /// the previous fix (or null) in place.
+  Future<void> refreshPhoneFix() async {
+    try {
+      final fix = await GpsPositioning.currentFix();
+      _lastPhoneFix = (
+        lat: fix.lat,
+        lon: fix.lon,
+        altM: fix.altitudeM,
+        accuracyM: fix.accuracyM,
+        at: DateTime.now(),
+      );
+    } catch (_) {}
+  }
+
+  /// Platform-level position: fresh phone fix, else the centroid of all
+  /// GPS-positioned nodes, else null. Used by the heartbeat and as the
+  /// fallback inside [bestKnownGeoFor].
+  ZmetaSensorGeo? _platformGeo() {
+    final fix = _lastPhoneFix;
+    if (fix != null &&
+        DateTime.now().difference(fix.at).inMinutes < 10 &&
+        fix.lat.isFinite &&
+        fix.lon.isFinite) {
+      return ZmetaSensorGeo(
+        lat: fix.lat,
+        lon: fix.lon,
+        altM: fix.altM.isFinite ? fix.altM : null,
+        source: 'phone-gps',
+        accuracyM: fix.accuracyM.isFinite ? fix.accuracyM : null,
+        ageSec: DateTime.now().difference(fix.at).inSeconds,
+      );
+    }
+    double latSum = 0, lonSum = 0;
+    var n = 0;
+    for (final node in effectiveNodes.values) {
+      if (node.lat != null && node.lon != null) {
+        latSum += node.lat!;
+        lonSum += node.lon!;
+        n++;
+      }
+    }
+    if (n > 0) {
+      return ZmetaSensorGeo(
+        lat: latSum / n,
+        lon: lonSum / n,
+        source: 'node-centroid',
+      );
+    }
+    return null;
+  }
+
+  /// Best-known SENSOR (detector) position for one link's observation,
+  /// or null when nothing honest is available.
+  ///
+  /// Preference order:
+  /// 1. Midpoint of the two link endpoints, when both are mesh nodes
+  ///    with operator-surveyed GPS positions (static; trusted until
+  ///    re-captured).
+  /// 2. Platform position ([_platformGeo]): fresh phone fix, else node
+  ///    centroid.
+  ///
+  /// This is the DETECTOR's position, never the target's. Canonical
+  /// geo is declared 2-D (ZMeta 21.8); the device-reported altitude
+  /// rides in features, flagged as not-verified-HAE.
+  ZmetaSensorGeo? bestKnownGeoFor(String linkKey) {
+    final parts = linkKey.split(' → ');
+    if (parts.length == 2) {
+      final a = effectiveNodes[parts[0]];
+      final b = effectiveNodes[parts[1]];
+      if (a?.lat != null && a?.lon != null && b?.lat != null && b?.lon != null) {
+        return ZmetaSensorGeo(
+          lat: (a!.lat! + b!.lat!) / 2,
+          lon: (a.lon! + b.lon!) / 2,
+          source: 'node-midpoint',
+        );
+      }
+    }
+    return _platformGeo();
+  }
+
+  /// ZMeta background timers: phone-fix refresh while export is on, and
+  /// the opt-in heartbeat. Called from applySettings; stop() cancels.
+  Timer? _zmetaFixTimer;
+  Timer? _zmetaHeartbeatTimer;
+
+  void _configureZmetaTimers() {
+    _zmetaFixTimer?.cancel();
+    _zmetaHeartbeatTimer?.cancel();
+    _zmetaFixTimer = null;
+    _zmetaHeartbeatTimer = null;
+    if (!settings.zmetaEnabled) return;
+    // Keep the phone fix warm so per-observation geo moves with the
+    // team. Best-effort; failures are silent by design.
+    unawaited(refreshPhoneFix());
+    _zmetaFixTimer = Timer.periodic(
+      const Duration(seconds: 60),
+      (_) => unawaited(refreshPhoneFix()),
+    );
+    if (settings.zmetaHeartbeatEnabled) {
+      final interval =
+          settings.zmetaHeartbeatIntervalSec.clamp(15, 600);
+      _zmetaHeartbeatTimer = Timer.periodic(
+        Duration(seconds: interval),
+        (_) => unawaited(_emitZmetaHeartbeat()),
+      );
+    }
+  }
+
+  /// One opt-in heartbeat: SYSTEM_EVENT / PLATFORM_STATUS. Same
+  /// fail-closed gate as detections (non-local + unsecured = no emit),
+  /// never during replay.
+  Future<void> _emitZmetaHeartbeat() async {
+    if (replaying) return;
+    if (!zmetaIsLocalHost(settings.zmetaHost) && !settings.zmetaSecured) {
+      return;
+    }
+    try {
+      await refreshPhoneFix();
+      final platform = settings.zmetaPlatformId.trim().isEmpty
+          ? 'shepherd-mesh-1'
+          : settings.zmetaPlatformId.trim();
+      final geo = _platformGeo();
+      final emitter = _zmetaEmitter();
+      await emitter.send(zmetaPlatformStatus(
+        platformId: platform,
+        ts: DateTime.now(),
+        state: 'NOMINAL',
+        nodeCount: effectiveNodes.length,
+        detectionCount: events.length,
+        heartbeatIntervalSec:
+            settings.zmetaHeartbeatIntervalSec.clamp(15, 600),
+        sensorGeo: geo,
+      ));
+    } catch (_) {}
   }
 
   /// Track-stitching specialist (tiny trained net). Starts model-less;
@@ -447,37 +648,160 @@ class AppState extends ChangeNotifier {
     return out;
   }
 
-  // ---- Camera confirmation (UPGRADE stub) ----
-  // No camera code exists yet. When a real integration ships, camera
-  // evidence may UPGRADE the displayed confidence of a detection — it
-  // must NEVER veto or suppress one. A detection stands on RF evidence
-  // alone; the camera can only add context.
-  bool cameraConfirmationEnabled = false;
+  // ---- Camera confirmation (UPGRADE-ONLY) ----
+  // Camera evidence may UPGRADE the displayed confidence of a detection —
+  // it must NEVER veto or suppress one. A detection stands on RF evidence
+  // alone; the camera can only add context. Absence of motion means
+  // nothing (occlusion, night, facing away).
+  static const _cameraSettingsKey = 'shepherd_camera_v1';
 
-  void toggleCameraConfirmation(bool on) {
-    cameraConfirmationEnabled = on;
+  CameraSettings cameraSettings = CameraSettings();
+  late final CameraDriver _cameraDriver;
+
+  bool get cameraConfirmationEnabled => cameraSettings.enabled;
+
+  void _initCameraDriver() {
+    _cameraDriver = CameraDriver(settings: cameraSettings);
+    _cameraDriver.onObservation = (obs) {
+      // Camera motion joins the shared observation store (bounded) and
+      // the ZMeta export path (EO modality).
+      sensorObservations.add(obs);
+      if (sensorObservations.length > 500) {
+        sensorObservations.removeRange(0, sensorObservations.length - 500);
+      }
+      unawaited(_emitZmetaSensorObs([obs]));
+    };
+    unawaited(_loadCameraSettings());
+  }
+
+  // ---- Universal sensor observations ----
+  // Observations from GenericSensorDriver pollers (lidar, acoustic,
+  // PIR, …) land here for the map overlay and evidence views. The RF
+  // tripwire stays the detection authority; these are corroboration.
+  final List<SensorObservation> sensorObservations = [];
+  DateTime _lastSensorPull = DateTime.fromMillisecondsSinceEpoch(0);
+
+  void _collectSensorObservations(_DriverPoller p) {
+    final d = p.driver;
+    if (d is! GenericSensorDriver) return;
+    final fresh = d.observationsSince(_lastSensorPull);
+    if (fresh.isEmpty) return;
+    _lastSensorPull = DateTime.now();
+    sensorObservations.addAll(fresh);
+    if (sensorObservations.length > 500) {
+      sensorObservations.removeRange(0, sensorObservations.length - 500);
+    }
+    unawaited(_emitZmetaSensorObs(fresh));
+  }
+
+  /// Emits acoustic/EO sensor observations to the ZMeta gateway.
+  /// Same fail-closed gate as detections: never during replay, never
+  /// to a non-local host unless the link is secured. RANGE/BINARY/
+  /// ENERGY have no honest ZMeta modality and stay local.
+  Future<void> _emitZmetaSensorObs(List<SensorObservation> obs) async {
+    if (replaying) return;
+    if (!settings.zmetaEnabled) return;
+    if (!zmetaIsLocalHost(settings.zmetaHost) && !settings.zmetaSecured) {
+      return;
+    }
+    try {
+      final emitter = _zmetaEmitter();
+      final platform = settings.zmetaPlatformId.trim().isEmpty
+          ? 'shepherd-mesh-1'
+          : settings.zmetaPlatformId.trim();
+      for (final o in obs) {
+        final evt = zmetaSensorObservation(platformId: platform, obs: o);
+        if (evt == null) continue; // no honest modality — stays local
+        await emitter.send(evt);
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _loadCameraSettings() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_cameraSettingsKey);
+      if (raw == null) return;
+      cameraSettings = CameraSettings.fromJson(
+          jsonDecode(raw) as Map<String, dynamic>);
+      _cameraDriver.settings
+        ..enabled = cameraSettings.enabled
+        ..webhookPort = cameraSettings.webhookPort
+        ..onvifAddress = cameraSettings.onvifAddress
+        ..onvifUser = cameraSettings.onvifUser
+        ..onvifPass = cameraSettings.onvifPass
+        ..snapshotUrlTemplate = cameraSettings.snapshotUrlTemplate;
+      if (cameraSettings.enabled) unawaited(_cameraDriver.start());
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  Future<void> saveCameraSettings(CameraSettings s) async {
+    cameraSettings = s;
+    _cameraDriver.settings
+      ..enabled = s.enabled
+      ..webhookPort = s.webhookPort
+      ..onvifAddress = s.onvifAddress
+      ..onvifUser = s.onvifUser
+      ..onvifPass = s.onvifPass
+      ..snapshotUrlTemplate = s.snapshotUrlTemplate;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_cameraSettingsKey, jsonEncode(s.toJson()));
+    } catch (_) {}
+    if (s.enabled) {
+      unawaited(_cameraDriver.start());
+    } else {
+      _cameraDriver.dispose();
+    }
     notifyListeners();
   }
 
-  /// Upgrade-only camera confirmation request. STUB: always returns
-  /// NOT_CONFIGURED until a camera integration is wired in.
-  CameraConfirmationResult requestCameraConfirmation(CrossingEvent e) =>
-      const CameraConfirmationResult(
+  void toggleCameraConfirmation(bool on) {
+    cameraSettings.enabled = on;
+    unawaited(saveCameraSettings(cameraSettings));
+  }
+
+  /// Upgrade-only camera confirmation request. Consults recent camera
+  /// motion: CORROBORATED upgrades displayed confidence; anything else
+  /// leaves the RF detection standing unchanged.
+  CameraConfirmationResult requestCameraConfirmation(CrossingEvent e) {
+    if (!cameraSettings.enabled) {
+      return const CameraConfirmationResult(
         'NOT_CONFIGURED',
         'No camera integration configured. '
         'Detection stands on RF evidence alone.',
       );
+    }
+    final motion = _cameraDriver.recentMotion(const Duration(seconds: 30));
+    if (motion.isNotEmpty) {
+      return CameraConfirmationResult(
+        'CORROBORATED',
+        '${motion.length} camera motion observation(s) within 30 s of '
+        'the detection window. Displayed confidence upgraded; RF '
+        'evidence unchanged.',
+      );
+    }
+    return const CameraConfirmationResult(
+      'NO_MOTION',
+      'Camera configured but no motion in the detection window. '
+      'Informational only — detection stands on RF evidence alone.',
+    );
+  }
 
   void applySettings(AppSettings s) {
     final wasPolling = polling;
     final wasWifi = wifiVisionEnabled;
     stop();
     settings = s;
+    unawaited(_saveZmetaSettings());
+    _configureZmetaTimers();
     _tripwire = Tripwire(config: s.tripwireConfig);
     _tracker.reset();
     track = null;
     history.clear();
     events.clear();
+    triage.clear();
     error = null;
     connectionLabel = 'Idle — press Start';
     if (wasWifi) {
@@ -630,6 +954,13 @@ class AppState extends ChangeNotifier {
   /// pollers, runs the CSV on its own clock with a fresh tripwire.
   Future<void> startReplay(String path, {double speed = 1.0}) async {
     stop();
+    // A recording in progress would swallow the replayed samples into
+    // its tuning CSV (they flow through _tickPoller). Stop it first —
+    // replaying over an active recording is never what the operator
+    // meant.
+    if (recorder.isRecording) {
+      await recorder.stop();
+    }
     replaying = true;
     _tripwire = Tripwire(config: settings.tripwireConfig);
     _tracker.reset();
@@ -658,6 +989,12 @@ class AppState extends ChangeNotifier {
         (_) => _tickPoller(p),
       );
     }
+    // Dead-man check, same as start(): a frozen replay must not leave
+    // the banner stuck. stop()/stopReplay() already cancel it.
+    _watchdog = Timer.periodic(
+      const Duration(seconds: 1),
+      (_) => _watchdogTick(),
+    );
   }
 
   void stopReplay() {
@@ -679,6 +1016,10 @@ class AppState extends ChangeNotifier {
     _latestByPoller.clear();
     _watchdog?.cancel();
     _watchdog = null;
+    _zmetaFixTimer?.cancel();
+    _zmetaFixTimer = null;
+    _zmetaHeartbeatTimer?.cancel();
+    _zmetaHeartbeatTimer = null;
     _simDriver = null;
     polling = false;
     notifyListeners();
@@ -691,11 +1032,14 @@ class AppState extends ChangeNotifier {
     p.busy = true;
     try {
       final raw = await p.driver.poll();
+      _collectSensorObservations(p);
       // The poller may have been stopped or replaced (settings change,
       // restart) while this poll was in flight. Its samples belong to a
       // session that no longer exists; don't let them into the new one.
       if (!polling || !_pollers.contains(p)) return;
-      if (recorder.isRecording) {
+      // Replayed samples never enter a recording: the tuning CSV must
+      // hold live sensor data only.
+      if (recorder.isRecording && !replaying) {
         for (final r in raw) {
           recorder.record(r);
         }
@@ -728,9 +1072,14 @@ class AppState extends ChangeNotifier {
       final classified = [
         for (final e in fresh) _classifyEvent(e, p.config.pollInterval),
       ];
-      if (classified.isNotEmpty) unawaited(_alert(AlertKind.detection));
+      // No audible alert for replayed detections: the operator is
+      // rehearsing, not watching a live mesh.
+      if (classified.isNotEmpty && !replaying) unawaited(_alert(AlertKind.detection));
       events.insertAll(0, classified);
-      if (settings.zmetaEnabled && classified.isNotEmpty) {
+      // Replay never exports: replayed detections are stale history,
+      // and pushing them to the operational gateway would corrupt
+      // fusion. (The fail-closed host/secured gate lives in _emitZmeta.)
+      if (settings.zmetaEnabled && classified.isNotEmpty && !replaying) {
         // Emit-only ZMeta export: must never disturb detection.
         unawaited(_emitZmeta(classified));
       }
@@ -739,6 +1088,14 @@ class AppState extends ChangeNotifier {
       }
       _pruneTriage();
       if (!settings.simulatedMode) _ensureNodes(raw);
+      // Mesh drivers that report GPS: pin nodes to real geometry.
+      final drv = p.driver;
+      if (drv is MeshtasticDriver) {
+        _applyMeshPositions(drv.meshPositions());
+      } else if (drv is Esp32Driver) {
+        _applyMeshPositions(drv.meshPositions());
+        _applyBeaconCallsigns(drv.beaconCallsigns);
+      }
       _updateFusedTrack();
       _refreshConnectionLabel();
       error = null;
@@ -781,14 +1138,18 @@ class AppState extends ChangeNotifier {
         for (final s in batch)
           if (_isLive(s, now)) s,
     ];
-    // Spectrum-band virtual links (SDR energy watch) and KrakenSDR
-    // bearings feed the tripwire and alerts like any link, but they carry
-    // no geometry -- a hot band is not a position, and one bearing is a
-    // direction, not a fix. Keep them out of the position solver, the
+    // Spectrum-band virtual links (SDR energy watch), KrakenSDR
+    // bearings, and sensor-bus virtual links feed the tripwire and alerts
+    // like any link, but they carry no geometry -- a hot band is not a
+    // position, one bearing is a direction not a fix, and a PIR trip is
+    // a point event. Keep them out of the position solver, the
     // shadow grid, and the stitcher so they can't drag the track.
     final geo = [
       for (final s in all)
-        if (driverOf(s.fromNode) != 'sdr' && driverOf(s.fromNode) != 'kraken')
+        if (driverOf(s.fromNode) != 'sdr' &&
+            driverOf(s.fromNode) != 'kraken' &&
+            driverOf(s.fromNode) != 'esp32' &&
+            driverOf(s.fromNode) != 'sensor')
           s,
     ];
     track = _tracker.update(
@@ -919,7 +1280,35 @@ class AppState extends ChangeNotifier {
   /// ZMeta export (emit-only): one OBSERVATION_EVENT per crossing, plus
   /// an INFERENCE_EVENT when the embedded classifier labeled it. Never
   /// throws — a down gateway must not disturb detection.
+  ///
+  /// Two hard gates before anything leaves the device:
+  /// - fail-closed security: a non-local gateway without the operator's
+  ///   WireGuard attestation ([AppSettings.zmetaSecured]) gets nothing;
+  ///   loopback targets ([zmetaIsLocalHost]) need no tunnel;
+  /// - replay: replayed detections are stale history and are never
+  ///   exported to the operational gateway (also guarded at the call
+  ///   site — belt and suspenders).
   Future<void> _emitZmeta(List<CrossingEvent> evts) async {
+    if (replaying) return;
+    if (!zmetaIsLocalHost(settings.zmetaHost) && !settings.zmetaSecured) {
+      return;
+    }
+    _zmetaQueue.addAll(evts);
+    if (_emitting) return; // the in-flight drain picks these up
+    _emitting = true;
+    try {
+      while (_zmetaQueue.isNotEmpty) {
+        final batch = _zmetaQueue.toList();
+        _zmetaQueue.clear();
+        await _sendZmetaBatch(batch);
+      }
+    } finally {
+      _emitting = false;
+    }
+  }
+
+  /// One serialized batch of ZMeta events over UDP. Never throws.
+  Future<void> _sendZmetaBatch(List<CrossingEvent> evts) async {
     try {
       final emitter = _zmetaEmitter();
       final platform = settings.zmetaPlatformId.trim().isEmpty
@@ -943,6 +1332,7 @@ class AppState extends ChangeNotifier {
           viaVariance: e.viaVariance,
           energyDbfs: rf.energyDbfs,
           doaArrayRelativeDeg: rf.doaDeg,
+          sensorGeo: bestKnownGeoFor(e.linkKey),
         );
         await emitter.send(obs);
         if (e.aiLabel != null && e.aiConfidence != null) {
@@ -1034,6 +1424,32 @@ class AppState extends ChangeNotifier {
     } catch (_) {}
   }
 
+  // ---- ZMeta settings (persisted) ----
+
+  static const _zmetaSettingsKey = 'rf_sentry_zmeta_v1';
+
+  Future<void> _loadZmetaSettings() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_zmetaSettingsKey);
+      if (raw == null) return;
+      settings.applyJson(jsonDecode(raw) as Map<String, dynamic>);
+    } catch (_) {
+      // Corrupt prefs: keep defaults.
+    }
+    notifyListeners();
+  }
+
+  Future<void> _saveZmetaSettings() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(
+        _zmetaSettingsKey,
+        jsonEncode(settings.toJson()),
+      );
+    } catch (_) {}
+  }
+
   Future<void> addRadio(RadioConfig c) async {
     radioConfigs.add(c);
     await _saveRadios();
@@ -1092,11 +1508,44 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  /// Place mesh nodes from their GPS positions. The driver reports
+  /// lat/lon per node; here they become field-local x/y so the tracking
+  /// map and the position solver see real geometry. Nodes the user has
+  /// already dragged keep their manual position — GPS only fills in
+  /// nodes that were auto-placed.
+  void _applyMeshPositions(Map<String, ({double lat, double lon})> pos) {
+    if (pos.isEmpty) return;
+    // Origin: the persisted GPS origin if the user captured one,
+    // otherwise the first mesh node with a fix.
+    double? lat0 = gpsOrigin?.lat;
+    double? lon0 = gpsOrigin?.lon;
+    lat0 ??= pos.values.first.lat;
+    lon0 ??= pos.values.first.lon;
+    var changed = false;
+    for (final e in pos.entries) {
+      final n = nodePositions[e.key];
+      if (n == null) continue; // _ensureNodes creates it next poll
+      n.lat = e.value.lat;
+      n.lon = e.value.lon;
+      if (!n.userPlaced) {
+        final m = latLonToMeters(e.value.lat, e.value.lon, lat0, lon0);
+        n.x = m.x;
+        n.y = m.y;
+        changed = true;
+      }
+    }
+    if (changed) {
+      _saveLayout();
+      notifyListeners();
+    }
+  }
+
   void moveNode(String id, double x, double y) {
     final n = nodePositions[id];
     if (n == null) return;
     n.x = x;
     n.y = y;
+    n.userPlaced = true;
     _saveLayout();
     notifyListeners();
   }
@@ -1116,6 +1565,56 @@ class AppState extends ChangeNotifier {
     n.antenna = antenna == 'panel' ? 'panel' : 'whip';
     _saveLayout();
     notifyListeners();
+  }
+
+  /// Callsign validation: 1-16 chars, A-Z 0-9 dash/underscore/space.
+  /// Returns the cleaned callsign, or null if invalid.
+  static String? cleanCallsign(String raw) {
+    final c = raw.trim().toUpperCase();
+    if (c.isEmpty || c.length > 16) return null;
+    if (!RegExp(r'^[A-Z0-9 _-]+$').hasMatch(c)) return null;
+    return c;
+  }
+
+  /// Operator-set callsign for a node. Empty string clears it (falls
+  /// back to a beacon callsign, then the hardware id). Persists.
+  /// Returns false when the callsign is invalid.
+  bool setNodeCallsign(String id, String raw) {
+    final n = nodePositions[id];
+    if (n == null) return false;
+    final c = raw.trim();
+    if (c.isEmpty) {
+      n.callsign = null;
+      n.callsignByUser = false;
+    } else {
+      final clean = cleanCallsign(c);
+      if (clean == null) return false;
+      n.callsign = clean;
+      n.callsignByUser = true;
+    }
+    _saveLayout();
+    notifyListeners();
+    return true;
+  }
+
+  /// Beacon-broadcast callsigns (ESP32 status page). Never overwrite a
+  /// user-set callsign.
+  void _applyBeaconCallsigns(Map<String, String> beaconCallsigns) {
+    var changed = false;
+    for (final e in beaconCallsigns.entries) {
+      final n = nodePositions[e.key];
+      if (n == null || n.callsignByUser) continue;
+      final clean = cleanCallsign(e.value);
+      if (clean == null) continue;
+      if (n.callsign != clean) {
+        n.callsign = clean;
+        changed = true;
+      }
+    }
+    if (changed) {
+      _saveLayout();
+      notifyListeners();
+    }
   }
 
   void moveDefended(double x, double y) {
@@ -1185,6 +1684,13 @@ class AppState extends ChangeNotifier {
       final fix = await GpsPositioning.currentFix();
       gpsOrigin = GpsOrigin(lat: fix.lat, lon: fix.lon);
       await _saveGpsOrigin();
+      _lastPhoneFix = (
+        lat: fix.lat,
+        lon: fix.lon,
+        altM: fix.altitudeM,
+        accuracyM: fix.accuracyM,
+        at: DateTime.now(),
+      );
       gpsMessage = 'ORIGIN SET — ${_accuracyNote(fix.accuracyM)}';
     } on GpsException catch (e) {
       gpsMessage = e.message;
@@ -1220,7 +1726,15 @@ class AppState extends ChangeNotifier {
       n.y = m.y;
       n.lat = fix.lat;
       n.lon = fix.lon;
+      n.userPlaced = true;
       _saveLayout();
+      _lastPhoneFix = (
+        lat: fix.lat,
+        lon: fix.lon,
+        altM: fix.altitudeM,
+        accuracyM: fix.accuracyM,
+        at: DateTime.now(),
+      );
       final placed =
           '${m.x.toStringAsFixed(1)}, ${m.y.toStringAsFixed(1)} M';
       gpsMessage = originWasSet
@@ -1253,6 +1767,13 @@ class AppState extends ChangeNotifier {
       defended.x = m.x;
       defended.y = m.y;
       _saveLayout();
+      _lastPhoneFix = (
+        lat: fix.lat,
+        lon: fix.lon,
+        altM: fix.altitudeM,
+        accuracyM: fix.accuracyM,
+        at: DateTime.now(),
+      );
       gpsMessage =
           'DEFENDED POINT PLACED AT ${m.x.toStringAsFixed(1)}, ${m.y.toStringAsFixed(1)} M — ${_accuracyNote(fix.accuracyM)}';
     } on GpsException catch (e) {
@@ -1327,6 +1848,9 @@ class AppState extends ChangeNotifier {
     }
     _pollers.clear();
     wifi.stop();
+    try {
+      _cameraDriver.dispose();
+    } catch (_) {}
     super.dispose();
   }
 }

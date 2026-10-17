@@ -19,6 +19,7 @@ class NodePosition {
     this.antenna = 'whip',
     this.lat,
     this.lon,
+    this.callsign,
   });
 
   final String nodeId;
@@ -34,6 +35,23 @@ class NodePosition {
   double? lat;
   double? lon;
 
+  /// True once the operator has dragged this node on the map. Auto
+  /// placement (spiral, or Meshtastic GPS) must not overwrite it.
+  bool userPlaced = false;
+
+  /// Operator callsign ("RAPTOR-1") shown over the node on the map.
+  /// Set by the user in the app, or broadcast by the node in its beacon.
+  /// Null = show the hardware node id.
+  String? callsign;
+
+  /// True when the callsign was typed by the operator; beacon callsigns
+  /// never overwrite a user-set one.
+  bool callsignByUser = false;
+
+  /// Map label: callsign when set, else the hardware id.
+  String get displayName =>
+      (callsign != null && callsign!.isNotEmpty) ? callsign! : nodeId;
+
   Map<String, dynamic> toJson() => {
         'nodeId': nodeId,
         'x': x,
@@ -42,6 +60,9 @@ class NodePosition {
         'antenna': antenna,
         if (lat != null) 'lat': lat,
         if (lon != null) 'lon': lon,
+        if (userPlaced) 'userPlaced': true,
+        if (callsign != null && callsign!.isNotEmpty) 'callsign': callsign,
+        if (callsignByUser) 'callsignByUser': true,
       };
 
   factory NodePosition.fromJson(Map<String, dynamic> j) => NodePosition(
@@ -52,7 +73,10 @@ class NodePosition {
         antenna: (j['antenna'] as String?) ?? 'whip',
         lat: (j['lat'] as num?)?.toDouble(),
         lon: (j['lon'] as num?)?.toDouble(),
-      );
+        callsign: j['callsign'] as String?,
+      )
+        ..userPlaced = (j['userPlaced'] as bool?) ?? false
+        ..callsignByUser = (j['callsignByUser'] as bool?) ?? false;
 
   String get gpsLabel => lat == null || lon == null
       ? '—'

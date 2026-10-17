@@ -59,8 +59,17 @@ class GpsException implements Exception {
 class GpsPositioning {
   /// One-shot best-accuracy fix. Throws [GpsException] with a UI-ready
   /// message when location is unavailable, denied, or times out.
-  static Future<({double lat, double lon, double accuracyM})>
-      currentFix() async {
+  ///
+  /// `altitudeM` is the device-reported altitude in meters. Its
+  /// reference frame is platform-dependent (Android documents WGS-84
+  /// ellipsoid, iOS documents MSL) — never treat it as verified HAE.
+  static Future<
+      ({
+        double lat,
+        double lon,
+        double accuracyM,
+        double altitudeM,
+      })> currentFix() async {
     final serviceEnabled = await Geolocator.isLocationServiceEnabled();
     if (!serviceEnabled) {
       throw GpsException(
@@ -87,6 +96,7 @@ class GpsPositioning {
         lat: pos.latitude,
         lon: pos.longitude,
         accuracyM: pos.accuracy,
+        altitudeM: pos.altitude,
       );
     } on TimeoutException {
       throw GpsException(

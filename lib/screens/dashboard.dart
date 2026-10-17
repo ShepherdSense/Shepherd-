@@ -378,7 +378,9 @@ class DashboardScreen extends StatelessWidget {
               'AI CLASSIFY',
               e.aiLabel == null
                   ? '—'
-                  : '${e.aiLabel} ${(e.aiConfidence! * 100).toStringAsFixed(0)}% EST',
+                  : e.aiConfidence == null
+                      ? '${e.aiLabel} EST'
+                      : '${e.aiLabel} ${(e.aiConfidence! * 100).toStringAsFixed(0)}% EST',
               SentryColors.purple),
           const SizedBox(height: 10),
           Text('SIZE AND AI LABELS ARE HEURISTIC ESTIMATES, NOT IDENTIFICATION. '
@@ -457,7 +459,10 @@ class DashboardScreen extends StatelessWidget {
             children: [
               Text('EVENT TIMELINE', style: SentryType.section()),
               const Spacer(),
-              Text('${state.events.length} EVENTS',
+              Text(
+                  evts.length < state.events.length
+                      ? 'SHOWING ${evts.length} OF ${state.events.length} EVENTS'
+                      : '${state.events.length} EVENTS',
                   style: SentryType.section(10)),
             ],
           ),
@@ -561,9 +566,12 @@ class DashboardScreen extends StatelessWidget {
     final verdict = state.triage[AppState.triageKeyFor(e)];
     final acked = verdict == AppState.triageAcked;
     final falseAlarm = verdict == AppState.triageFalseAlarm;
+    final aiConf = e.aiConfidence;
     final aiLabel = e.aiLabel == null
         ? '—'
-        : 'AI ${e.aiLabel} ${(e.aiConfidence! * 100).toStringAsFixed(0)}% EST';
+        : aiConf == null
+            ? 'AI ${e.aiLabel} EST'
+            : 'AI ${e.aiLabel} ${(aiConf * 100).toStringAsFixed(0)}% EST';
     final row = Padding(
       padding: const EdgeInsets.symmetric(vertical: 6),
       child: InkWell(
@@ -708,7 +716,8 @@ class DashboardScreen extends StatelessWidget {
               Expanded(
                 child: Text(
                   '${b.centerMhz.toStringAsFixed(1)} MHz · '
-                  '${spanMhz.toStringAsFixed(1)} MHz SPAN',
+                  '${spanMhz.toStringAsFixed(1)} MHz SPAN'
+                  '${b.sigHint != null ? ' · ${b.sigHint}' : ''}',
                   style: SentryType.rowLabel()
                       .copyWith(fontSize: 11),
                   overflow: TextOverflow.ellipsis,

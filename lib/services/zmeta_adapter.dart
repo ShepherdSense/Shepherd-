@@ -1,15 +1,21 @@
 /// Shepherd → ZMeta event adapter (emit-only).
 ///
-/// Translates Shepherd detections into ZMeta v1.0 events and ships them
+/// Translates Shepherd detections into ZMeta v1.1 events and ships them
 /// over UDP to a ZMeta gateway (default 127.0.0.1:5555 — the gateway's
 /// ingest port). One adapter runs per Shepherd mesh; the gateway fuses
 /// across meshes. Shepherd never receives anything back: this is the
 /// same emit-only posture as the ATAK CoT output path.
 ///
+/// Targets the v1.1 lane (spec v1.1.26, schema zmeta-event-1.1.0):
+/// declared-2D geo (semantics-contract 21.8) and SYSTEM_EVENT /
+/// PLATFORM_STATUS (21.6) both require v1.1 — the v1.0 schema rejects
+/// them. Everything else is unchanged from the v1.0 shape and validates
+/// under 1.1 unchanged.
+///
 /// Event mapping:
 ///   tripwire CrossingEvent  → OBSERVATION_EVENT / RF
 ///   AI classifier label     → INFERENCE_EVENT / CLASSIFICATION
-///   (radio health           → SYSTEM_EVENT / LINK_STATUS — planned)
+///   mesh heartbeat          → SYSTEM_EVENT / PLATFORM_STATUS (opt-in)
 ///
 /// Honesty rules (mirroring ZMeta's own adapter contract, which is why
 /// this pairing works):
@@ -27,6 +33,16 @@
 ///   kraken/moth/signalhunter adapters).
 /// - `confidence` appears ONLY on INFERENCE/FUSION/STATE envelopes —
 ///   never on OBSERVATION (per ZMeta contract 7.1).
+/// - GEO HONESTY (semantics-contract 6.2 + 21.8): canonical `geo` is
+///   declared `"2D"` (lat/lon only, no `alt_m`). The device-reported
+///   altitude is platform-dependent (Android: WGS-84 ellipsoid per
+///   platform docs; iOS: MSL) and is NEVER verified HAE, so 6.2 forbids
+///   it in `alt_m` — it rides in the explicitly-named
+///   `features.shepherd_sensor_alt_m` instead, flagged in quality.
+///   Substituting a non-HAE altitude into `alt_m` was rejected on the
+///   ZMeta record (doctrine A1-02); a 2-D position is the honest
+///   complete statement of what the sensor measured. `geo` is the
+///   SENSOR (platform) position, never the target's — stated in quality.
 /// - Original observations carry no `lineage` block (no ZMeta parent
 ///   exists); the INFERENCE carries a genuine `based_on` link to its
 ///   observation.
@@ -38,13 +54,53 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
-/// ZMeta spec lane this adapter targets.
-const String kZmetaVersion = '1.0';
+import '../models/sensor_observation.dart';
+
+/// ZMeta spec lane this adapter targets. v1.1: declared-2D geo (21.8)
+/// and PLATFORM_STATUS (21.6) are v1.1 additions; the v1.0 schema
+/// rejects both.
+const String kZmetaVersion = '1.1.0';
 
 /// Default ZMeta gateway ingest endpoint (their reference gateway
 /// listens on UDP 0.0.0.0:5555).
 const String kZmetaDefaultHost = '127.0.0.1';
 const int kZmetaDefaultPort = 5555;
+
+/// True for loopback targets, where no wire is involved — a local
+/// gateway needs no WireGuard tunnel. Accepts the app's own prefill
+/// style (`127.0.0.1:5555`), bracketed IPv6 (`[::1]`), trailing dots
+/// (`localhost.`), and the whole 127/8 block. Canonical definition
+/// shared by the settings UI warning (settings.dart) and the fail-closed
+/// emit path (state/app_state.dart): keep exactly one copy.
+bool zmetaIsLocalHost(String h) {
+  var s = h.trim().toLowerCase();
+  // Strip brackets, e.g. [::1] or [::1]:5555.
+  if (s.startsWith('[')) {
+    final close = s.indexOf(']');
+    if (close > 0) s = s.substring(1, close) + s.substring(close + 1);
+  }
+  // Strip a :port suffix. Bare IPv6 (::1) has more than one colon.
+  final firstColon = s.indexOf(':');
+  if (firstColon >= 0 && s.indexOf(':', firstColon + 1) < 0) {
+    s = s.substring(0, firstColon);
+  }
+  // Trailing dot is a fully-qualified root form of the same name.
+  s = s.replaceAll(RegExp(r'\.+$'), '');
+  if (s == 'localhost' || s == '::1' || s == '127.1') return true;
+  if (s.startsWith('127.')) {
+    // 127.0.0.0/8 is loopback; validate the octets so 127.1.2.9999
+    // doesn't sneak in as local.
+    final parts = s.split('.');
+    if (parts.length == 4 &&
+        parts.every((p) {
+          final n = int.tryParse(p);
+          return n != null && n >= 0 && n <= 255;
+        })) {
+      return true;
+    }
+  }
+  return false;
+}
 
 // ---------------------------------------------------------------------------
 // Small primitives
@@ -82,6 +138,40 @@ String zmetaUtcZ(DateTime t) {
 // Event builders
 // ---------------------------------------------------------------------------
 
+/// Best-known SENSOR (platform/mesh) position for one observation.
+///
+/// This is where the DETECTOR is, never where the target is — stated in
+/// quality on every event that carries it. `altM` is the device-reported
+/// altitude in meters; its reference frame is platform-dependent
+/// (Android documents WGS-84 ellipsoid, iOS documents MSL) and is never
+/// verified HAE, so it is excluded from canonical `geo` per ZMeta 6.2
+/// and carried in features instead (semantics-contract 21.8).
+class ZmetaSensorGeo {
+  const ZmetaSensorGeo({
+    required this.lat,
+    required this.lon,
+    this.altM,
+    required this.source, // 'node-midpoint' | 'phone-gps'
+    this.accuracyM,
+    this.ageSec,
+  });
+
+  final double lat;
+  final double lon;
+  final double? altM;
+  final String source;
+  final double? accuracyM;
+  final int? ageSec;
+
+  /// Canonical ZMeta geo: declared 2-D (lat/lon only — 21.8 prohibits
+  /// alt_m on a "2D" geo, and 6.2 prohibits non-HAE altitude in alt_m).
+  Map<String, dynamic> toGeoJson() => {
+        'lat': lat,
+        'lon': lon,
+        'dimensionality': '2D',
+      };
+}
+
 /// Builds a ZMeta OBSERVATION_EVENT / RF for one Shepherd link
 /// disturbance.
 ///
@@ -116,6 +206,7 @@ Map<String, dynamic> zmetaObservation({
   double? energyDbfs, // SDR band energy, dBFS (not dBm — kept explicit)
   double? doaArrayRelativeDeg, // KrakenSDR, array-relative until surveyed
   bool ppsLocked = false,
+  ZmetaSensorGeo? sensorGeo, // detector position; 2-D canonical geo (21.8)
 }) {
   final features = <String, dynamic>{
     'center_freq_hz': freqHz.isFinite ? freqHz : 0.0,
@@ -139,6 +230,11 @@ Map<String, dynamic> zmetaObservation({
       'shepherd_energy_dbfs': energyDbfs,
     if (doaArrayRelativeDeg != null && doaArrayRelativeDeg.isFinite)
       'kraken_doa_array_relative_deg': doaArrayRelativeDeg,
+    // Device-reported altitude: platform-dependent reference frame,
+    // never verified HAE — excluded from canonical geo per ZMeta 6.2,
+    // carried here explicitly instead (21.8).
+    if (sensorGeo?.altM != null && sensorGeo!.altM!.isFinite)
+      'shepherd_sensor_alt_m': sensorGeo.altM,
   };
 
   final quality = <String, dynamic>{
@@ -147,12 +243,31 @@ Map<String, dynamic> zmetaObservation({
     // Consumer-visible sentinel flag: power_dbm is the documented
     // "not measured" sentinel, not 1 mW of received power.
     'shepherd_power_sentinel': true,
-    'geo_status': 'UNAVAILABLE',
+    // Canonical geo is the SENSOR (platform) position — never the
+    // target's. Declared 2-D per 21.8: horizontal WGS-84 is real, the
+    // vertical is device-reported (not verified HAE) and lives in
+    // features.shepherd_sensor_alt_m instead.
+    if (sensorGeo != null) ...{
+      'geo_status': 'VERTICAL_UNAVAILABLE',
+      'shepherd_geo_source': sensorGeo.source,
+      'shepherd_geo_note':
+          'Sensor (platform) position, not target position. '
+          'Altitude is device-reported, reference frame not verified '
+          'HAE — see features.shepherd_sensor_alt_m and the adapter spec.',
+      if (sensorGeo.accuracyM != null && sensorGeo.accuracyM!.isFinite)
+        'shepherd_geo_accuracy_m': sensorGeo.accuracyM,
+      if (sensorGeo.ageSec != null) 'shepherd_geo_age_s': sensorGeo.ageSec,
+    } else
+      'geo_status': 'UNAVAILABLE',
   };
 
   final tsZ = zmetaUtcZ(ts);
   final payload = <String, dynamic>{
     'modality': 'RF',
+    // Declared-2D canonical geo (21.8): present only when the detector
+    // position is genuinely known; omitted — never zero-filled — per
+    // 6.8 otherwise. This is the sensor's position, not the target's.
+    if (sensorGeo != null) 'geo': sensorGeo.toGeoJson(),
     'features': features,
     'quality': quality,
     // Degraded timing stays visible: only a GPS-PPS-locked node may
@@ -167,10 +282,10 @@ Map<String, dynamic> zmetaObservation({
     },
   };
 
-  // v1.0 geo is all-or-nothing (needs WGS-84 HAE altitude). Shepherd's
-  // node positions are 2-D fixes, so canonical geo is omitted rather
-  // than zero-filled; the sensor is identified by
-  // source.platform_id + source.sensor_id.
+  // v1.1 geo: declared "2D" (lat/lon, no alt_m) when the detector
+  // position is known (21.8); omitted — never zero-filled — per 6.8
+  // otherwise. The sensor is identified by source.platform_id +
+  // source.sensor_id regardless.
 
   return {
     'zmeta_version': kZmetaVersion,
@@ -185,6 +300,84 @@ Map<String, dynamic> zmetaObservation({
       'node_role': 'EDGE',
       'producer': 'rf-sensor-shepherd',
       'sensor_id': sensorId,
+    },
+    'profile': 'H',
+    'payload': payload,
+  };
+}
+
+/// Builds a ZMeta OBSERVATION_EVENT for a universal sensor observation
+/// (acoustic bearing/spectrum, camera motion). The payload comes from
+/// [SensorObservation.toZMetaPayload] — this function ONLY wraps it in
+/// the envelope and MUST NOT invent fields the payload doesn't carry.
+/// Returns null when the observation has no honest ZMeta modality
+/// (RANGE/BINARY/ENERGY stay local).
+Map<String, dynamic>? zmetaSensorObservation({
+  required String platformId,
+  required SensorObservation obs,
+}) {
+  final inner = obs.toZMetaPayload();
+  if (inner == null) return null;
+  final modality = '${inner['modality'] ?? ''}';
+  final features = Map<String, dynamic>.of(
+      (inner['features'] as Map?)?.cast<String, dynamic>() ?? {});
+  // Sensor position (platform position, never the target's): declared
+  // 2-D per 21.8 when genuinely known, omitted — never zero-filled —
+  // per 6.8 otherwise.
+  ZmetaSensorGeo? geo;
+  if (obs.sensorLat != null &&
+      obs.sensorLon != null &&
+      obs.sensorLat!.isFinite &&
+      obs.sensorLon!.isFinite &&
+      !(obs.sensorLat == 0 && obs.sensorLon == 0)) {
+    geo = ZmetaSensorGeo(
+      lat: obs.sensorLat!,
+      lon: obs.sensorLon!,
+      source: 'sensor-observation',
+    );
+  }
+  final tsZ = zmetaUtcZ(obs.timestamp);
+  final payload = <String, dynamic>{
+    'modality': modality,
+    if (geo != null) 'geo': geo.toGeoJson(),
+    'features': {
+      ...features,
+      'shepherd_obs_type': features['shepherd_obs_type'] ?? 'UNKNOWN',
+      'shepherd_sensor_id': obs.sensorId,
+    },
+    'quality': {
+      'calibration_state': 'UNCALIBRATED',
+      'shepherd_estimates': true,
+      if (geo != null) ...{
+        'geo_status': 'VERTICAL_UNAVAILABLE',
+        'shepherd_geo_source': geo.source,
+        'shepherd_geo_note':
+            'Sensor (platform) position, not target position.',
+      } else
+        'geo_status': 'UNAVAILABLE',
+    },
+    'timing_quality': {
+      'time_source': 'UNKNOWN',
+      'sync_state': 'UNSYNCED',
+      'est_error_ms': 60000,
+      'last_sync_ts': tsZ,
+    },
+  };
+  return {
+    'zmeta_version': kZmetaVersion,
+    'event': {
+      'event_id': zmetaUuid7(),
+      'event_type': 'OBSERVATION_EVENT',
+      'event_subtype': modality,
+      'ts': tsZ,
+    },
+    'source': {
+      'platform_id': platformId,
+      'node_role': 'EDGE',
+      // eo-sensor-* is the governed producer pattern for EO events
+      // (policy/producer-authority.yaml).
+      'producer': 'eo-sensor-shepherd',
+      'sensor_id': obs.sensorId,
     },
     'profile': 'H',
     'payload': payload,
@@ -255,6 +448,85 @@ Map<String, dynamic> zmetaInference({
   };
 }
 
+/// Builds a ZMeta SYSTEM_EVENT / PLATFORM_STATUS heartbeat for the mesh.
+///
+/// Opt-in (default off): a periodic "this mesh is alive, here is where
+/// its platform is" for teams on the move. v1.1 subtype (21.6):
+/// platform health and operating state — the platform's own position is
+/// operating state, NOT track position (no target is implied).
+///
+/// [sensorGeo] is the platform position when freshly known (2-D, same
+/// honesty rules as observations); omitted when unknown. [state] must be
+/// one of the schema's platform states: NOMINAL | CAUTION | WARNING |
+/// CRITICAL | UNKNOWN.
+///
+/// Schema note: PLATFORM_STATUS metrics require one power field
+/// (battery_pct | fuel_remaining_pct | endurance_remaining_ms |
+/// power_state). Shepherd runs on a phone/PC whose power state the app
+/// does not measure, so it honestly reports `power_state: 'UNKNOWN'`
+/// (an allowed enum value) rather than inventing a battery percentage.
+Map<String, dynamic> zmetaPlatformStatus({
+  required String platformId,
+  required DateTime ts,
+  required String state,
+  required int nodeCount,
+  required int detectionCount,
+  required int heartbeatIntervalSec,
+  ZmetaSensorGeo? sensorGeo,
+}) {
+  final metrics = <String, dynamic>{
+    // Required by the schema (anyOf power fields); UNKNOWN is the
+    // honest value — the app does not measure device power.
+    'power_state': 'UNKNOWN',
+    // Dismounted team carrying the mesh: ground platform.
+    'platform_type': 'GROUND',
+    'shepherd_node_count': nodeCount,
+    'shepherd_detection_count': detectionCount,
+    'shepherd_heartbeat_interval_s': heartbeatIntervalSec,
+    if (sensorGeo != null) ...{
+      'position': {
+        'lat': sensorGeo.lat,
+        'lon': sensorGeo.lon,
+        'dimensionality': '2D',
+        'source': sensorGeo.source,
+        if (sensorGeo.altM != null && sensorGeo.altM!.isFinite)
+          'sensor_alt_m': sensorGeo.altM,
+        if (sensorGeo.accuracyM != null && sensorGeo.accuracyM!.isFinite)
+          'accuracy_m': sensorGeo.accuracyM,
+        if (sensorGeo.ageSec != null) 'age_s': sensorGeo.ageSec,
+      },
+      // Same honesty note as observations: platform position, and the
+      // altitude is device-reported (not verified HAE).
+      'position_note':
+          'Platform (mesh) position, not a target track. Altitude is '
+          'device-reported, reference frame not verified HAE.',
+    },
+  };
+  return {
+    'zmeta_version': kZmetaVersion,
+    'event': {
+      'event_id': zmetaUuid7(),
+      'event_type': 'SYSTEM_EVENT',
+      'event_subtype': 'PLATFORM_STATUS',
+      'ts': zmetaUtcZ(ts),
+    },
+    'source': {
+      'platform_id': platformId,
+      // policy/roles.yaml: EDGE may emit OBSERVATION and SYSTEM.
+      // policy/producer-authority.yaml: rf-sensor-* may emit
+      // OBSERVATION_EVENT and SYSTEM_EVENT.
+      'node_role': 'EDGE',
+      'producer': 'rf-sensor-shepherd',
+    },
+    'profile': 'H',
+    'payload': {
+      'system_type': 'PLATFORM_STATUS',
+      'state': state,
+      'metrics': metrics,
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // UDP emitter
 // ---------------------------------------------------------------------------
@@ -268,7 +540,26 @@ class ZMetaEmitter {
   final int port;
 
   RawDatagramSocket? _sock;
+
+  /// Resolved destination, looked up ONCE per emitter lifetime — not
+  /// per datagram. A hostname must not flap mid-session, and a
+  /// per-datagram failure reads as silent data loss.
+  InternetAddress? _dest;
+  bool _resolved = false;
+
   bool _closed = false;
+
+  Future<InternetAddress?> _resolve() async {
+    if (_resolved) return _dest;
+    _resolved = true;
+    try {
+      final addrs = await InternetAddress.lookup(host);
+      if (addrs.isNotEmpty) _dest = addrs.first;
+    } catch (_) {
+      // Unresolvable: sends are dropped below, detection continues.
+    }
+    return _dest;
+  }
 
   /// Sends one event as a single UDP datagram (the gateway's ingest
   /// format). Safe to call without awaiting; errors are swallowed.
@@ -276,8 +567,10 @@ class ZMetaEmitter {
     if (_closed) return;
     try {
       _sock ??= await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+      final dest = await _resolve();
+      if (dest == null) return;
       final data = utf8.encode(jsonEncode(event));
-      _sock!.send(data, InternetAddress(host), port);
+      _sock!.send(data, dest, port);
     } catch (_) {
       // Emit-only: never let the export path break detection.
     }

@@ -18,6 +18,10 @@ import '../models/tracking.dart';
 import 'silvus_api.dart';
 import 'simulated.dart';
 import 'kraken_driver.dart';
+import 'meshtastic_driver.dart';
+import 'esp32_driver.dart';
+import 'generic_sensor_driver.dart';
+import 'camera_driver.dart';
 
 /// One configured radio network.
 class RadioConfig {
@@ -260,6 +264,7 @@ class SdrBand {
     this.peakMhz,
     this.peakDbfs,
     this.spanMhz,
+    this.sigHint,
   });
 
   final String radio;
@@ -289,6 +294,11 @@ class SdrBand {
   /// [bwMhz] when the radio's sample rate can't cover the whole band.
   final double? spanMhz;
 
+  /// Additive signature hint from newer bridges (e.g. `fhss-2g4`,
+  /// `ofdm-5g`). Null from older bridges that don't send it. Parsed and
+  /// exposed only — no detection logic consumes it.
+  final String? sigHint;
+
   /// Parse a decoded bridge datagram. Returns null for beacons,
   /// wrong versions, and malformed packets (never throws).
   static SdrBand? tryParse(Map<String, dynamic> j) {
@@ -310,6 +320,9 @@ class SdrBand {
         return v is num && v.isFinite ? v.toDouble() : null;
       }
 
+      // Additive field: old bridges don't send it, so this is null-safe.
+      final sh = j['sig_hint'];
+
       return SdrBand(
         radio: '${j['radio']}',
         band: '${j['band']}',
@@ -321,6 +334,7 @@ class SdrBand {
         peakMhz: opt('peak_mhz'),
         peakDbfs: opt('peak_dbfs'),
         spanMhz: opt('span_mhz'),
+        sigHint: sh is String && sh.isNotEmpty ? sh : null,
         t: DateTime.fromMillisecondsSinceEpoch(
             ((j['t'] as num).toDouble() * 1000).round()),
       );
@@ -525,6 +539,14 @@ RadioDriver driverFor(RadioConfig config) {
       return SdrDriver.fromAddress(config.address);
     case 'kraken':
       return KrakenDriver.fromAddress(config.address);
+    case 'meshtastic':
+      return MeshtasticDriver.fromAddress(config.address);
+    case 'esp32':
+      return Esp32Driver();
+    case 'sensor':
+      return GenericSensorDriver();
+    case 'camera':
+      return CameraDriver();
     default:
       throw ArgumentError('Unknown driver: ${config.driverId}');
   }
@@ -535,6 +557,10 @@ const List<({String id, String label, bool implemented})> driverTypes = [
   (id: 'silvus', label: 'SILVUS', implemented: true),
   (id: 'sdr', label: 'SDR (Pluto / USRP / RTL-SDR / HackRF…)', implemented: true),
   (id: 'kraken', label: 'KRAKENSDR (DF bearings)', implemented: true),
+  (id: 'meshtastic', label: 'MESHTASTIC (LoRa mesh nodes)', implemented: true),
+  (id: 'esp32', label: 'ESP32 NODE (UDP beacons)', implemented: true),
+  (id: 'sensor', label: 'SENSOR BUS (lidar / acoustic / PIR / …)', implemented: true),
+  (id: 'camera', label: 'CAMERA (webhook / ONVIF)', implemented: true),
   (id: 'mpu5', label: 'MPU5 (Wave Relay)', implemented: false),
   (id: 'harris', label: 'L3HARRIS', implemented: false),
 ];

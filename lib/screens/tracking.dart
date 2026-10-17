@@ -4,10 +4,12 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 
 import '../models/tracking.dart';
+import '../services/gps_positioning.dart';
 import '../services/tracker.dart';
 import '../state/app_state.dart';
 import '../theme.dart';
 import '../utils/hull.dart';
+import 'sensor_overlay.dart';
 
 /// Tracking tab in the RuView observatory style: dark field map with
 /// glowing nodes, fused track readout as technical rows, node heights.
@@ -34,6 +36,10 @@ class _TrackingScreenState extends State<TrackingScreen> {
   /// Node health overlay: recolor node dots by link freshness
   /// (green/amber/red/grey) instead of driver color.
   bool _showHealth = false;
+
+  /// Universal sensor observation overlay (lidar arcs, acoustic
+  /// bearings, camera motion…). Needs a GPS origin to project.
+  bool _showSensors = true;
 
   /// Map zoom (wheel / buttons). Pinch is reserved for node dragging.
   double _mapZoom = 1.0;
@@ -121,6 +127,12 @@ class _TrackingScreenState extends State<TrackingScreen> {
                 child: Text(
                     _showHealth ? 'HEALTH ON' : 'HEALTH OFF'),
               ),
+              TextButton(
+                onPressed: () =>
+                    setState(() => _showSensors = !_showSensors),
+                child: Text(
+                    _showSensors ? 'SENSORS ON' : 'SENSORS OFF'),
+              ),
               Text(
                 live ? 'LIVE LAYOUT' : 'SIMULATED LAYOUT',
                 style: SentryType.section(10).copyWith(
@@ -165,6 +177,8 @@ class _TrackingScreenState extends State<TrackingScreen> {
         final h = expand ? constraints.maxHeight : 320.0;
         final size =
             Size(constraints.maxWidth, h.isFinite ? h : 320.0);
+        final tr = _buildTransform(size, nodes);
+        final origin = state.gpsOrigin;
         return Stack(
           children: [
             Listener(
@@ -184,7 +198,7 @@ class _TrackingScreenState extends State<TrackingScreen> {
                 child: CustomPaint(
                   size: size,
                   painter: _TrackingMapPainter(
-                    transform: _buildTransform(size, nodes),
+                    transform: tr,
                     nodes: nodes,
                     disturbedPairs: state.disturbedPairs,
                     defended: state.defended,
@@ -197,6 +211,18 @@ class _TrackingScreenState extends State<TrackingScreen> {
                 ),
               ),
             ),
+            // Universal sensor observations (lidar arcs, acoustic
+            // bearings, camera motion…). Above tracks reads best.
+            // Needs a GPS origin to project lat/lon → map.
+            if (_showSensors && origin != null)
+              ...sensorObservationLayer(
+                observations: state.sensorObservations,
+                project: (lat, lon) {
+                  final m = latLonToMeters(lat, lon, origin.lat, origin.lon);
+                  return tr.toScreen(m.x, m.y);
+                },
+                metersToPx: tr.scale,
+              ),
             Positioned(
               right: 4,
               top: 4,
@@ -480,6 +506,81 @@ class _TrackingScreenState extends State<TrackingScreen> {
     );
   }
 
+  Future<void> _editCallsign(
+      BuildContext context, AppState state, NodePosition n) async {
+    final ctl = TextEditingController(text: n.callsign ?? '');
+    String? error;
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setD) => AlertDialog(
+          backgroundColor: SentryColors.surface2,
+          title: Text('CALLSIGN — ${n.nodeId}',
+              style: SentryType.rowValue(SentryColors.onDark)),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('SHOWN OVER THIS NODE ON THE MAP. A-Z 0-9 DASH, UP TO 16 CHARACTERS. EMPTY CLEARS IT.',
+                  style: SentryType.section(10)),
+              const SizedBox(height: 10),
+              TextField(
+                controller: ctl,
+                autofocus: true,
+                textCapitalization: TextCapitalization.characters,
+                maxLength: 16,
+                style: SentryType.rowValue(SentryColors.onDark),
+                decoration: InputDecoration(
+                  hintText: 'e.g. RAPTOR-1',
+                  errorText: error,
+                  counterText: '',
+                ),
+                onChanged: (_) => setD(() => error = null),
+              ),
+              if (n.callsign != null && !n.callsignByUser)
+                Padding(
+                  padding: const EdgeInsets.only(top: 8),
+                  child: Text('CURRENTLY FROM THE NODE\u2019S BEACON — TYPING YOUR OWN OVERRIDES IT.',
+                      style: SentryType.section(10)),
+                ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('CANCEL'),
+            ),
+            if (n.callsignByUser)
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(''),
+                child: const Text('CLEAR'),
+              ),
+            ElevatedButton(
+              onPressed: () {
+                final clean = AppState.cleanCallsign(ctl.text);
+                if (ctl.text.trim().isNotEmpty && clean == null) {
+                  setD(() => error = 'A-Z 0-9, DASH, UP TO 16 CHARS');
+                  return;
+                }
+                Navigator.of(ctx).pop(ctl.text);
+              },
+              child: const Text('SAVE'),
+            ),
+          ],
+        ),
+      ),
+    );
+    ctl.dispose();
+    if (result != null && context.mounted) {
+      final ok = state.setNodeCallsign(n.nodeId, result);
+      if (!ok && context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('INVALID CALLSIGN')),
+        );
+      }
+    }
+  }
+
   /// GPS-assisted positioning: walk to each node with the device and tap
   /// the target button — the node's map position is set from the GPS fix,
   /// in meters east/north of the stored origin. The first capture sets
@@ -535,7 +636,7 @@ class _TrackingScreenState extends State<TrackingScreen> {
                 children: [
                   SizedBox(
                     width: 88,
-                    child: Text(shortNodeId(n.nodeId),
+                    child: Text(n.callsign ?? shortNodeId(n.nodeId),
                         style:
                             SentryType.rowValue(SentryColors.onDark)
                                 .copyWith(fontSize: 12),
@@ -562,6 +663,12 @@ class _TrackingScreenState extends State<TrackingScreen> {
                     onPressed: state.gpsBusy
                         ? null
                         : () => state.captureNodeGps(n.nodeId),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.badge, size: 18),
+                    color: SentryColors.purple,
+                    tooltip: 'Set callsign for ${n.nodeId}',
+                    onPressed: () => _editCallsign(context, state, n),
                   ),
                 ],
               ),
@@ -617,7 +724,7 @@ class _TrackingScreenState extends State<TrackingScreen> {
                 children: [
                   SizedBox(
                     width: 96,
-                    child: Text(shortNodeId(n.nodeId),
+                    child: Text(n.callsign ?? shortNodeId(n.nodeId),
                         style: SentryType.rowValue(SentryColors.onDark)
                             .copyWith(fontSize: 12),
                         overflow: TextOverflow.ellipsis),
@@ -903,7 +1010,7 @@ class _TrackingMapPainter extends CustomPainter {
       canvas.drawCircle(p, 14, Paint()..color = color.withAlpha(45));
       canvas.drawCircle(p, 8, Paint()..color = color.withAlpha(140));
       canvas.drawCircle(p, 4.5, Paint()..color = color);
-      _label(canvas, shortNodeId(n.nodeId), p + const Offset(16, -24),
+      _label(canvas, n.callsign ?? shortNodeId(n.nodeId), p + const Offset(16, -24),
           SentryColors.onDark);
       if (n.height >= 0.5) {
         _label(canvas, '${n.height.toStringAsFixed(0)}m',
