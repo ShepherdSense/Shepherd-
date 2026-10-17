@@ -31,6 +31,10 @@ class _TrackingScreenState extends State<TrackingScreen> {
   /// Shadow (attenuation) heatmap overlay on the field map.
   bool _showShadow = true;
 
+  /// Node health overlay: recolor node dots by link freshness
+  /// (green/amber/red/grey) instead of driver color.
+  bool _showHealth = false;
+
   /// Map zoom (wheel / buttons). Pinch is reserved for node dragging.
   double _mapZoom = 1.0;
 
@@ -111,6 +115,12 @@ class _TrackingScreenState extends State<TrackingScreen> {
                 child: Text(
                     _showShadow ? 'SHADOW ON' : 'SHADOW OFF'),
               ),
+              TextButton(
+                onPressed: () =>
+                    setState(() => _showHealth = !_showHealth),
+                child: Text(
+                    _showHealth ? 'HEALTH ON' : 'HEALTH OFF'),
+              ),
               Text(
                 live ? 'LIVE LAYOUT' : 'SIMULATED LAYOUT',
                 style: SentryType.section(10).copyWith(
@@ -127,7 +137,7 @@ class _TrackingScreenState extends State<TrackingScreen> {
             style: SentryType.section(10),
           ),
           const SizedBox(height: 8),
-          _driverLegend(nodes),
+          if (_showHealth) _healthLegend() else _driverLegend(nodes),
           const SizedBox(height: 8),
           _mapVisualization(nodes, live),
           if (live) ...[
@@ -181,6 +191,8 @@ class _TrackingScreenState extends State<TrackingScreen> {
                     track: state.track,
                     shadow: state.shadow,
                     showShadow: _showShadow,
+                    showHealth: _showHealth,
+                    nodeHealth: _showHealth ? state.nodeHealthMap : const {},
                   ),
                 ),
               ),
@@ -276,6 +288,38 @@ class _TrackingScreenState extends State<TrackingScreen> {
               const SizedBox(width: 5),
               Text(d.isEmpty ? 'UNKNOWN' : d.toUpperCase(),
                   style: SentryType.section(10)),
+            ],
+          ),
+      ],
+    );
+  }
+
+  /// Legend for the node-health overlay: dot color = link freshness.
+  Widget _healthLegend() {
+    const items = [
+      (SentryColors.green, 'ALL LINKS LIVE'),
+      (SentryColors.amber, 'SOME STALE'),
+      (SentryColors.red, 'ALL STALE'),
+      (SentryColors.muted, 'NO LINKS'),
+    ];
+    return Wrap(
+      spacing: 14,
+      runSpacing: 4,
+      children: [
+        for (final (c, label) in items)
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 9,
+                height: 9,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: c,
+                ),
+              ),
+              const SizedBox(width: 5),
+              Text(label, style: SentryType.section(10)),
             ],
           ),
       ],
@@ -688,6 +732,8 @@ class _TrackingMapPainter extends CustomPainter {
     required this.track,
     required this.shadow,
     required this.showShadow,
+    this.showHealth = false,
+    this.nodeHealth = const {},
   });
 
   final _MapTransform transform;
@@ -697,6 +743,11 @@ class _TrackingMapPainter extends CustomPainter {
   final TrackEstimate? track;
   final List<ShadowCell> shadow;
   final bool showShadow;
+
+  /// When true, node dots are colored by link freshness instead of
+  /// driver color. Disturbed nodes still glow amber on top.
+  final bool showHealth;
+  final Map<String, NodeHealthStatus> nodeHealth;
 
   static String _pairKey(String a, String b) {
     final ids = [a, b]..sort();
@@ -831,7 +882,8 @@ class _TrackingMapPainter extends CustomPainter {
     }
 
     // Nodes — driver-colored dots (one unified map for all radios),
-    // amber when disturbed.
+    // amber when disturbed. With the health overlay on, the base color
+    // is link freshness instead of driver color.
     final disturbedNodes = <String>{};
     for (final key in disturbedPairs) {
       disturbedNodes.addAll(key.split('|'));
@@ -839,8 +891,15 @@ class _TrackingMapPainter extends CustomPainter {
     for (final n in nodes) {
       final p = tr.toScreen(n.x, n.y);
       final hot = disturbedNodes.contains(n.nodeId);
-      final color =
-          hot ? SentryColors.amber : driverColor(driverOf(n.nodeId));
+      final healthColor = switch (nodeHealth[n.nodeId]) {
+        NodeHealthStatus.ok => SentryColors.green,
+        NodeHealthStatus.degraded => SentryColors.amber,
+        NodeHealthStatus.dead => SentryColors.red,
+        _ => SentryColors.muted,
+      };
+      final base =
+          showHealth ? healthColor : driverColor(driverOf(n.nodeId));
+      final color = hot ? SentryColors.amber : base;
       canvas.drawCircle(p, 14, Paint()..color = color.withAlpha(45));
       canvas.drawCircle(p, 8, Paint()..color = color.withAlpha(140));
       canvas.drawCircle(p, 4.5, Paint()..color = color);

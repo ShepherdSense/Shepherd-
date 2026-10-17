@@ -1,8 +1,27 @@
 import 'package:flutter/material.dart';
 
+import '../models/link_sample.dart';
 import '../services/health.dart';
+import '../services/radio_driver.dart';
 import '../state/app_state.dart';
 import '../theme.dart';
+import 'evidence_sheet.dart';
+
+/// Dot color for a crossing event's size estimate. Pure function so the
+/// timeline and the detection card agree — and so it's unit-testable.
+Color eventSizeColor(String sizeEstimate) => switch (sizeEstimate) {
+      'S' => SentryColors.blue,
+      'M' => SentryColors.amber,
+      _ => SentryColors.red,
+    };
+
+/// Events for the timeline strip: the last [n] events, oldest first.
+/// Pure function so the mapping is unit-testable.
+List<CrossingEvent> timelineEvents(List<CrossingEvent> events, [int n = 24]) {
+  final take = events.length > n ? n : events.length;
+  // events is newest-first; timeline reads oldest-first.
+  return events.take(take).toList().reversed.toList();
+}
 
 /// Alert-first dashboard in the RuView observatory style: a floating
 /// PERIMETER STATUS panel with a giant readout, a LATEST DETECTION panel
@@ -34,7 +53,11 @@ class DashboardScreen extends StatelessWidget {
             const SizedBox(height: 12),
             _linksCompact(disturbed),
             const SizedBox(height: 12),
-            _eventsCard(),
+            _spectrumCard(),
+            if (state.hasSdrDriver) const SizedBox(height: 12),
+            _timelineStrip(context),
+            const SizedBox(height: 12),
+            _eventsCard(context),
             const SizedBox(height: 12),
             const _ScopeNote(),
           ],
@@ -161,6 +184,13 @@ class DashboardScreen extends StatelessWidget {
               disturbed.join('  ·  '),
               style: SentryType.rowValue(SentryColors.amber)
                   .copyWith(fontSize: 11),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              'HEURISTIC DETECTION — LINK DISTURBANCE CONFIRMED, '
+              'NOT IDENTIFICATION. SIZE AND AI LABELS ARE ESTIMATES.',
+              style: SentryType.section(10).copyWith(
+                  height: 1.6, color: SentryColors.muted),
             ),
           ],
           if (showReasons) ...[
@@ -322,11 +352,7 @@ class DashboardScreen extends StatelessWidget {
       );
     }
     final e = state.events.first;
-    final sizeColor = switch (e.sizeEstimate) {
-      'S' => SentryColors.blue,
-      'M' => SentryColors.amber,
-      _ => SentryColors.red,
-    };
+    final sizeColor = eventSizeColor(e.sizeEstimate);
     return SentryPanel(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -417,44 +443,322 @@ class DashboardScreen extends StatelessWidget {
     );
   }
 
-  Widget _eventsCard() {
+  /// Horizontal event timeline: one dot per crossing (colored by size
+  /// estimate), tap for the evidence sheet. Oldest first, newest last.
+  /// Works on the live event list and on replayed recordings alike —
+  /// both land in [AppState.events].
+  Widget _timelineStrip(BuildContext context) {
+    final evts = timelineEvents(state.events);
     return SentryPanel(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('CROSSING EVENTS', style: SentryType.section()),
+          Row(
+            children: [
+              Text('EVENT TIMELINE', style: SentryType.section()),
+              const Spacer(),
+              Text('${state.events.length} EVENTS',
+                  style: SentryType.section(10)),
+            ],
+          ),
+          const SizedBox(height: 10),
+          if (evts.isEmpty)
+            Text('NO EVENTS YET', style: SentryType.rowLabel())
+          else ...[
+            SizedBox(
+              height: 56,
+              child: ListView.builder(
+                scrollDirection: Axis.horizontal,
+                itemCount: evts.length,
+                itemBuilder: (ctx, i) {
+                  final e = evts[i];
+                  return InkWell(
+                    borderRadius: BorderRadius.circular(8),
+                    onTap: () => _openEvidence(context, e),
+                    child: Padding(
+                      padding:
+                          const EdgeInsets.symmetric(horizontal: 8),
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Container(
+                            width: 12,
+                            height: 12,
+                            decoration: BoxDecoration(
+                              color: eventSizeColor(e.sizeEstimate),
+                              shape: BoxShape.circle,
+                            ),
+                          ),
+                          const SizedBox(height: 5),
+                          Text(_fmtTime(e.timestamp),
+                              style: SentryType.section(9)),
+                        ],
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+            const SizedBox(height: 4),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(_fmtTime(evts.first.timestamp),
+                    style: SentryType.section(9)),
+                Text('SIZE: S/M/L (EST)',
+                    style: SentryType.section(9)),
+                Text(_fmtTime(evts.last.timestamp),
+                    style: SentryType.section(9)),
+              ],
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  void _openEvidence(BuildContext context, CrossingEvent e) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: SentryColors.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (_) => EvidenceSheet(event: e, state: state),
+    );
+  }
+
+  Widget _eventsCard(BuildContext context) {
+    final stats = state.triageStats;
+    return SentryPanel(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text('CROSSING EVENTS', style: SentryType.section()),
+              const Spacer(),
+              Text(
+                'ACK ${stats['acked']} · FA ${stats['falseAlarm']} · '
+                'NEW ${stats['unreviewed']}',
+                style: SentryType.section(10),
+              ),
+            ],
+          ),
           const SizedBox(height: 10),
           if (state.events.isEmpty)
             Text('NO CROSSINGS DETECTED YET',
                 style: SentryType.rowLabel()),
-          for (final e in state.events.take(30))
-            Padding(
-              padding: const EdgeInsets.symmetric(vertical: 6),
-              child: Row(
+          for (final e in state.events.take(30)) _eventRow(context, e),
+        ],
+      ),
+    );
+  }
+
+  /// One event row: tap for evidence, ACK / FALSE ALARM for triage.
+  /// Acked rows dim; false alarms mute. Triage never deletes the event.
+  Widget _eventRow(BuildContext context, CrossingEvent e) {
+    final verdict = state.triage[AppState.triageKeyFor(e)];
+    final acked = verdict == AppState.triageAcked;
+    final falseAlarm = verdict == AppState.triageFalseAlarm;
+    final aiLabel = e.aiLabel == null
+        ? '—'
+        : 'AI ${e.aiLabel} ${(e.aiConfidence! * 100).toStringAsFixed(0)}% EST';
+    final row = Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(8),
+        onTap: () => _openEvidence(context, e),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(
+              falseAlarm
+                  ? Icons.do_not_disturb_on_outlined
+                  : Icons.warning_amber_rounded,
+              color:
+                  falseAlarm ? SentryColors.muted : SentryColors.amber,
+              size: 18,
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Icon(Icons.warning_amber_rounded,
-                      color: SentryColors.amber, size: 18),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          '${_fmtTime(e.timestamp)} · ${shortLinkKey(e.linkKey)}${e.aiLabel == null ? '' : ' · AI ${e.aiLabel}'}',
-                          style: SentryType.rowValue(SentryColors.onDark),
-                        ),
-                        const SizedBox(height: 2),
-                        Text(
-                          'SIZE ${e.sizeEstimate} EST · DIP -${e.dipDepth.toStringAsFixed(0)} EST · LASTED ${e.durationLabel}',
-                          style: SentryType.rowLabel().copyWith(fontSize: 11),
-                        ),
-                      ],
-                    ),
+                  Text(
+                    '${_fmtTime(e.timestamp)} · ${shortLinkKey(e.linkKey)} · $aiLabel',
+                    style: SentryType.rowValue(falseAlarm
+                        ? SentryColors.muted
+                        : SentryColors.onDark),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    'SIZE ${e.sizeEstimate} EST · ${e.direction == 'rise' ? 'RISE +' : 'DIP -'}${e.dipDepth.toStringAsFixed(0)} EST · LASTED ${e.durationLabel}',
+                    style: SentryType.rowLabel().copyWith(
+                        fontSize: 11,
+                        color: falseAlarm ? SentryColors.muted : null),
+                  ),
+                  const SizedBox(height: 5),
+                  Row(
+                    children: [
+                      _triageBtn(e, AppState.triageAcked, 'ACK',
+                          SentryColors.green),
+                      const SizedBox(width: 8),
+                      _triageBtn(e, AppState.triageFalseAlarm,
+                          'FALSE ALARM', SentryColors.red),
+                    ],
                   ),
                 ],
               ),
             ),
+            const Icon(Icons.chevron_right,
+                color: SentryColors.muted, size: 18),
+          ],
+        ),
+      ),
+    );
+    return Opacity(opacity: acked ? 0.55 : 1.0, child: row);
+  }
+
+  /// Small triage toggle button. Active state is highlighted; tapping
+  /// the active verdict again clears it.
+  Widget _triageBtn(
+      CrossingEvent e, String verdict, String label, Color color) {
+    final active =
+        state.triage[AppState.triageKeyFor(e)] == verdict;
+    return InkWell(
+      borderRadius: BorderRadius.circular(6),
+      onTap: () => state.triageEvent(e, verdict),
+      child: Container(
+        padding:
+            const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+        decoration: BoxDecoration(
+          border: Border.all(
+              color: active ? color : SentryColors.border),
+          borderRadius: BorderRadius.circular(6),
+          color:
+              active ? color.withAlpha(28) : Colors.transparent,
+        ),
+        child: Text(
+          label,
+          style: SentryType.chip(
+                  active ? color : SentryColors.muted)
+              .copyWith(fontSize: 10),
+        ),
+      ),
+    );
+  }
+
+  /// Spectrum bands watched by live SDR drivers. One honest bar per
+  /// band — band-median energy (dBFS) with a noise-floor marker. No
+  /// waterfall: a waterfall would imply time resolution the sweep
+  /// doesn't have. Bars follow the same disturbed-link state as the
+  /// tripwire. Shown only when an SDR driver is active.
+  Widget _spectrumCard() {
+    if (!state.hasSdrDriver) return const SizedBox.shrink();
+    final bands = state.sdrBands;
+    final disturbed = state.disturbedLinks.toSet();
+    return SentryPanel(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text('SPECTRUM BANDS', style: SentryType.section()),
+              const Spacer(),
+              Text('ENERGY dBFS', style: SentryType.section(10)),
+            ],
+          ),
+          const SizedBox(height: 10),
+          if (bands.isEmpty)
+            Text('WAITING FOR SWEEP DATA',
+                style: SentryType.rowLabel()),
+          for (final b in bands) _bandRow(b, disturbed),
+          const SizedBox(height: 6),
+          Text(
+            'BAND-MEDIAN ENERGY, NOT A WATERFALL. LEVELS ARE ESTIMATES '
+            '(dBFS, RECEIVER-RELATIVE — NOT dBm).',
+            style: SentryType.section(9),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _bandRow(SdrBand b, Set<String> disturbed) {
+    // Same virtual link key the tripwire uses, so disturbance state
+    // agrees between the panel and the detector.
+    final linkKey = 'sdr:${b.radio} → sdr:band-${b.band}';
+    final hot = disturbed.contains(linkKey);
+    final color = hot ? SentryColors.amber : SentryColors.blue;
+    // Bar scale: -100..-20 dBFS.
+    double frac(double db) => ((db + 100) / 80).clamp(0.0, 1.0);
+    final spanMhz = b.spanMhz ?? b.bwMhz;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 7),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text(b.band.toUpperCase(),
+                  style:
+                      SentryType.rowValue(SentryColors.onDark)),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  '${b.centerMhz.toStringAsFixed(1)} MHz · '
+                  '${spanMhz.toStringAsFixed(1)} MHz SPAN',
+                  style: SentryType.rowLabel()
+                      .copyWith(fontSize: 11),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              Text(
+                '${b.energyDbfs.toStringAsFixed(1)} EST',
+                style: SentryType.rowValue(color)
+                    .copyWith(fontSize: 11),
+              ),
+            ],
+          ),
+          const SizedBox(height: 5),
+          SizedBox(
+            height: 10,
+            child: LayoutBuilder(
+              builder: (ctx, c) {
+                return Stack(
+                  children: [
+                    Container(
+                      decoration: BoxDecoration(
+                        color: SentryColors.surface2,
+                        borderRadius: BorderRadius.circular(5),
+                      ),
+                    ),
+                    FractionallySizedBox(
+                      widthFactor: frac(b.energyDbfs),
+                      child: Container(
+                        decoration: BoxDecoration(
+                          color: color.withAlpha(170),
+                          borderRadius:
+                              BorderRadius.circular(5),
+                        ),
+                      ),
+                    ),
+                    // Noise-floor marker (10th-percentile PSD).
+                    Positioned(
+                      left: (c.maxWidth * frac(b.noiseDbfs) - 1)
+                          .clamp(0.0, c.maxWidth),
+                      top: 0,
+                      bottom: 0,
+                      child: Container(
+                          width: 2,
+                          color: SentryColors.muted),
+                    ),
+                  ],
+                );
+              },
+            ),
+          ),
         ],
       ),
     );
