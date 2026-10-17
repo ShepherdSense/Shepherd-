@@ -24,7 +24,10 @@ class LinkSample {
   final double? noiseFrom;
   final double? noiseTo;
 
-  /// baseline - snr, in radio units. Estimate.
+  /// Deviation from baseline in the *expected* direction, radio units
+  /// (baseline−snr on anti-fade links, snr−baseline on deep-fade links,
+  /// larger of the two on intermediate links — see Tripwire). Estimate;
+  /// use deltas, not absolutes.
   final double dip;
 
   /// Rolling median baseline the dip is measured against. Estimate.
@@ -34,6 +37,11 @@ class LinkSample {
   /// it per link from the link's own noise (see [TripwireConfig.adaptive]);
   /// NaN on raw samples that haven't been through the tripwire yet.
   final double threshold;
+
+  /// Bearing in degrees (0–360), when this sample comes from a
+  /// direction-finding driver (KrakenSDR). Null otherwise. A bearing is
+  /// not a position — one station gives direction only.
+  final double? bearingDeg;
 
   const LinkSample({
     required this.timestamp,
@@ -47,6 +55,7 @@ class LinkSample {
     this.dip = 0.0,
     this.baseline = double.nan,
     this.threshold = double.nan,
+    this.bearingDeg,
   });
 
   String get linkKey => '$fromNode → $toNode';
@@ -61,7 +70,11 @@ class LinkSample {
   /// True when the dip is at/above this link's own threshold.
   bool isDisturbed(double fallback) => dip >= effectiveThreshold(fallback);
 
-  LinkSample copyWith({double? dip, double? baseline, double? threshold}) =>
+  LinkSample copyWith(
+          {double? dip,
+          double? baseline,
+          double? threshold,
+          double? bearingDeg}) =>
       LinkSample(
         timestamp: timestamp,
         fromNode: fromNode,
@@ -74,6 +87,7 @@ class LinkSample {
         dip: dip ?? this.dip,
         baseline: baseline ?? this.baseline,
         threshold: threshold ?? this.threshold,
+        bearingDeg: bearingDeg ?? this.bearingDeg,
       );
 }
 
@@ -92,6 +106,14 @@ class CrossingEvent {
   /// Estimate only — not identification.
   final String sizeEstimate;
 
+  /// Direction of the disturbance: 'dip' (signal fell) or 'rise'
+  /// (signal rose — the expected sign on deep-fade links).
+  final String direction;
+
+  /// True when the variance (VRTI) channel fired during this episode —
+  /// motion raised RSS variance even though the mean barely moved.
+  final bool viaVariance;
+
   /// Embedded-classifier label (PASSING / LINGERING / INTERFERENCE /
   /// FAULT) with confidence. Null when the model wasn't available.
   /// Heuristic estimate — trained on synthetic data, not an ID.
@@ -104,17 +126,26 @@ class CrossingEvent {
     required this.dipDepth,
     required this.durationSecs,
     required this.sizeEstimate,
+    this.direction = 'dip',
+    this.viaVariance = false,
     this.aiLabel,
     this.aiConfidence,
   });
 
-  CrossingEvent copyWith({String? aiLabel, double? aiConfidence}) =>
+  CrossingEvent copyWith({
+    String? aiLabel,
+    double? aiConfidence,
+    String? direction,
+    bool? viaVariance,
+  }) =>
       CrossingEvent(
         timestamp: timestamp,
         linkKey: linkKey,
         dipDepth: dipDepth,
         durationSecs: durationSecs,
         sizeEstimate: sizeEstimate,
+        direction: direction ?? this.direction,
+        viaVariance: viaVariance ?? this.viaVariance,
         aiLabel: aiLabel ?? this.aiLabel,
         aiConfidence: aiConfidence ?? this.aiConfidence,
       );
@@ -123,7 +154,10 @@ class CrossingEvent {
 
   String get durationLabel => '${durationSecs.toStringAsFixed(1)}s (est.)';
 
-  String get summary =>
-      'Crossing (est.) · $linkKey · dip -${dipDepth.toStringAsFixed(0)} (est.) · '
-      'size $sizeLabel · lasted $durationLabel';
+  String get summary {
+    final arrow = direction == 'rise' ? '+' : '-';
+    final via = viaVariance ? ' · variance channel' : '';
+    return 'Crossing (est.) · $linkKey · $arrow${dipDepth.toStringAsFixed(0)} (est.) · '
+        'size $sizeLabel · lasted $durationLabel$via';
+  }
 }
