@@ -325,7 +325,11 @@ class _TrackingScreenState extends State<TrackingScreen> {
           const SizedBox(height: 12),
           if (t == null)
             Text(
-              'NO ACTIVE TARGET. DISTURB A LINK AND THE ESTIMATE APPEARS HERE.',
+              state.disturbedLinks.isNotEmpty
+                  ? 'DISTURBANCE DETECTED, BUT THERE IS NOT ENOUGH GEOMETRY TO '
+                      'PLACE IT. LOCALIZING NEEDS 3+ NODES WITH POSITIONS '
+                      '(SPECTRUM-BAND ALERTS NEVER LOCALIZE).'
+                  : 'NO ACTIVE TARGET. DISTURB A LINK AND THE ESTIMATE APPEARS HERE.',
               style: SentryType.rowLabel(),
             )
           else ...[

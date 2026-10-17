@@ -99,7 +99,7 @@ as any undiscovered node); drag them where you like or ignore them.
   FFT, dBFS with full-scale sine = 0 dBFS. First capture after each
   retune is discarded.
 - **Protocol:** UDP JSON to 127.0.0.1:49161 — `band` packets per dwell
-  plus a `beacon` every 10 s so the driver (and `probe()`) knows the
+  plus a `beacon` every 3 s so the driver (and `probe()`) knows the
   bridge is alive. `--print` dumps packets as JSON lines instead of
   sending (sandbox/CI friendly); `--sweeps N` exits after N sweeps.
 - **Launcher:** `RUN_SDR_BRIDGE.bat` — venv, deps, run. Double-click.

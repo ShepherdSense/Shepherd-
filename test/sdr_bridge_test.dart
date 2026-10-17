@@ -32,6 +32,27 @@ void main() {
       expect(b.binsDbfs, hasLength(8));
     });
 
+    test('rejects NaN / infinite readings (they would poison a baseline)', () {
+      expect(SdrBand.tryParse(bandPacket(energy: double.nan)), isNull);
+      expect(SdrBand.tryParse(bandPacket(energy: double.infinity)), isNull);
+      expect(SdrBand.tryParse(bandPacket(energy: double.negativeInfinity)),
+          isNull);
+    });
+
+    test('optional peak/span fields parse when present, null when absent', () {
+      final plain = SdrBand.tryParse(bandPacket())!;
+      expect(plain.peakMhz, isNull);
+      expect(plain.spanMhz, isNull);
+      final j = bandPacket()
+        ..['peak_mhz'] = 2441.5
+        ..['peak_dbfs'] = -48.2
+        ..['span_mhz'] = 3.2;
+      final rich = SdrBand.tryParse(j)!;
+      expect(rich.peakMhz, 2441.5);
+      expect(rich.peakDbfs, -48.2);
+      expect(rich.spanMhz, 3.2);
+    });
+
     test('rejects beacons, wrong versions, and garbage without throwing', () {
       expect(SdrBand.tryParse(bandPacket(kind: 'beacon')), isNull);
       expect(SdrBand.tryParse(bandPacket(v: 2)), isNull);
@@ -91,6 +112,18 @@ void main() {
       final b = SdrDriver.fromAddress('192.168.4.10');
       expect(b.host, '192.168.4.10');
       expect(b.port, SdrDriver.defaultBridgePort);
+    });
+
+    test('a hostname or wildcard address does not crash construction', () {
+      expect(SdrDriver.fromAddress('0.0.0.0:49161').host, '0.0.0.0');
+      expect(SdrDriver.fromAddress('my-pc.local').host, 'my-pc.local');
+    });
+
+    test('sweeping SDR declares a longer sample lifetime than a mesh radio',
+        () {
+      final d = SdrDriver.fromAddress('');
+      expect(d.sampleMaxAge, isNotNull);
+      expect(d.sampleMaxAge!.inSeconds, greaterThan(10));
     });
 
     test('driver identity', () {

@@ -39,6 +39,8 @@ Color driverColor(String driverId) {
       return SentryColors.purple;
     case 'harris':
       return SentryColors.orange;
+    case 'sdr':
+      return SentryColors.purple;
     default:
       return SentryColors.muted;
   }
@@ -81,10 +83,30 @@ class AppState extends ChangeNotifier {
   AppState() {
     _loadLayout();
     _loadGpsOrigin();
-    _loadRadios();
+    _radiosReady = _loadRadios();
     // Fire-and-forget: events simply carry no AI label until it lands.
     DisturbanceClassifier.load().then((c) => _classifier = c);
     TrackStitcher.load().then((s) => _stitcher = s);
+  }
+
+  /// Completes when the saved radio list has been read. START waits for
+  /// it: otherwise a quick START on a cold launch saw an empty list,
+  /// "migrated" the legacy single radio, and overwrote the saved radios.
+  late final Future<void> _radiosReady;
+  bool _radiosLoaded = false;
+  bool _startPending = false;
+  bool _disposed = false;
+
+  /// Last timestamp processed per link. A driver may re-report its latest
+  /// reading on every poll (the sweeping SDR does); feeding that replay
+  /// to the tripwire would let ONE reading satisfy "N confirming polls"
+  /// and would stuff the baseline with duplicates.
+  final Map<String, DateTime> _lastSampleTs = {};
+
+  @override
+  void notifyListeners() {
+    if (_disposed) return;
+    super.notifyListeners();
   }
 
   /// Embedded disturbance classifier (tiny trained net). Null until the
@@ -284,6 +306,18 @@ class AppState extends ChangeNotifier {
 
   void start() {
     stop();
+    if (!settings.simulatedMode && !_radiosLoaded) {
+      _startPending = true;
+      connectionLabel = 'Loading saved radios…';
+      notifyListeners();
+      _radiosReady.then((_) {
+        if (_startPending && !_disposed) {
+          _startPending = false;
+          start();
+        }
+      });
+      return;
+    }
     // START always begins a fresh session: new baselines, new link set.
     // (Establish the baseline with the area clear: whatever is standing
     // in a link when its baseline is learned is invisible until it moves.)
@@ -292,6 +326,7 @@ class AppState extends ChangeNotifier {
     history.clear();
     _tripwire = Tripwire(config: settings.tripwireConfig);
     _latestByPoller.clear();
+    _lastSampleTs.clear();
     _lastFuse = null;
     _startedAt = DateTime.now();
     _lastCoverage = null;
@@ -387,6 +422,7 @@ class AppState extends ChangeNotifier {
   }
 
   void stop() {
+    _startPending = false;
     for (final p in _pollers) {
       p.timer?.cancel();
       try {
@@ -409,14 +445,25 @@ class AppState extends ChangeNotifier {
     p.busy = true;
     try {
       final raw = await p.driver.poll();
+      // The poller may have been stopped or replaced (settings change,
+      // restart) while this poll was in flight. Its samples belong to a
+      // session that no longer exists; don't let them into the new one.
+      if (!polling || !_pollers.contains(p)) return;
       p.status.lastPoll = DateTime.now();
       p.status.linkCount = raw.length;
-      p.status.error = raw.isEmpty
-          ? 'Radio reachable but reports no RF links (radios unmeshed?)'
-          : null;
+      p.status.error = raw.isEmpty ? p.driver.emptyHint : null;
 
       final enrichedAll = <LinkSample>[];
       for (final r in raw) {
+        final prevTs = _lastSampleTs[r.linkKey];
+        if (prevTs != null && r.timestamp.isAtSameMomentAs(prevTs)) {
+          // Replay of a reading already processed: keep it as current
+          // evidence but don't run it through the tripwire again.
+          final hist = history[r.linkKey];
+          if (hist != null && hist.isNotEmpty) enrichedAll.add(hist.last);
+          continue;
+        }
+        _lastSampleTs[r.linkKey] = r.timestamp;
         final enriched = _tripwire.process(r);
         enrichedAll.add(enriched);
         final h = history.putIfAbsent(enriched.linkKey, () => []);
@@ -440,6 +487,7 @@ class AppState extends ChangeNotifier {
       _refreshConnectionLabel();
       error = null;
     } catch (e) {
+      if (!_pollers.contains(p)) return;
       p.status.error = 'Poll error: $e';
       // A failed radio must not keep feeding its last batch into the
       // fusion: drop it and re-solve without it.
@@ -537,12 +585,15 @@ class AppState extends ChangeNotifier {
   static const _minFuseGap = Duration(milliseconds: 100);
 
   /// How long a sample from [driverId] stays valid: four poll intervals
-  /// of that driver's slowest radio, but never under 2 s.
+  /// of that driver's slowest radio, but never under 2 s (or whatever the
+  /// driver itself declares via [RadioDriver.sampleMaxAge]).
   Duration _staleAfter(String driverId) {
     var secs = 2.0;
     for (final p in _pollers) {
       if (p.config.driverId == driverId) {
         secs = math.max(secs, p.config.pollInterval * 4);
+        final m = p.driver.sampleMaxAge;
+        if (m != null) secs = math.max(secs, m.inMilliseconds / 1000.0);
       }
     }
     return Duration(milliseconds: (secs * 1000).round());
@@ -568,6 +619,10 @@ class AppState extends ChangeNotifier {
   CrossingEvent _classifyEvent(CrossingEvent e, double pollInterval) {
     final clf = _classifier;
     if (clf == null) return e;
+    // The model was trained on mesh-link dips. A spectrum band's energy
+    // rise is a different physical thing; a PASSING/LINGERING label on
+    // it would be a confident-looking guess about the wrong signal.
+    if (driverOf(e.linkKey) == 'sdr') return e;
     try {
       final h = history[e.linkKey];
       if (h == null || h.length < 4) return e;
@@ -578,8 +633,8 @@ class AppState extends ChangeNotifier {
       final now = DateTime.now();
       final activeDrivers = <String>{};
       var simulLinks = 0;
-      history.forEach((_, samples) {
-        if (samples.isEmpty) return;
+      history.forEach((key, samples) {
+        if (samples.isEmpty || driverOf(key) == 'sdr') return;
         final last = samples.last;
         if (last.isDisturbed(settings.dipThreshold) &&
             now.difference(last.timestamp).inSeconds < 5) {
@@ -593,9 +648,10 @@ class AppState extends ChangeNotifier {
         durationSecs: e.durationSecs,
         simulLinks: simulLinks,
         crossDriver: activeDrivers.length > 1,
-        meshLinks: history.length,
+        meshLinks: history.keys.where((k) => driverOf(k) != 'sdr').length,
       );
       final (label, conf) = clf.classify(features);
+      if (conf <= 0) return e; // model had no answer: attach no label
       return e.copyWith(aiLabel: label, aiConfidence: conf);
     } catch (_) {
       return e;
@@ -615,7 +671,10 @@ class AppState extends ChangeNotifier {
       radioConfigs
         ..clear()
         ..addAll(list.map(RadioConfig.fromJson));
-    } catch (_) {}
+    } catch (_) {
+    } finally {
+      _radiosLoaded = true;
+    }
   }
 
   Future<void> _saveRadios() async {
@@ -664,6 +723,9 @@ class AppState extends ChangeNotifier {
     var changed = false;
     for (final s in samples) {
       for (final id in [s.fromNode, s.toNode]) {
+        // Spectrum "nodes" (sdr:rtlsdr0 / sdr:band-433) are not places in
+        // the field; they must not appear on the map or in the layout.
+        if (driverOf(id) == 'sdr') continue;
         if (!nodePositions.containsKey(id)) {
           final i = nodePositions.length;
           final r = 25.0 + 6.0 * i;
@@ -905,9 +967,17 @@ class AppState extends ChangeNotifier {
 
   @override
   void dispose() {
+    _disposed = true;
+    _watchdog?.cancel();
+    _watchdog = null;
     for (final p in _pollers) {
       p.timer?.cancel();
+      try {
+        p.driver.dispose();
+      } catch (_) {}
     }
+    _pollers.clear();
+    wifi.stop();
     super.dispose();
   }
 }

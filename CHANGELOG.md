@@ -1,0 +1,125 @@
+# Changelog
+
+## 0.14.5 — review pass
+
+Bug fixes and hardening from a full read-through. Dart changes were made
+without a Dart toolchain available: run `flutter analyze` and
+`flutter test` before shipping. The Python bridge changes ARE tested
+(`python field_kit/sdr_bridge/test_sdr_bridge.py`, 7 tests, passing).
+The ESP32 firmware was not compiled or flashed.
+
+### Detection correctness (highest impact)
+
+- **Replayed SDR readings defeated "confirm polls".** The SDR driver
+  re-reports each band's latest reading on every 0.25 s poll, so a single
+  noisy reading was seen 2+ times and satisfied `confirmPolls` on its own,
+  and duplicates flooded the baseline. `AppState` now skips readings whose
+  timestamp it has already processed (`_lastSampleTs`).
+- **SDR links were judged "stale" after 2 s**, though a sweep revisits each
+  band every few seconds. That made health flap to DEGRADED and hid band
+  links from the banner. Drivers can now declare `sampleMaxAge`; the SDR
+  driver uses its 15 s retention.
+- **A failed SDR capture was reported as a real -120 dBFS reading**,
+  poisoning the baseline and producing a phantom emitter on the next good
+  read. The bridge now drops failed/short/non-finite captures. The Dart
+  parser also rejects NaN/Infinity.
+- **Pluto scaling was data-dependent** (`peak > 1.5` → divide by 32768),
+  which could jump ~55 dB between quiet and loud captures. Now a fixed
+  12-bit scale.
+- **Windows Wi-Fi survey parsed every SSID as "(hidden)".** `netsh` emits
+  CRLF and Dart's `(.*)$` can't match across the trailing `\r`, so rogue-AP
+  detection never ran on Windows. Lines are now split on `\r?\n`.
+- **Wi-Fi APs stayed "disturbed" forever.** `disturbedBssids` was never
+  cleared (only on `stop()`), and an AP that vanished while flagged kept
+  the DETECTED state stuck. Both fixed.
+- **Tracker invented positions from a single link.** With < 3 positioned
+  nodes it now returns no fix (the UI says why) instead of an arbitrary
+  point on the link, matching the README's "two nodes cannot triangulate".
+
+### SDR bridge
+
+- `--simulate` never tripped the energy tripwire (the scripted emitter was a
+  DC tone: +28 dB changed the median by 0.2 dB). The 2.4 GHz burst is now
+  wideband; the 915 MHz burst is deliberately narrowband to show the
+  median-vs-peak distinction.
+- `bw_mhz` was ignored: every band measured the whole 4 MHz capture. Now
+  the requested band (clipped to the central 80% of the sample rate) is
+  measured and `span_mhz` reports what was actually covered.
+- Sub-bands were not in frequency order (unshifted FFT). Now low→high.
+- `--dwell N` captured N times but reported only the last. Now averaged.
+- Welch-averaged PSD (lower variance → fewer false alerts); DC spike masked.
+- New optional packet fields: `peak_mhz`, `peak_dbfs`, `span_mhz`
+  (protocol stays `v:1`; old apps ignore them). Beacon every 3 s (was 10)
+  and carries a `dropped` counter.
+- UDP send errors no longer kill the bridge; bad `--bands` input gives a
+  clear message.
+
+### App / state
+
+- SDR pseudo-nodes (`sdr:rtlsdr0`, `sdr:band-433`) were auto-placed into the
+  map layout and persisted. They are now excluded.
+- SDR events were given mesh-trained AI labels (PASSING/LINGERING…) and
+  counted in `simulLinks` / `meshLinks`. Both excluded.
+- In-flight polls from a stopped/replaced session could write into the new
+  session's history. Guarded.
+- Quick START on a cold launch could overwrite saved radios with the legacy
+  single-radio default (saved list still loading). START now waits.
+- `SdrDriver` bind used `InternetAddress(host)` (IP literals only); falls
+  back to all interfaces for hostnames. `probe()` waited 2 s for a beacon
+  that came every 10 s, so a healthy bridge usually "failed" — now accepts
+  any bridge packet within 5 s.
+- Silvus polling opened a new TCP connection 4×/s; now one keep-alive
+  client, closed on dispose. Duplicate link directions in one snapshot are
+  de-duplicated (they would also satisfy `confirmPolls` alone).
+- `RadioConfig.fromJson`: explicit `double` for `pollInterval`.
+- Discovery: error text said /16 but anything below /20 was rejected.
+- Classifier: NaN features no longer yield a fake label at -100%.
+- Wi-Fi threats: the first observation no longer counts as a "flap";
+  sighting counts no longer double-increment.
+- `AppState.dispose` now cancels the watchdog, drivers, and Wi-Fi sensing.
+
+### Capability
+
+- Tracker velocity is a least-squares fit over the last 12 s of fixes (was
+  a two-point difference), so speed/heading are much less jumpy.
+- Tracker/shadow grid cost is capped (~20k / ~6k cells) so large meshes
+  can't stall the UI thread; refinement window scales with the coarse step.
+- SDR driver exposes `latestBands` (incl. `peak_mhz`) for UI panels, and a
+  driver-specific "no data" hint on the radio card.
+- New tests: `test/tripwire_test.dart`, `test/tracker_test.dart`, extra
+  cases in `test/sdr_bridge_test.dart`, `field_kit/sdr_bridge/test_sdr_bridge.py`.
+
+### ESP32 firmware (uncompiled — please build and bench-test)
+
+- **CC1101 was never detected**: VERSION was read with the wrong address and
+  without the burst bit (that address range is command strobes, including
+  SRES). Fixed; also accepts version 0x04.
+- **nRF24 RPD could never report energy**: CE was never driven. New
+  `NRF_CE` (GPIO22) is held high — see wiring note in `field_kit/README.md`.
+- CC1101 polarity was inverted vs nRF24 (fired when a signal *vanished*).
+- Events could stay open forever after a lasting level change; now
+  force-closed after 120 s and the baseline relearned.
+- Event `t0` was the close time; now the start time.
+- UART-supplied sensor names/details are sanitized before going into JSON.
+- Frame counters are updated under a spinlock.
+
+### Repo hygiene
+
+- Removed `android/local.properties` (a developer's machine path) and
+  `__pycache__/*.pyc` from the archive.
+
+### Known issues NOT fixed (need hardware or a design decision)
+
+- `README`/`CONTRIBUTING` reference `test/ai_golden.json` and
+  `test/stitcher_golden.json`; neither is in the archive, so the numerical
+  check of the Dart inference kernel against the Python trainer is absent.
+- Rogue-AP auto-trust: the AP you connect to is trusted automatically, so
+  an evil twin you *joined* is trusted. Needs a UX decision (e.g. confirm
+  before first trust).
+- Wi-Fi per-AP baseline still lets a lingering disturbance "heal" (the
+  Silvus tripwire holds its baseline; the Wi-Fi one doesn't).
+- ESP32 CSI only fires on received frames; with no station associated to
+  the node's AP the Wi-Fi channel sees nothing.
+- The Android package id is still the `com.example.rf_sentry` placeholder.
+- The tracker still assumes a single target and a fixed Gaussian falloff
+  (`sigma = 11 m`).
