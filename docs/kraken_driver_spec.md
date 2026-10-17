@@ -45,6 +45,44 @@ by a third party, 2026-07):**
 - Prefer this transport when port 8021 accepts a connection; fall back
   to the :8081 CSV poll otherwise.
 
+**KrakenSDR Suite V2 (public beta; C++ rewrite — `heimdall_v2`
+server + `kraken_doa_v2` client, repo `krakenrf/krakensdr_suite`) —
+VERIFIED against source 2026-10-06; both transports survive:**
+- Local WebSocket broadcast, default port **8021**, streams one legacy
+  `doapost` record per VFO — **but it is OPT-IN in V2**: enable it in
+  the client web UI's "🌐 Web Mapper" panel → Local Network WS
+  broadcast (port configurable, default 8021). By design it is
+  token-free for LAN readers (host allow-list checked, no Origin
+  check). The old Node.js `web_mapper_middleware/` is deprecated and
+  no longer needed — Shepherd reads the WS directly.
+- `doapost` record schema is **byte-compatible with the V1 / Android
+  app / map.krakenrf.com contract** (verified against
+  `build_doapost_json` in `web_mapper.cpp`): `station_id`, `tStamp`
+  (wall-clock ms at record build — NOT a DSP measurement timestamp),
+  `gps_timestamp`, `latitude`/`longitude` (strings), `gpsBearing`,
+  `speed`, `radioBearing` (integer 0–359, string — "the integer
+  compass bearing, exactly as DOA_value.html serves it"), `conf`
+  (2 dp), `power` / `snr_db` (1 dp dB, strings), `freq` (Hz, number),
+  `antType`, `doaArray` (comma-separated spectrum), `num_corr_sources`;
+  `latency`/`processing_time`/`adc_overdrive` are 0.
+- `:8081/DOA_value.html` **still exists** (plain HTTP, token-free, no
+  CORS header) — the CSV fallback path works on V2 unchanged.
+- Squelch: off = records always stream; on = only while the VFO's
+  squelch is open (per VFO).
+- Port changes to know: client web UI moved to **:8080** (HTTPS+WS);
+  heimdall server web UI on **:8070**. Connect by **IP literal**
+  (passes the host allow-list).
+- Driver consequences: keep the same auto-detect order (ws :8021
+  first, CSV :8081 fallback). If :8021 refuses on a V2 install,
+  surface a settings hint — *"on V2, enable 🌐 Web Mapper → Local
+  Network WS broadcast in the Kraken web UI"* — before falling back.
+  Freshness on the WS path must be measured by **arrival cadence**
+  (no record in N s = stale/squelch closed), since `tStamp` is
+  record-build wall time, not a DSP clock.
+- Bench test and driver validation stay on the **stable V1 generation**
+  (the two transports above) until V2 leaves beta. The 360−θ /
+  true-vs-relative bearing bench gate stands on both generations.
+
 Station position/heading comes from the Kraken UI (static lat/lon/array
 heading) or a gpsd USB GPS — the driver reads the configured values, it
 does not do its own GPS.

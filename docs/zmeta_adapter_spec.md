@@ -1,7 +1,9 @@
 # Shepherd → ZMeta adapter spec
 
 Emit-only bridge from Shepherd's detection pipeline to a
-[ZMeta](https://github.com/JTC-byte/zmeta-spec) gateway (v1.0 lane),
+[ZMeta](https://github.com/JTC-byte/zmeta-spec) gateway (v1.1 lane —
+declared-2D geo and `PLATFORM_STATUS` require v1.1; the v1.0 schema
+rejects both),
 so ZMeta can see Shepherd detection data and fuse across multiple
 Shepherd mesh networks. One Shepherd instance = one ZMeta `platform_id`;
 the gateway correlates and fuses across meshes.
@@ -21,7 +23,7 @@ into downstream fusion — the same shape as Shepherd's outputs.
 |---|---|---|
 | Tripwire `CrossingEvent` | `OBSERVATION_EVENT` / `RF` | One per confirmed crossing |
 | Embedded classifier label | `INFERENCE_EVENT` / `CLASSIFICATION` | Genuine `based_on` lineage to its observation |
-| Radio health transitions | `SYSTEM_EVENT` / `LINK_STATUS` | Planned (v1.1) |
+| Mesh heartbeat (opt-in) | `SYSTEM_EVENT` / `PLATFORM_STATUS` | "Alive, here is the platform" for teams on the move; default off |
 
 Fused tracks are deliberately NOT emitted as `FUSION_EVENT` in v1:
 cross-mesh fusion is the gateway's job, and Shepherd's internal tracks
@@ -69,6 +71,36 @@ are its own estimate. The gateway builds tracks from observations.
 - `confidence` is never present on observations (contract 7.1).
 - Original observations carry no `lineage` block (no ZMeta parent exists).
 
+### Geo (declared 2-D — the honest altitude story)
+
+- `payload.geo` is present only when the detector position is genuinely
+  known, and it is declared `"2D"` (`{lat, lon, dimensionality: "2D"}`,
+  no `alt_m`) per semantics-contract 21.8. Omitted — never zero-filled
+  — otherwise (6.8).
+- **Why 2-D:** ZMeta 6.2 requires `alt_m` to be Height Above Ellipsoid
+  and forbids MSL/pressure/local altitudes in canonical geo ("convert
+  or omit"). The device-reported altitude is platform-dependent —
+  Android documents WGS-84 ellipsoid, iOS documents MSL — and is never
+  verified HAE, so it is **excluded** from canonical geo and carried
+  explicitly in `features.shepherd_sensor_alt_m` instead. Substituting
+  a non-HAE altitude into `alt_m` was rejected on the ZMeta record
+  (doctrine A1-02); a 2-D position is the honest complete statement of
+  what the sensor measured.
+- **This is the SENSOR (platform) position, never the target's** —
+  stated in `quality.shepherd_geo_note`. Source hierarchy
+  (`AppState.bestKnownGeoFor`): (1) midpoint of the two link endpoints
+  when both are mesh nodes with surveyed GPS positions (static, trusted
+  until re-captured); (2) the phone's last GPS fix, if younger than 10
+  minutes (a moving team outruns a stale fix); else omitted.
+- `quality.geo_status`: `VERTICAL_UNAVAILABLE` with 2-D geo (21.1:
+  a 2-D geo must not claim `AVAILABLE`), `UNAVAILABLE` when omitted.
+  `quality.shepherd_geo_source` = `node-midpoint` | `phone-gps` |
+  `node-centroid`; accuracy and age ride in
+  `quality.shepherd_geo_accuracy_m` / `shepherd_geo_age_s` when known.
+- Node positions themselves carry no altitude (operator-surveyed
+  lat/lon); the phone fix's altitude is what populates
+  `features.shepherd_sensor_alt_m`.
+
 ## Inference mapping
 
 - `event_subtype`: `CLASSIFICATION`. `node_role`: `GATEWAY` (the roles
@@ -114,19 +146,54 @@ and `field_kit/zmeta_secure/` for the full package.
   platform IDs) is OPSEC-relevant — it never travels outside the
   tunnel.
 
+## Heartbeat (opt-in)
+
+- `SYSTEM_EVENT` / `PLATFORM_STATUS` (v1.1, semantics-contract 21.6):
+  platform health and operating state. The platform's own position is
+  operating state — no target track is implied.
+- Settings → ZMeta export → "mesh heartbeat", default OFF, cadence
+  15–600 s (default 60). Same fail-closed gate as detections
+  (non-local + unsecured = no emit) and never during replay.
+- `payload.state`: `NOMINAL` while running. `payload.metrics` carries
+  `power_state: 'UNKNOWN'` (schema requires a power field; the app does
+  not measure device power, and `UNKNOWN` is the honest enum value),
+  `platform_type: 'GROUND'` (dismounted team), node/detection counts,
+  heartbeat interval, and the platform position (2-D + source/age,
+  same honesty rules as observations) when freshly known.
+- Policy-clean: `rf-sensor-*` producers may emit `SYSTEM_EVENT`
+  (producer-authority.yaml) and `EDGE` may emit it (roles.yaml).
+
+## Sensor observations (universal ingestion)
+
+- `zmetaSensorObservation()` wraps `SensorObservation.toZMetaPayload()`
+  in the standard envelope (same UUIDv7/ts/source/profile, fail-closed
+  gate, never during replay). Producer `eo-sensor-shepherd` matches the
+  governed EO producer pattern (producer-authority.yaml).
+- **Only MOTION exports (EO).** BEARING/SPECTRUM stay local: the 1.1.0
+  ACOUSTIC arm requires `center_freq_hz` plus a level (`spl_db`, or
+  `pressure_pa` + `pressure_statistic`), and our acoustic reports are
+  directions/uncalibrated bins — fabricating a level would be exactly
+  the lie the schema guards against. RANGE/BINARY/ENERGY have no
+  honest modality at all. All five types still feed the in-app map
+  overlay and upgrade-only corroboration.
+- The EO arm bans `class_name`/`confidence`/`classification`/`label`
+  in features — all avoided (`zone_label`). `snapshot_ref` is a
+  local-only reference; frames never leave the device.
+
 ## Validation
 
-- `test/zmeta_adapter_test.dart`: 14 unit tests (UUIDv7 shape, `Z`
+- `test/zmeta_adapter_test.dart`: 23 unit tests (UUIDv7 shape, `Z`
   timestamps, no confidence on observations, sentinel flagging, timing
-  completeness, inference lineage/clamping) plus a sample-JSONL export.
-- The sample events pass ZMeta's own `tools/validate.py --profile H
-  --strict` with 0 failures (validated against zmeta-spec v1.1.26,
-  1.0 lane).
+  completeness, inference lineage/clamping, 2-D geo rules, heartbeat
+  shape, sensor-observation modality honesty) plus a sample-JSONL export.
+- The sample events (2-D geo observation, no-geo observation,
+  inference, heartbeat, EO camera-motion) pass ZMeta's own
+  `tools/validate.py --profile H --strict` with 0 failures, 0 warnings
+  (validated against zmeta-spec v1.1.26, 1.1.0 lane).
 - `flutter analyze`: clean.
 
 ## Future
 
 - `SYSTEM_EVENT` / `LINK_STATUS` on radio health transitions.
-- `shepherd_sig_hint` from the SDR bridge's FHSS signature detector.
 - Surveyed KrakenSDR array heading → canonical `bearing.az_deg`.
 - ZMeta Profile M/L thinning notes for constrained links.

@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shepherd/models/sensor_observation.dart';
 import 'package:shepherd/services/zmeta_adapter.dart';
 
 final _t0 = DateTime.utc(2026, 10, 16, 22, 30, 0);
@@ -44,7 +45,7 @@ void main() {
   group('observation', () {
     test('envelope shape', () {
       final e = _obs();
-      expect(e['zmeta_version'], '1.0');
+      expect(e['zmeta_version'], '1.1.0');
       final ev = e['event'] as Map;
       expect(ev['event_type'], 'OBSERVATION_EVENT');
       expect(ev['event_subtype'], 'RF');
@@ -199,6 +200,176 @@ void main() {
       final out = File('/tmp/zmeta_shepherd_sample.jsonl');
       out.writeAsStringSync('${[obs, inf, sdrObs].map(jsonEncode).join('\n')}\n');
       expect(out.existsSync(), isTrue);
+    });
+  });
+
+  group('sensor geo (ZMeta 21.8 declared-2D)', () {
+    Map<String, dynamic> obsGeo() => zmetaObservation(
+          platformId: 'shepherd-mesh-1',
+          sensorId: 'silvus:node90550->node90551',
+          ts: _t0,
+          linkKey: 'silvus:node90550 → silvus:node90551',
+          driverId: 'silvus',
+          dipDepthDb: 14.2,
+          direction: 'dip',
+          durationSecs: 3.5,
+          sizeEstimate: 'M',
+          freqHz: 2440000000,
+          bwHz: 10000000,
+          sensorGeo: const ZmetaSensorGeo(
+            lat: 35.1391,
+            lon: -79.0063,
+            altM: 87.5,
+            source: 'node-midpoint',
+            accuracyM: 4.0,
+            ageSec: 12,
+          ),
+        );
+
+    test('2-D canonical geo, no alt_m', () {
+      final e = obsGeo();
+      final payload = e['payload'] as Map;
+      final geo = payload['geo'] as Map;
+      expect(geo['lat'], 35.1391);
+      expect(geo['lon'], -79.0063);
+      expect(geo['dimensionality'], '2D');
+      expect(geo.containsKey('alt_m'), isFalse,
+          reason: '2-D geo must prohibit alt_m (21.8)');
+    });
+
+    test('device altitude rides in features, flagged in quality', () {
+      final e = obsGeo();
+      final payload = e['payload'] as Map;
+      final features = payload['features'] as Map;
+      expect(features['shepherd_sensor_alt_m'], 87.5);
+      final quality = payload['quality'] as Map;
+      expect(quality['geo_status'], 'VERTICAL_UNAVAILABLE');
+      expect(quality['shepherd_geo_source'], 'node-midpoint');
+      expect(quality['shepherd_geo_accuracy_m'], 4.0);
+      expect(quality['shepherd_geo_age_s'], 12);
+      final note = quality['shepherd_geo_note'] as String;
+      expect(note.contains('not target'), isTrue);
+    });
+
+    test('null geo omits geo, keeps UNAVAILABLE', () {
+      final e = _obs(); // no sensorGeo
+      final payload = e['payload'] as Map;
+      expect(payload.containsKey('geo'), isFalse);
+      expect((payload['quality'] as Map)['geo_status'], 'UNAVAILABLE');
+      expect(
+          (payload['features'] as Map).containsKey('shepherd_sensor_alt_m'),
+          isFalse);
+    });
+  });
+
+  group('platform heartbeat (SYSTEM_EVENT / PLATFORM_STATUS)', () {
+    Map<String, dynamic> hb() => zmetaPlatformStatus(
+          platformId: 'shepherd-mesh-1',
+          ts: _t0,
+          state: 'NOMINAL',
+          nodeCount: 4,
+          detectionCount: 17,
+          heartbeatIntervalSec: 60,
+          sensorGeo: const ZmetaSensorGeo(
+            lat: 35.1391,
+            lon: -79.0063,
+            source: 'phone-gps',
+            ageSec: 30,
+          ),
+        );
+
+    test('envelope + subtype match', () {
+      final e = hb();
+      expect(e['zmeta_version'], '1.1.0');
+      final ev = e['event'] as Map;
+      expect(ev['event_type'], 'SYSTEM_EVENT');
+      expect(ev['event_subtype'], 'PLATFORM_STATUS');
+      final src = e['source'] as Map;
+      expect(src['node_role'], 'EDGE');
+      expect(src['producer'], 'rf-sensor-shepherd');
+      final payload = e['payload'] as Map;
+      expect(payload['system_type'], 'PLATFORM_STATUS');
+      expect(payload['state'], 'NOMINAL');
+    });
+
+    test('metrics carry platform position honestly', () {
+      final e = hb();
+      final metrics = (e['payload'] as Map)['metrics'] as Map;
+      expect(metrics['shepherd_node_count'], 4);
+      expect(metrics['shepherd_detection_count'], 17);
+      expect(metrics['shepherd_heartbeat_interval_s'], 60);
+      final pos = metrics['position'] as Map;
+      expect(pos['lat'], 35.1391);
+      expect(pos['dimensionality'], '2D');
+      expect(pos.containsKey('alt_m'), isFalse);
+      expect((metrics['position_note'] as String).contains('not a target'),
+          isTrue);
+    });
+
+    test('heartbeat without position is state-only', () {
+      final e = zmetaPlatformStatus(
+        platformId: 'shepherd-mesh-1',
+        ts: _t0,
+        state: 'NOMINAL',
+        nodeCount: 2,
+        detectionCount: 0,
+        heartbeatIntervalSec: 60,
+      );
+      final metrics = (e['payload'] as Map)['metrics'] as Map;
+      expect(metrics.containsKey('position'), isFalse);
+    });
+  });
+
+  group('sensor observations', () {
+    test('bearing/spectrum stay local — no honest ACOUSTIC fit (level required)', () {
+      final bearing = SensorObservation(
+        type: SensorObsType.bearing,
+        sensorId: 'micarray-1',
+        timestamp: _t0,
+        bearingDeg: 137.0,
+        confidence: 0.8,
+      );
+      expect(
+          zmetaSensorObservation(
+              platformId: 'shepherd-mesh-1', obs: bearing),
+          isNull);
+      final spectrum = SensorObservation(
+        type: SensorObsType.spectrum,
+        sensorId: 'mic-1',
+        timestamp: _t0,
+        freqHz: const [120.0, 240.0],
+        magnitudes: const [0.2, 0.9],
+      );
+      expect(
+          zmetaSensorObservation(
+              platformId: 'shepherd-mesh-1', obs: spectrum),
+          isNull);
+    });
+
+    test('RANGE has no honest modality — stays local (null)', () {
+      final obs = SensorObservation(
+        type: SensorObsType.range,
+        sensorId: 'lidar-1',
+        timestamp: _t0,
+        distanceM: 12.4,
+      );
+      expect(
+          zmetaSensorObservation(
+              platformId: 'shepherd-mesh-1', obs: obs),
+          isNull);
+    });
+
+    test('camera motion wraps to OBSERVATION_EVENT/EO', () {
+      final obs = SensorObservation(
+        type: SensorObsType.motion,
+        sensorId: 'cam-1',
+        timestamp: _t0,
+        zone: '3',
+      );
+      final e = zmetaSensorObservation(
+          platformId: 'shepherd-mesh-1', obs: obs)!;
+      expect((e['payload'] as Map)['modality'], 'EO');
+      expect((e['event'] as Map)['event_subtype'], 'EO');
     });
   });
 }

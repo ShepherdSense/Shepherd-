@@ -115,19 +115,20 @@ void main() {
       SharedPreferences.setMockInitialValues({});
     });
 
-    test('stub: default off, always NOT_CONFIGURED', () {
+    test('default off → NOT_CONFIGURED; enabled with no motion → NO_MOTION (never a veto)', () {
       final s = AppState();
       addTearDown(s.dispose);
       expect(s.cameraConfirmationEnabled, isFalse);
       final r = s.requestCameraConfirmation(_ev('a → b', 1));
       expect(r.status, 'NOT_CONFIGURED');
       expect(r.note, isNotEmpty);
-      // Even enabled, the stub cannot confirm — upgrade-only contract.
+      // Enabled but no motion seen: informational NO_MOTION — the RF
+      // detection stands on its own. Upgrade-only contract holds.
       s.toggleCameraConfirmation(true);
       expect(s.cameraConfirmationEnabled, isTrue);
-      expect(
-          s.requestCameraConfirmation(_ev('a → b', 1)).status,
-          'NOT_CONFIGURED');
+      final r2 = s.requestCameraConfirmation(_ev('a → b', 1));
+      expect(r2.status, 'NO_MOTION');
+      expect(r2.note, contains('stands on RF evidence'));
     });
   });
 

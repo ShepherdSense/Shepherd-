@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.15.1 — bug fixes, LoRa nodes, universal sensors, callsigns
+
+Everything the v0.15.0 adversarial review found (HIGH through LOW),
+fixed and re-verified — plus the three builds that landed after the
+review: LoRa node support, universal sensor ingestion, and node
+callsigns. All validated: `flutter analyze` clean, 100/100 Dart
+tests, 22/22 SDR bridge tests, firmware compiles in all 5 flag
+configs (50-51% flash / 19-20% RAM), ZMeta samples pass
+`validate.py --profile H --strict` (0 warnings).
+
+### Bug fixes (v0.15.0 review, HIGH → LOW)
+
+- **Replay:** timestamps re-based on replay (DETECTED banner and health
+  work in replay); replays never emit to ZMeta, never sound alerts,
+  never contaminate recordings.
+- **ESP-NOW relay:** callback restructured (no WiFi-task crash risk);
+  250-byte ceiling enforced with a drop counter.
+- **LD2450:** corrected 24-byte frame parse + runtime sync-failure
+  warning.
+- **Variance channel** gated on baseline trust; **ZMeta "link secured"**
+  now fail-closed (unsecured non-local export refused, not just
+  warned); security warning recomputes while typing.
+- **GPS/PPS:** NMEA UTC epoch where available, wrap-safe clocks, real
+  lock detection (3 consecutive ~1 s edges), stale coordinates zeroed
+  on fix loss.
+- Recorder failure handling, UUIDv7 monotonicity, replay watchdog,
+  Windows-path basename, and ~15 more LOW findings.
+
+### ZMeta: coordinates + heartbeat
+
+- Per-observation **declared-2D geo** (21.8): the SENSOR position,
+  never zero-filled, never fake HAE — device altitude rides in
+  `features.shepherd_sensor_alt_m` as labeled metadata. Required the
+  v1.1 lane (`kZmetaVersion` 1.0 → 1.1.0).
+- Opt-in **PLATFORM_STATUS heartbeat** (default off, 15–600 s,
+  fail-closed, never during replay). PEERS.md gains position columns.
+
+### LoRa nodes (two ways in)
+
+- **Meshtastic driver** (TCP 4403, auto-reconnect, GPS→map,
+  discovery probe) and **custom SX1276 backhaul** (22-byte binary
+  codec, US915/EU868/AS433, ~0.19% duty, star topology) with
+  plug-and-play flashers and pre-compiled bins.
+
+### Universal sensor ingestion
+
+- **Shepherd Sensor Protocol**: typed messages (RANGE/BEARING/
+  SPECTRUM/BINARY/PIR/ENERGY/MOTION) over UART + UDP 49160; generic
+  driver with bounded store; map overlay (range arcs, bearing wedges,
+  motion markers); upgrade-only corroboration — sensors can only ever
+  raise confidence, never veto the RF tripwire.
+- **Cameras**: motion-webhook receiver + ONVIF events, snapshot pull
+  for the evidence view, wired into the camera-confirmation contract
+  (CORROBORATED / NO_MOTION / NOT_CONFIGURED).
+- ZMeta export: only MOTION→EO (validated); acoustic stays local —
+  the 1.1.0 ACOUSTIC arm requires a level we don't measure, and
+  fabricating one would be exactly the lie the schema guards against.
+
+### Node callsigns
+
+- Operator-set callsigns in the app (tracking screen, validated,
+  persisted) or broadcast by the ESP32 in its beacon (set from the
+  status page). App-set wins; hardware ID is the fallback. Shown over
+  every node type on the map.
+
 ## 0.15.0 — capabilities build ("do it all")
 
 New sensing, fusion, and operator-interface capabilities from the

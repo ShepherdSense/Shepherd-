@@ -28,7 +28,8 @@ Built by **Draco**.
 | Silvus StreamCaster mesh (any node count) | **Live** | One radio's telemetry carries the whole mesh view; tripwire, tracker, and map all scale per-link |
 | L3Harris AN/PRC-163 | **In progress** | SNMP discovery probe in `tools/`; driver follows what the radio exposes |
 | MPU5 / Wave Relay | **Planned** | Driver stub in the multi-driver framework |
-| Meshtastic nodes | **Planned** | Cheap GPS/PIR field nodes; driver wakes when hardware is on hand |
+| Meshtastic nodes | **Live** | TCP 4403 client API; GPS auto-placement, coarse link health, LAN auto-detect; USB serial via TCP bridge |
+| ESP32 nodes (WiFi / LoRa backhaul) | **Live** | Passive UDP 49160 listener; WiFi-direct nodes and SX1276 LoRa-gateway re-emits, zero config |
 | This device's Wi-Fi + BLE | **Live** | Windows via `netsh`; passive scan only |
 | ZMeta gateway | **Live** | Emit-only event export (Settings → ZMeta export); gateway fuses across meshes; link secured via WireGuard |
 
