@@ -302,8 +302,9 @@ class SdrBand {
 }
 
 /// SDR spectrum-sensor driver: listens for the PC-side bridge
-/// (`field_kit/sdr_bridge/sdr_bridge.py`, driving an ADALM-Pluto or
-/// Ettus USRP B200/B210 — RX only, never transmits) on UDP.
+/// (`field_kit/sdr_bridge/sdr_bridge.py` — any supported SDR: RTL-SDR,
+/// ADALM-Pluto, USRP B200/B210, HackRF/Airspy/LimeSDR via SoapySDR;
+/// RX only, never transmits) on UDP.
 ///
 /// Each watched band becomes a virtual tripwire link, so the whole
 /// downstream pipeline (adaptive thresholds, baseline hold, alerts,
@@ -343,7 +344,6 @@ class SdrDriver extends RadioDriver {
   String _bridgeBackend = '';
   final Map<String, SdrBand> _latest = {};
   final Map<String, DateTime> _arrivedAt = {};
-  DateTime _lastPoll = DateTime.fromMillisecondsSinceEpoch(0);
 
   /// What the bridge last announced itself as ('' until first beacon).
   String get bridgeBackend => _bridgeBackend;
@@ -395,16 +395,15 @@ class SdrDriver extends RadioDriver {
   Future<List<LinkSample>> poll() async {
     await _ensureSocket();
     _drain();
-    final now = DateTime.now();
-    final out = <LinkSample>[];
-    for (final e in _latest.entries) {
-      final arrived = _arrivedAt[e.key];
-      if (arrived != null && arrived.isAfter(_lastPoll)) {
-        out.add(e.value.toLinkSample());
-      }
-    }
-    _lastPoll = now;
-    return out;
+    // Report the latest reading per band on EVERY poll, not just fresh
+    // arrivals: a sweep revisits each band every couple of seconds, and
+    // an empty poll reads as "radio broken" downstream. But bands the
+    // bridge hasn't refreshed in a while are dropped, so a dead bridge
+    // reads as no data instead of a frozen last reading.
+    final cutoff = DateTime.now().subtract(const Duration(seconds: 15));
+    _latest.removeWhere((k, _) => (_arrivedAt[k] ?? cutoff).isBefore(cutoff));
+    _arrivedAt.removeWhere((k, _) => !_latest.containsKey(k));
+    return [for (final b in _latest.values) b.toLinkSample()];
   }
 
   @override

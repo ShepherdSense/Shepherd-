@@ -142,6 +142,8 @@ class PlutoBackend(RadioBackend):
     def capture(self, n):
         x = self.sdr.rx()
         x = np.asarray(x, dtype=np.complex64)
+        if x.size == 0:
+            return x  # USB hiccup: let the DSP clamp handle it
         # pyadi-iio returns int16-scale complex; normalize to [-1, 1].
         peak = np.max(np.abs(x))
         if peak > 1.5:  # looks like raw ADC counts

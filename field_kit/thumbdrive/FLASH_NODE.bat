@@ -58,7 +58,8 @@ if errorlevel 1 (
 
 echo.
 echo ============================================================
-echo  DONE. The node will now boot as WiFi AP "Shepherd-SHNX-XXXX".
+echo  DONE. The node will now boot as its own WiFi AP
+echo  "Shepherd-XXXX" (XXXX = last 4 characters of its node ID).
 echo  Join it from the Shepherd device - password: shepherd-field
 echo  Status page: http://192.168.4.1  (change defaults later)
 echo ============================================================

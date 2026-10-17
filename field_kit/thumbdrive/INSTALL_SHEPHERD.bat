@@ -112,7 +112,7 @@ echo     "mdns_service": "_shepherd-node._udp",
 echo     "beacon_interval_s": 5
 echo   },
 echo   "installed_from": "field-kit",
-echo   "installed_version": "%BUNDLED_VER%"
+echo   "installed_version": "!USE_VER!"
 echo }
 ) > "%APP%\shepherd_field_kit.json"
 echo.
