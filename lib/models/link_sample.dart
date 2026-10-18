@@ -30,6 +30,22 @@ class LinkSample {
   /// use deltas, not absolutes.
   final double dip;
 
+  /// Direction-split Δr (first-class, per the RTI imaging spec): RSS
+  /// *decrease* magnitude = max(0, baseline − snr), radio units.
+  /// Always ≥ 0. The dip-side measurement vector p⁻ is built from this,
+  /// never folded into |Δr| first — folding lets a rise and a dip on
+  /// the same pixel cancel or double-count.
+  final double deltaDown;
+
+  /// Direction-split Δr: RSS *increase* magnitude = max(0, snr − baseline),
+  /// radio units. Always ≥ 0. Feeds the rise-side vector p⁺.
+  final double deltaUp;
+
+  /// This link's fade level F_l (baseline median vs network median of
+  /// link medians, radio units; positive = anti-fade, negative =
+  /// deep fade). Estimate; drives the imaging ellipse sizing.
+  final double fadeLevel;
+
   /// Rolling median baseline the dip is measured against. Estimate.
   final double baseline;
 
@@ -53,6 +69,9 @@ class LinkSample {
     this.noiseFrom,
     this.noiseTo,
     this.dip = 0.0,
+    this.deltaDown = 0.0,
+    this.deltaUp = 0.0,
+    this.fadeLevel = 0.0,
     this.baseline = double.nan,
     this.threshold = double.nan,
     this.bearingDeg,
@@ -72,6 +91,9 @@ class LinkSample {
 
   LinkSample copyWith(
           {double? dip,
+          double? deltaDown,
+          double? deltaUp,
+          double? fadeLevel,
           double? baseline,
           double? threshold,
           double? bearingDeg}) =>
@@ -85,6 +107,9 @@ class LinkSample {
         noiseFrom: noiseFrom,
         noiseTo: noiseTo,
         dip: dip ?? this.dip,
+        deltaDown: deltaDown ?? this.deltaDown,
+        deltaUp: deltaUp ?? this.deltaUp,
+        fadeLevel: fadeLevel ?? this.fadeLevel,
         baseline: baseline ?? this.baseline,
         threshold: threshold ?? this.threshold,
         bearingDeg: bearingDeg ?? this.bearingDeg,

@@ -76,6 +76,16 @@ class HealthReport {
 ///   detector now treats the new level as normal, so a person who stayed
 ///   put would silently read as CLEAR. For [persistentChangeWindow] after
 ///   such a reset the system reports DEGRADED instead.
+/// * [suspectLinks]: link keys the ARTI divergence safeguard froze
+///   (|mu − mu_calib| past the 6 dB cap). A runaway estimator is worse
+///   than a stale one — the link degrades honestly instead of silently
+///   feeding bad geometry to the tracker.
+/// * [fadeLevels]: linkKey → fade level F_l (radio units). Persistently
+///   deep-fade links are where misses hide; they degrade the verdict
+///   rather than staying silent.
+/// * [uncalibratedBands]: link keys whose band lacks TX-power
+///   characterization (rti_imaging_weights_spec §3) — the imager must
+///   never silently trust an uncalibrated band.
 HealthReport assessHealth({
   required DateTime now,
   required DateTime startedAt,
@@ -84,6 +94,10 @@ HealthReport assessHealth({
   required Duration Function(String driverId) staleAfter,
   Map<String, DateTime> rebaselines = const {},
   Duration persistentChangeWindow = const Duration(minutes: 10),
+  Set<String> suspectLinks = const {},
+  Map<String, double> fadeLevels = const {},
+  double deepFadeGate = 6.0,
+  Set<String> uncalibratedBands = const {},
 }) {
   final reasons = <String>[];
 
@@ -159,7 +173,49 @@ HealthReport assessHealth({
     reasons.add('+${recent.length - 3} more links reset');
   }
 
-  final degraded = anyDriverBad || missing > 0 || recent.isNotEmpty;
+  // ARTI divergence-suspect links: frozen, not trusted.
+  final liveSuspect = suspectLinks
+      .where((k) => lastByLink.containsKey(k))
+      .toList()
+    ..sort();
+  for (final k in liveSuspect.take(3)) {
+    reasons.add('$k: SUSPECT — baseline drift past the divergence cap, '
+        'reference updates frozen pending recalibration');
+  }
+  if (liveSuspect.length > 3) {
+    reasons.add('+${liveSuspect.length - 3} more suspect links');
+  }
+
+  // Persistently deep-fade links are where misses hide.
+  final deep = [
+    for (final e in fadeLevels.entries)
+      if (e.value < -deepFadeGate && lastByLink.containsKey(e.key)) e.key,
+  ]..sort();
+  for (final k in deep.take(3)) {
+    reasons.add('$k: deep fade — disturbance sensitivity reduced');
+  }
+  if (deep.length > 3) {
+    reasons.add('+${deep.length - 3} more deep-fade links');
+  }
+
+  // Uncalibrated bands: the imager must not silently trust them.
+  final uncal =
+      uncalibratedBands.where((k) => lastByLink.containsKey(k)).toList()
+        ..sort();
+  for (final k in uncal.take(3)) {
+    reasons.add('$k: band TX characterization missing — fade levels '
+        'uncalibrated, imaging weights provisional');
+  }
+  if (uncal.length > 3) {
+    reasons.add('+${uncal.length - 3} more uncalibrated bands');
+  }
+
+  final degraded = anyDriverBad ||
+      missing > 0 ||
+      recent.isNotEmpty ||
+      liveSuspect.isNotEmpty ||
+      deep.isNotEmpty ||
+      uncal.isNotEmpty;
   return HealthReport(
     level: degraded ? Coverage.degraded : Coverage.ok,
     reasons: reasons,

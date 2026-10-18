@@ -1,0 +1,39 @@
+{
+ "seed": 20261018,
+ "provenance": "SYNTHETIC STAND-IN -- NOT AERPAW DATA. Schema mirrors Dickerson et al. arXiv:2512.14608 as documented in aerpaw_adapter.py. Deterministic seed recorded in the companion .meta.json.",
+ "generator": "replay_aerpaw.py --emit-fixture",
+ "n_rows": 1440,
+ "meta": {
+  "nodes": {
+   "n0": [
+    -304.571,
+    -167.2
+   ],
+   "n1": [
+    350.281,
+    -167.2
+   ],
+   "n2": [
+    350.281,
+    399.2
+   ],
+   "n3": [
+    -304.571,
+    399.2
+   ]
+  },
+  "links": [
+   "n0>n1",
+   "n1>n2",
+   "n2>n3",
+   "n3>n0",
+   "n0>n2",
+   "n1>n3"
+  ],
+  "span_m": 545.71,
+  "sigma_m": 43.656800000000004,
+  "meas_noise_m": 27.285500000000003,
+  "seed": 20261018,
+  "provenance": "SYNTHETIC STAND-IN -- NOT AERPAW DATA. Schema mirrors Dickerson et al. arXiv:2512.14608 as documented in aerpaw_adapter.py. Deterministic seed recorded in the companion .meta.json."
+ }
+}

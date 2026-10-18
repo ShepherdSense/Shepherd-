@@ -51,6 +51,47 @@ class GenericSensorDriver extends RadioDriver {
   /// sensorId → last ENERGY level (for virtual-link output).
   final Map<String, double> _energyLevel = {};
 
+  // ---- CSI motion pipeline (esp32_csi_pipeline_spec.md) ----
+  //
+  // Per-link CSI health gates live here (app-side), NOT in the
+  // firmware: the decision inputs already exist here and the
+  // computation is trivial. CSI is corroboration-only — it never
+  // creates virtual tripwire links, so gating can NEVER remove the
+  // RSSI tripwire (regression-prohibited by construction).
+
+  /// sensorId → latest CSI motion observation.
+  final Map<String, CsiObservation> _csi = {};
+
+  /// sensorId → latest wind observation.
+  final Map<String, WindObservation> _wind = {};
+
+  /// sensorId → last evaluated CSI gate state (for flip events).
+  final Map<String, bool> _csiGateState = {};
+
+  /// Human-readable gate-flip events, newest last (bounded). The
+  /// dashboard shows these so an operator sees WHY a node's CSI
+  /// channel went quiet — "LINK GATED: path loss 63 dB" beats a
+  /// silent feature.
+  final List<String> csiGateEvents = [];
+  static const int maxCsiGateEvents = 50;
+
+  /// Conservative CSI path-loss gate (dB). The 60 dB knee was
+  /// cable-conducted on better silicon with no multipath; the ESP32
+  /// field knee will be worse. 5 dB safety margin until measured —
+  /// narrowing it is field-test follow-up work.
+  static const double csiPathLossGateDb = 55.0;
+
+  /// Cross-link imbalance gate (dB): the multi-path analogue of the
+  /// paper's >10 dB inter-chain rule. Spread between the strongest
+  /// and weakest live CSI link beyond this disables the weak link's
+  /// CSI features. (Documented caveat: the single-chain ESP32 has no
+  /// on-node inter-chain imbalance; this is the cross-link analogue
+  /// that protects the pipeline where multiple receive paths meet.)
+  static const double csiImbalanceGateDb = 10.0;
+
+  /// Suzuki's wind gate (m/s): vegetation flutter dominates above this.
+  static const double csiWindGateMs = 3.5;
+
   int _malformed = 0;
   int _ingested = 0;
 
@@ -107,6 +148,7 @@ class GenericSensorDriver extends RadioDriver {
   Future<List<LinkSample>> poll() async {
     await NodeUdpHub.ensureListening(_onDatagram);
     _prune();
+    _refreshCsiGates(DateTime.now());
     final now = DateTime.now();
     final out = <LinkSample>[];
     for (final e in _energyLevel.entries) {
@@ -138,12 +180,178 @@ class GenericSensorDriver extends RadioDriver {
       return; // not JSON / not ours; other drivers' traffic passes by
     }
     if ('${j['type']}' != 'sensor_obs') return;
+    final obs = '${j['obs'] ?? ''}';
+    // CSI / WIND verbs: typed ingest (additive). Unknown verbs are
+    // skipped per the §1c parser contract — never counted malformed.
+    if (obs.toUpperCase() == 'CSI') {
+      final r = SensorProtocol.parseCsiUdpJson(j);
+      if (r.observation == null) {
+        _malformed++;
+        return;
+      }
+      _ingestCsi(r.observation!, DateTime.now());
+      return;
+    }
+    if (obs.toUpperCase() == 'WIND') {
+      final r = SensorProtocol.parseWindUdpJson(j);
+      if (r.observation == null) {
+        _malformed++;
+        return;
+      }
+      _ingestWind(r.observation!, DateTime.now());
+      return;
+    }
+    if (!SensorProtocol.isKnownVerb(obs)) return; // future sensor: skip
     final r = SensorProtocol.parseUdpJson(j);
     if (r.observation == null) {
       _malformed++;
       return;
     }
     _ingest(r.observation!, DateTime.now());
+  }
+
+  /// Test hook: feed one CSI observation directly (gates are
+  /// evaluated as of the observation's own timestamp).
+  @visibleForTesting
+  void ingestCsiForTest(CsiObservation o) => _ingestCsi(o, o.timestamp);
+
+  /// Test hook: feed one WIND observation directly (gates are
+  /// evaluated as of the observation's own timestamp).
+  @visibleForTesting
+  void ingestWindForTest(WindObservation o) =>
+      _ingestWind(o, o.timestamp);
+
+  void _ingestCsi(CsiObservation o, DateTime now) {
+    _ingested++;
+    _csi[o.sensorId] = o;
+    _refreshCsiGates(now);
+  }
+
+  void _ingestWind(WindObservation o, DateTime now) {
+    _ingested++;
+    _wind[o.sensorId] = o;
+    _refreshCsiGates(now);
+  }
+
+  /// Latest CSI observation per sensor (read-only view).
+  Map<String, CsiObservation> latestCsi() => Map.of(_csi);
+
+  /// Latest wind observation per sensor (read-only view).
+  Map<String, WindObservation> latestWind() => Map.of(_wind);
+
+  /// CSI observations fresher than the 30 s staleness horizon.
+  List<CsiObservation> liveCsiObservations(DateTime now) => [
+        for (final o in _csi.values)
+          if (!o.isStaleAt(now)) o
+      ];
+
+  /// Per-link CSI health verdict: enabled only when the path-loss
+  /// gate, the imbalance gate, and the wind gate all pass. Any gate
+  /// failure forces the merger weight to exactly 0 (the AV-FDTI
+  /// zero-weight case) — the RSSI tripwire is unaffected.
+  CsiLinkHealth csiHealthFor(String sensorId, DateTime now) {
+    final o = _csi[sensorId];
+    if (o == null) {
+      return const CsiLinkHealth(
+          enabled: false, reason: 'no CSI observation');
+    }
+    if (o.isStaleAt(now)) {
+      return const CsiLinkHealth(enabled: false, reason: 'stale');
+    }
+    // Wind gate (load-bearing, not cosmetic): without wind data the
+    // feature is OFF, not degraded.
+    final wind = o.windMs ?? _freshestWindMs(now);
+    if (wind == null) {
+      return const CsiLinkHealth(
+          enabled: false, reason: 'no wind source (fail-safe)');
+    }
+    if (o.windGated || wind >= csiWindGateMs) {
+      return CsiLinkHealth(
+          enabled: false,
+          reason:
+              'wind gated (${wind.toStringAsFixed(1)} m/s ≥ $csiWindGateMs m/s)');
+    }
+    // Path-loss gate (conservative 55 dB default).
+    final pl = o.pathLossDb;
+    if (pl == null || !pl.isFinite) {
+      return const CsiLinkHealth(
+          enabled: false, reason: 'path loss unknown');
+    }
+    if (pl > csiPathLossGateDb) {
+      return CsiLinkHealth(
+          enabled: false,
+          reason:
+              'path loss ${pl.toStringAsFixed(1)} dB > $csiPathLossGateDb dB');
+    }
+    // Imbalance gate: weak links in a >10 dB spread are untrustworthy.
+    final spread = _csiLevelSpread(now);
+    if (spread != null && pl > spread.min + csiImbalanceGateDb) {
+      return CsiLinkHealth(
+          enabled: false,
+          reason:
+              'imbalance spread ${spread.range.toStringAsFixed(1)} dB > $csiImbalanceGateDb dB');
+    }
+    return const CsiLinkHealth(enabled: true, reason: 'ok');
+  }
+
+  /// Freshest wind reading across all wind sensors within the 5 min
+  /// horizon, or null when there is no wind source.
+  double? _freshestWindMs(DateTime now) {
+    double? best;
+    DateTime? bestAt;
+    for (final w in _wind.values) {
+      if (now.difference(w.timestamp) > WindObservation.stalenessHorizon) {
+        continue;
+      }
+      if (bestAt == null || w.timestamp.isAfter(bestAt)) {
+        bestAt = w.timestamp;
+        best = w.windMs;
+      }
+    }
+    return best;
+  }
+
+  /// (min, range) of live path-loss estimates across CSI sensors, or
+  /// null with fewer than 2 live readings.
+  ({double min, double range})? _csiLevelSpread(DateTime now) {
+    final pls = <double>[];
+    for (final o in _csi.values) {
+      if (o.isStaleAt(now)) continue;
+      final pl = o.pathLossDb;
+      if (pl != null && pl.isFinite) pls.add(pl);
+    }
+    if (pls.length < 2) return null;
+    final lo = pls.reduce((a, b) => a < b ? a : b);
+    final hi = pls.reduce((a, b) => a > b ? a : b);
+    return (min: lo, range: hi - lo);
+  }
+
+  /// Re-evaluate every CSI gate; emit a health event on each flip so
+  /// the operator sees why a channel went quiet.
+  void _refreshCsiGates(DateTime now) {
+    for (final id in _csi.keys) {
+      final h = csiHealthFor(id, now);
+      final prev = _csiGateState[id];
+      if (prev == null) {
+        _csiGateState[id] = h.enabled;
+        continue; // first sighting: no flip to report
+      }
+      if (prev != h.enabled) {
+        _csiGateState[id] = h.enabled;
+        _gateEvent(h.enabled
+            ? 'LINK UNGATED: $id — ${h.reason}'
+            : 'LINK GATED: $id — ${h.reason}');
+      }
+    }
+    _csiGateState.removeWhere((k, _) => !_csi.containsKey(k));
+  }
+
+  void _gateEvent(String msg) {
+    csiGateEvents.add(msg);
+    if (csiGateEvents.length > maxCsiGateEvents) {
+      csiGateEvents.removeRange(
+          0, csiGateEvents.length - maxCsiGateEvents);
+    }
   }
 
   void _ingest(SensorObservation o, DateTime now) {
@@ -174,7 +382,12 @@ class GenericSensorDriver extends RadioDriver {
     final cutoff = now.subtract(maxAge);
     _store.removeWhere((o) => o.timestamp.isBefore(cutoff));
     _latest.removeWhere((_, o) => o.timestamp.isBefore(cutoff));
-    if (_latest.length > maxSensors) {
+    // CSI (30 s) and WIND (5 min) have their own staleness horizons —
+    // prune on those, not the 10 min store horizon.
+    _csi.removeWhere((_, o) => o.isStaleAt(now));
+    _wind.removeWhere(
+        (_, w) => now.difference(w.timestamp) > WindObservation.stalenessHorizon);
+    _csiGateState.removeWhere((k, _) => !_csi.containsKey(k));    if (_latest.length > maxSensors) {
       final sorted = _latest.entries.toList()
         ..sort((a, b) => a.value.timestamp.compareTo(b.value.timestamp));
       for (final e in sorted.take(_latest.length - maxSensors)) {
@@ -196,9 +409,18 @@ class GenericSensorDriver extends RadioDriver {
   void dispose() => NodeUdpHub.release(_onDatagram);
 }
 
-// SEAM: at merge, wire into radio_driver.dart:
-//   import 'generic_sensor_driver.dart';
-//   case 'sensor': return GenericSensorDriver();
-// and append to driverTypes:
-//   (id: 'sensor', label: 'SENSOR BUS (lidar/acoustic/PIR/…)', implemented: true),
+/// Per-link CSI health verdict (esp32_csi_pipeline_spec.md §Stage 3).
+class CsiLinkHealth {
+  const CsiLinkHealth({required this.enabled, required this.reason});
+
+  /// False ⇒ the merger weight is exactly 0 (AV-FDTI zero-weight
+  /// case). The RSSI tripwire is never affected.
+  final bool enabled;
+
+  /// Human-readable why, for the gate-flip health events.
+  final String reason;
+}
+
+// Wired into radio_driver.dart as driver id 'sensor'
+// (driverTypes: 'SENSOR BUS (lidar / acoustic / PIR / …)').
 // No config address needed — the driver listens, sensors talk.

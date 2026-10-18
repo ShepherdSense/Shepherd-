@@ -51,18 +51,30 @@ enum SensorObsType {
 /// The constructor asserts [boost] is non-negative — any path that
 /// tried to express "this sensor says nothing is here" as a negative
 /// number fails loudly in tests.
+///
+/// [quality] is the geometry-alignment channel (0..1): how well the
+/// observation lined up with the track, independent of how strong the
+/// evidence is. The gated merger (see confidence_merger.dart) uses it
+/// as part of the reliability weight w_s — the AV-FDTI lesson is that a
+/// misaligned modality must contribute ~nothing, not a degraded
+/// average. [Corroboration.none] carries quality 0 ("no opinion").
 class Corroboration {
-  const Corroboration({required this.boost, this.note = ''})
-      : assert(boost >= 0, 'corroboration is upgrade-only: boost >= 0');
+  const Corroboration({required this.boost, this.quality = 1.0, this.note = ''})
+      : assert(boost >= 0, 'corroboration is upgrade-only: boost >= 0'),
+        assert(quality >= 0 && quality <= 1,
+            'alignment quality is a 0..1 weight');
 
   /// 0 = no opinion. >0 = this observation supports the track.
   /// Capped by producers; the merger caps the total (see spec).
   final double boost;
 
+  /// 0..1 alignment quality feeding the merger's reliability gate.
+  final double quality;
+
   /// Human-readable why, shown in the evidence view.
   final String note;
 
-  static const none = Corroboration(boost: 0);
+  static const none = Corroboration(boost: 0, quality: 0);
 }
 
 /// One typed measurement from any sensor on the bus.
@@ -186,6 +198,7 @@ class SensorObservation {
         final closeness = 1 - ((trackDist - d).abs() / tol).clamp(0.0, 1.0);
         return Corroboration(
           boost: 0.05 + 0.20 * closeness,
+          quality: closeness,
           note: 'RANGE ${d.toStringAsFixed(1)} m matches track '
               '(${trackDist.toStringAsFixed(0)} m from sensor)',
         );
@@ -204,6 +217,7 @@ class SensorObservation {
         final align = 1 - (diff / 25).clamp(0.0, 1.0);
         return Corroboration(
           boost: (0.05 + 0.15 * align) * confidence.clamp(0.0, 1.0),
+          quality: align,
           note: 'Acoustic bearing ${b.toStringAsFixed(0)}° aligns with '
               'track (Δ${diff.toStringAsFixed(0)}°)',
         );
@@ -222,6 +236,7 @@ class SensorObservation {
         }
         return const Corroboration(
           boost: 0.10,
+          quality: 1.0, // trigger inside the radius is inherently aligned
           note: 'PIR trigger near track',
         );
 
@@ -243,6 +258,8 @@ class SensorObservation {
         }
         return const Corroboration(
           boost: 0.15,
+          quality: 1.0, // inside the 500 m gate; the camera's facing is
+          // unknown, so alignment is binary, not graded
           note: 'Camera motion near track',
         );
     }

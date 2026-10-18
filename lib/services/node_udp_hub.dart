@@ -5,13 +5,9 @@
 /// listener receives every datagram as text and filters by its own
 /// `type` field.
 ///
-/// SEAM: at merge, migrate Esp32Driver._Esp32UdpHub to this hub — the
-/// API is intentionally identical (ensureListening/release), so it is
-/// a mechanical swap: replace `_Esp32UdpHub.ensureListening(_onDatagram)`
-/// with `NodeUdpHub.ensureListening(_onDatagram)` (and the import),
-/// then delete the private hub class. Until then, do NOT enable the
-/// 'esp32' and 'sensor' drivers simultaneously: the second bind fails
-/// silently and that driver hears nothing.
+/// Esp32Driver and GenericSensorDriver both listen through this hub,
+/// so the 'esp32' and 'sensor' drivers may run simultaneously — one
+/// socket, every listener gets every datagram.
 library;
 
 import 'dart:io';
@@ -73,4 +69,29 @@ class NodeUdpHub {
 
   /// Test hook: number of registered listeners.
   static int get listenerCountForTest => _listeners.length;
+
+  /// Sniff the `calib` flag from a node beacon datagram without a full
+  /// parse: true = the node is participating in the vacant-window
+  /// calibration, false = explicitly not, null = not a beacon / no
+  /// flag / unparseable. Never throws. (The full beacon parse lives in
+  /// the drivers; this is the shared, cheap pre-check.)
+  static bool? beaconCalibFlag(String text) {
+    try {
+      final t = text.trim();
+      if (!t.startsWith('{')) return null;
+      // Cheap structural check before JSON decode: must look like a
+      // beacon and mention calib at all.
+      if (!t.contains('"type"') || !t.contains('calib')) return null;
+      // Minimal manual extraction: avoids a full jsonDecode on the
+      // hot path for non-beacon traffic.
+      final typeM = RegExp(r'"type"\s*:\s*"beacon"').firstMatch(t);
+      if (typeM == null) return null;
+      final m =
+          RegExp(r'"calib"\s*:\s*(true|false)').firstMatch(t);
+      if (m == null) return null;
+      return m.group(1) == 'true';
+    } catch (_) {
+      return null;
+    }
+  }
 }

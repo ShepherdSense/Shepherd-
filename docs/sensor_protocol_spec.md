@@ -181,6 +181,24 @@ While the track is internally inconsistent (see §5b) all upgrades are
 suspended: `C_display = C_RF`. Upgrading a misassociated track is the
 failure mode the consistency literature warns about.
 
+**CSI addendum (v0.17.0, esp32_csi_pipeline_spec.md):** the CSI motion
+channel instantiates §5a as a new evidence type with its own gate
+semantics — no structural change to the merger. `e_csi` comes from the
+Hz-deviation band table (weak 0.05 / moderate 0.10 / strong 0.15;
+below the 3 Hz noise floor: no claim). `w_csi = freshness · health ·
+quality`: freshness is the 30 s staleness horizon (ENERGY-class
+cadence); health is the per-link gate state (path-loss ≤ 55 dB
+conservative default, ≤ 10 dB cross-link imbalance spread, source
+polling recently); quality is the link-geometry overlap of the sniffed
+AP link with the track. The wind gate is load-bearing: `wind_gated`,
+any link-budget gate, or no wind source forces `w_csi = 0` exactly —
+the AV-FDTI zero-weight case. Without a wind source the CSI motion
+features are OFF by default (fail-safe), never degraded. Doppler
+(`e_dop` 0.10, velocity-consistency) and WPP-IDP (upgrade-only
+existence evidence) instantiate the same §5a shape with their own
+horizons (60 s / 30 s); Doppler disagreement and moving-node WPP-IDP
+events contribute exactly 0.
+
 ### 5b. Consistency monitor (honest NEES analogue)
 
 The app tracker is a grid search with no state covariance, so a

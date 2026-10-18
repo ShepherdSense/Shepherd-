@@ -59,7 +59,34 @@ class EvidenceSheet extends StatelessWidget {
             if (event.aiLabel != null)
               _row('AI GUESS',
                   '${event.aiLabel} (${((event.aiConfidence ?? 0) * 100).toStringAsFixed(0)}% conf, synthetic-trained)'),
-            _rfSignatureRows(state),
+            _evidenceSection(
+              state,
+              'RF SIGNATURES',
+              state.elrsEvidenceLines,
+              'Protocol-pattern evidence only: consistent with, never '
+              'confirmed. Any LoRa FHSS emitter can raise these.',
+            ),
+            _evidenceSection(
+              state,
+              'CSI DISTURBANCE',
+              state.csiEvidenceLines,
+              'Class estimates from a synthetic-trained model: possible '
+              'mover classes, never identity.',
+            ),
+            _evidenceSection(
+              state,
+              'PASSIVE DOPPLER',
+              state.dopplerEvidenceLines,
+              'Corroboration only: agreement can upgrade confidence, '
+              'disagreement never downgrades a track.',
+            ),
+            _evidenceSection(
+              state,
+              'WPP-IDP',
+              state.wppIdpEvidenceLines,
+              'Doppler-line detections are estimates — R&D logging, not '
+              'identification.',
+            ),
             _bearingRow(window),
             const SizedBox(height: 12),
             Text('DEVIATION HISTORY (60s window)', style: SentryType.section()),
@@ -98,14 +125,17 @@ class EvidenceSheet extends StatelessWidget {
         ),
       );
 
-  Widget _rfSignatureRows(AppState state) {
-    final lines = state.elrsEvidenceLines;
+  /// One evidence section (ELRS / CSI / Doppler / WPP-IDP): the raw
+  /// lines plus a fixed honesty footnote. Empty sections render
+  /// nothing — silence, never a guess.
+  Widget _evidenceSection(
+      AppState state, String title, List<String> lines, String footnote) {
     if (lines.isEmpty) return const SizedBox.shrink();
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         const SizedBox(height: 6),
-        Text('RF SIGNATURES', style: SentryType.section()),
+        Text(title, style: SentryType.section()),
         const SizedBox(height: 4),
         for (final l in lines)
           Padding(
@@ -123,8 +153,7 @@ class EvidenceSheet extends StatelessWidget {
         Padding(
           padding: const EdgeInsets.only(top: 2, bottom: 3),
           child: Text(
-            'Protocol-pattern evidence only: consistent with, never '
-            'confirmed. Any LoRa FHSS emitter can raise these.',
+            footnote,
             style: SentryType.rowLabel().copyWith(fontSize: 10),
           ),
         ),

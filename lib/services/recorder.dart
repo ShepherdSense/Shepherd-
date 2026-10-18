@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:path_provider/path_provider.dart';
@@ -17,6 +18,12 @@ class RecordingService {
   IOSink? _sink;
   int _rows = 0;
   DateTime? _startedAt;
+
+  /// JSON-lines sidecar for calibration records and ARTI runtime stats
+  /// (adaptive_baseline_spec.md schemas). Created lazily next to the
+  /// CSV, or on first JSON write when no CSV recording is active.
+  File? _jsonFile;
+  IOSink? _jsonSink;
 
   /// Human-readable description of the most recent start/stop failure,
   /// or null when the last operation succeeded. start()/stop() never
@@ -72,6 +79,31 @@ class RecordingService {
     }
   }
 
+  /// Append one JSON telemetry record (calibration / arti_stats, per
+  /// the adaptive_baseline_spec.md schemas) to the sidecar JSONL file.
+  /// Never throws — a full disk surfaces in [lastError], never in the
+  /// UI. Works with or without an active CSV recording.
+  Future<void> recordJson(Map<String, dynamic> record) async {
+    try {
+      await _ensureJsonSink();
+      final s = _jsonSink;
+      if (s == null) return;
+      s.writeln(jsonEncode(record));
+    } catch (e) {
+      _lastError = 'telemetry write failed: $e';
+    }
+  }
+
+  Future<void> _ensureJsonSink() async {
+    if (_jsonSink != null) return;
+    final dir = await getApplicationDocumentsDirectory();
+    final recDir = Directory('${dir.path}/shepherd_recordings');
+    if (!await recDir.exists()) await recDir.create(recursive: true);
+    final stamp = DateTime.now().toIso8601String().replaceAll(':', '-');
+    _jsonFile = File('${recDir.path}/telemetry_$stamp.jsonl');
+    _jsonSink = _jsonFile!.openWrite();
+  }
+
   /// Stop and flush. Returns a summary string, or an error description
   /// on failure (also in [lastError]). Never throws.
   Future<String> stop() async {
@@ -82,6 +114,8 @@ class RecordingService {
     try {
       await _sink?.flush();
       await _sink?.close();
+      await _jsonSink?.flush();
+      await _jsonSink?.close();
       _lastError = null;
     } catch (e) {
       _lastError = 'recording stop failed: $e';
@@ -89,6 +123,8 @@ class RecordingService {
     } finally {
       _sink = null;
       _file = null;
+      _jsonSink = null;
+      _jsonFile = null;
     }
     return '$rows samples, ${secs}s → $path';
   }

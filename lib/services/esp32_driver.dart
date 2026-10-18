@@ -47,6 +47,12 @@ class Esp32Driver extends RadioDriver {
   /// overwriting a user-set callsign).
   Map<String, String> get beaconCallsigns => Map.unmodifiable(_callsigns);
 
+  /// Node ids whose latest beacon carries `"calib": true` — nodes
+  /// participating in the vacant-window calibration. A node
+  /// mid-reboot (no flag, or flag false) must not contaminate the
+  /// fit; the guided routine only trusts flagged nodes.
+  final Set<String> calibNodes = {};
+
   /// Node id → sensor names from its beacon ("sensors" array).
   final Map<String, List<String>> _sensors = {};
 
@@ -92,6 +98,7 @@ class Esp32Driver extends RadioDriver {
     _seenAt.removeWhere((_, t) => now.difference(t) > const Duration(minutes: 5));
     _positions.removeWhere((k, _) => !_seenAt.containsKey(k));
     _sensors.removeWhere((k, _) => !_seenAt.containsKey(k));
+    calibNodes.removeWhere((k) => !_seenAt.containsKey(k));
     final out = <LinkSample>[];
     for (final e in _active.entries) {
       final parts = e.key.split(':');
@@ -155,6 +162,14 @@ class Esp32Driver extends RadioDriver {
         _callsigns[node] = cs;
       } else {
         _callsigns.remove(node);
+      }
+      // Vacant-window calibration flag (adaptive_baseline_spec.md):
+      // only nodes explicitly flagging `calib: true` count toward
+      // the guided routine's fit.
+      if (NodeUdpHub.beaconCalibFlag(text) == true) {
+        calibNodes.add(node);
+      } else {
+        calibNodes.remove(node);
       }
       _lastBeaconAt = DateTime.now();
       _seenAt[node] = _lastBeaconAt;

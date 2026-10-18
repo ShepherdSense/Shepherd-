@@ -12,16 +12,24 @@
 ///      ENERGY rf1 -67
 ///      MOTION cam1 zone=3
 ///      MOTION cam1
+///      WIND anem1 4.2 6.1          (wind_ms [gust_ms])
 ///    And the legacy form (still parsed, as ENERGY):
 ///      SENSOR <name> <rssi_dbm>
 ///
 /// 2. UDP 49160 JSON (node → app, or anything → app):
 ///      {"type":"sensor_obs","obs":"RANGE","sensor":"lidar1",
 ///       "dist_m":12.4,"angle_deg":45,"lat":..,"lon":..}
+///      {"type":"sensor_obs","obs":"CSI","sensor":"csi_ap_buffalo",
+///       "dev_hz":12.4,"pairs_active":19,"path_loss_db":54.0,
+///       "link":"ap:buffalo","wind_ms":1.8,"wind_gated":false,"t":..}
+///      {"type":"sensor_obs","obs":"WIND","sensor":"anem_1",
+///       "wind_ms":4.2,"gust_ms":6.1,"t":..}
 ///
 /// The parser is LENIENT BY DESIGN: malformed lines are logged and
 /// skipped, never thrown. A chatty broken sensor must not take down
 /// the ingest path. [parseLine] and [parseUdpJson] never throw.
+/// Unknown `obs` verbs are skipped per the §1c parser contract (a
+/// future sensor must not break today's app).
 ///
 /// Field reference (all numbers finite-checked; NaN/Inf rejected):
 /// - RANGE:   <sensor> <dist_m> [angle_deg]
@@ -30,6 +38,8 @@
 /// - BINARY:  <sensor> <0|1|true|false>
 /// - ENERGY:  <sensor> <level_db>
 /// - MOTION:  <sensor> [zone=<id>] [label=<text>]
+/// - WIND:    <sensor> <wind_ms> [gust_ms]
+/// - CSI:     UDP JSON only (see [CsiObservation])
 library;
 
 import '../models/sensor_observation.dart';
@@ -42,6 +52,135 @@ class SensorParseResult {
   /// Non-null when the line was malformed (observation is null then).
   /// For the log; throttled by the caller.
   final String? warning;
+}
+
+/// Result of parsing one CSI wire message.
+class CsiParseResult {
+  const CsiParseResult(this.observation, this.warning);
+  final CsiObservation? observation;
+  final String? warning;
+}
+
+/// Result of parsing one WIND wire message.
+class WindParseResult {
+  const WindParseResult(this.observation, this.warning);
+  final WindObservation? observation;
+  final String? warning;
+}
+
+/// CSI motion observation (esp32_csi_pipeline_spec.md).
+///
+/// One ESP32's WiFi-CSI motion channel: symmetric-subcarrier phase
+/// averaging in firmware, Hz-deviation metric per 1 s window. This is
+/// meters-class *disturbance on a link*, not a target at a coordinate —
+/// tripwire, not radar. Never identity, never classification of what
+/// moved; dev_hz bands are size-class heuristics with confidence.
+class CsiObservation {
+  const CsiObservation({
+    required this.sensorId,
+    required this.timestamp,
+    required this.devHz,
+    this.pairsActive,
+    this.pathLossDb,
+    this.link,
+    this.windMs,
+    this.windGated = true,
+    this.sensorLat,
+    this.sensorLon,
+  });
+
+  final String sensorId;
+  final DateTime timestamp;
+
+  /// Hz-deviation of the averaged phase time series (req).
+  final double devHz;
+
+  /// Subcarrier pairs above the noise floor (opt).
+  final int? pairsActive;
+
+  /// Firmware's path-loss estimate in dB (opt — the app re-derives).
+  final double? pathLossDb;
+
+  /// AP/link id the motion is attributed to (opt).
+  final String? link;
+
+  /// Local wind at the node, m/s (opt).
+  final double? windMs;
+
+  /// True when this window's motion claim was suppressed by the wind
+  /// gate. Defaults true (fail-safe): without wind data the feature is
+  /// OFF, not degraded.
+  final bool windGated;
+
+  final double? sensorLat;
+  final double? sensorLon;
+
+  /// Staleness horizon: 30 s (ENERGY-class cadence).
+  static const Duration stalenessHorizon = Duration(seconds: 30);
+
+  bool get isStale =>
+      DateTime.now().difference(timestamp) > stalenessHorizon;
+
+  bool isStaleAt(DateTime now) =>
+      now.difference(timestamp) > stalenessHorizon;
+
+  /// Size-class band from the paper's outdoor operating points —
+  /// starting estimates to field-calibrate, not constants.
+  CsiBand get band {
+    if (devHz < 3) return CsiBand.noise;
+    if (devHz < 10) return CsiBand.smallMover;
+    if (devHz < 30) return CsiBand.personAnimal;
+    return CsiBand.vehicleClass;
+  }
+}
+
+/// CSI Hz-deviation bands (heuristic size classes, never identities).
+enum CsiBand {
+  /// < 3 Hz: below the paper's bird floor — noise; no claim.
+  noise,
+
+  /// 3–10 Hz: small-mover band (crow-class ~5 Hz).
+  smallMover,
+
+  /// 10–30 Hz: person/animal class.
+  personAnimal,
+
+  /// > 30 Hz: vehicle-class intrusion (paper's SUV floor).
+  vehicleClass,
+}
+
+/// Wind observation (anemometer module / operator gate / weather API).
+class WindObservation {
+  const WindObservation({
+    required this.sensorId,
+    required this.timestamp,
+    required this.windMs,
+    this.gustMs,
+    this.sensorLat,
+    this.sensorLon,
+  });
+
+  final String sensorId;
+  final DateTime timestamp;
+
+  /// Wind speed, m/s (req).
+  final double windMs;
+
+  /// Gust speed, m/s (opt).
+  final double? gustMs;
+
+  final double? sensorLat;
+  final double? sensorLon;
+
+  /// Staleness horizon: 5 min (weather changes slowly; a stale wind
+  /// reading fails safe to wind_gated).
+  static const Duration stalenessHorizon = Duration(minutes: 5);
+
+  bool get isStale =>
+      DateTime.now().difference(timestamp) > stalenessHorizon;
+
+  /// Suzuki's gate: motion claims suppressed at/above 3.5 m/s.
+  bool get exceedsGate => windMs >= 3.5;
 }
 
 class SensorProtocol {
@@ -182,6 +321,11 @@ class SensorProtocol {
           zone: zone,
           zoneLabel: label,
         );
+      case 'WIND':
+        // WIND has its own typed model (not a SensorObservation); the
+        // UART path surfaces it via parseWindLine. Here: skip silently
+        // so the generic sensor-bus parser doesn't call it malformed.
+        return null;
       default:
         return null;
     }
@@ -387,6 +531,173 @@ class SensorProtocol {
         if (o.zone != null) s += ' zone=${o.zone}';
         if (o.zoneLabel != null) s += ' label=${o.zoneLabel}';
         return s;
+    }
+  }
+
+  /// True for `obs` verbs this app understands (sensor bus + CSI +
+  /// WIND). Unknown verbs are SKIPPED per the §1c parser contract — a
+  /// future sensor must not break today's app, and an unknown verb is
+  /// not a malformed message.
+  static bool isKnownVerb(String obs) {
+    switch (obs.toUpperCase()) {
+      case 'RANGE':
+      case 'BEARING':
+      case 'SPECTRUM':
+      case 'BINARY':
+      case 'ENERGY':
+      case 'MOTION':
+      case 'CSI':
+      case 'WIND':
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  /// Parse one UDP JSON CSI observation. Never throws.
+  ///
+  ///   {"type":"sensor_obs","obs":"CSI","sensor":"csi_ap_buffalo",
+  ///    "dev_hz":12.4,"pairs_active":19,"path_loss_db":54.0,
+  ///    "link":"ap:buffalo","wind_ms":1.8,"wind_gated":false,"t":..}
+  ///
+  /// `wind_gated` defaults TRUE (fail-safe): without wind data the CSI
+  /// motion features are OFF, not degraded.
+  static CsiParseResult parseCsiUdpJson(Map<String, dynamic> j,
+      {DateTime? receivedAt}) {
+    final now = receivedAt ?? DateTime.now();
+    try {
+      return CsiParseResult(_parseCsiInner(j, now), null);
+    } catch (e) {
+      return CsiParseResult(null, 'unparseable CSI sensor_obs JSON ($e)');
+    }
+  }
+
+  static CsiObservation? _parseCsiInner(
+      Map<String, dynamic> j, DateTime now) {
+    if ('${j['type']}' != 'sensor_obs') return null;
+    if ('${j['obs']}'.toUpperCase() != 'CSI') return null;
+    final id = _id('${j['sensor'] ?? ''}');
+    if (id.isEmpty) return null;
+    final dev = j['dev_hz'];
+    if (dev is! num || !dev.isFinite || dev < 0) return null;
+
+    DateTime ts = now;
+    final t = j['t'];
+    if (t is num && t.isFinite && t > 946684800 && t < 4102444800) {
+      ts = DateTime.fromMillisecondsSinceEpoch((t * 1000).round(),
+          isUtc: true);
+    }
+    double? lat, lon;
+    final la = j['lat'];
+    final lo = j['lon'];
+    if (la is num && lo is num && la.isFinite && lo.isFinite) {
+      if (la.abs() <= 90 && lo.abs() <= 180 && (la != 0 || lo != 0)) {
+        lat = la.toDouble();
+        lon = lo.toDouble();
+      }
+    }
+    double? fin(String k) {
+      final v = j[k];
+      return v is num && v.isFinite ? v.toDouble() : null;
+    }
+
+    final pairs = j['pairs_active'];
+    final link = j['link'];
+    final wg = j['wind_gated'];
+    return CsiObservation(
+      sensorId: id,
+      timestamp: ts,
+      devHz: dev.toDouble(),
+      pairsActive: pairs is num ? pairs.toInt() : null,
+      pathLossDb: fin('path_loss_db'),
+      link: link is String && link.isNotEmpty ? link : null,
+      windMs: fin('wind_ms'),
+      // Fail-safe default: unknown wind ⇒ gated.
+      windGated: wg is bool ? wg : true,
+      sensorLat: lat,
+      sensorLon: lon,
+    );
+  }
+
+  /// Parse one UDP JSON WIND observation. Never throws.
+  ///
+  ///   {"type":"sensor_obs","obs":"WIND","sensor":"anem_1",
+  ///    "wind_ms":4.2,"gust_ms":6.1,"t":..}
+  static WindParseResult parseWindUdpJson(Map<String, dynamic> j,
+      {DateTime? receivedAt}) {
+    final now = receivedAt ?? DateTime.now();
+    try {
+      return WindParseResult(_parseWindInner(j, now), null);
+    } catch (e) {
+      return WindParseResult(null, 'unparseable WIND sensor_obs JSON ($e)');
+    }
+  }
+
+  static WindObservation? _parseWindInner(
+      Map<String, dynamic> j, DateTime now) {
+    if ('${j['type']}' != 'sensor_obs') return null;
+    if ('${j['obs']}'.toUpperCase() != 'WIND') return null;
+    final id = _id('${j['sensor'] ?? ''}');
+    if (id.isEmpty) return null;
+    final w = j['wind_ms'];
+    if (w is! num || !w.isFinite || w < 0 || w > 150) return null;
+
+    DateTime ts = now;
+    final t = j['t'];
+    if (t is num && t.isFinite && t > 946684800 && t < 4102444800) {
+      ts = DateTime.fromMillisecondsSinceEpoch((t * 1000).round(),
+          isUtc: true);
+    }
+    double? lat, lon;
+    final la = j['lat'];
+    final lo = j['lon'];
+    if (la is num && lo is num && la.isFinite && lo.isFinite) {
+      if (la.abs() <= 90 && lo.abs() <= 180 && (la != 0 || lo != 0)) {
+        lat = la.toDouble();
+        lon = lo.toDouble();
+      }
+    }
+    final g = j['gust_ms'];
+    return WindObservation(
+      sensorId: id,
+      timestamp: ts,
+      windMs: w.toDouble(),
+      gustMs: g is num && g.isFinite ? g.toDouble() : null,
+      sensorLat: lat,
+      sensorLon: lon,
+    );
+  }
+
+  /// Parse one UART WIND line: `WIND <name> <wind_ms> [gust_ms]`.
+  /// Never throws.
+  static WindParseResult parseWindLine(String line, {DateTime? at}) {
+    final now = at ?? DateTime.now();
+    try {
+      final t = line.trim();
+      final parts = t.split(RegExp(r'\s+'));
+      if (parts.length < 3 || parts[0].toUpperCase() != 'WIND') {
+        return const WindParseResult(null, null);
+      }
+      final id = _id(parts[1]);
+      final w = _finite(parts[2]);
+      if (id.isEmpty || w == null || w < 0 || w > 150) {
+        return WindParseResult(
+            null, 'unparseable WIND line: "$t"');
+      }
+      double? gust;
+      if (parts.length >= 4) {
+        gust = _finite(parts[3]);
+        if (gust == null) {
+          return WindParseResult(null, 'unparseable WIND line: "$t"');
+        }
+      }
+      return WindParseResult(
+        WindObservation(
+            sensorId: id, timestamp: now, windMs: w, gustMs: gust),
+        null,
+      );
+    } catch (e) {
+      return WindParseResult(null, 'unparseable WIND line ($e)');
     }
   }
 

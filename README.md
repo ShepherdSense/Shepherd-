@@ -20,6 +20,12 @@ Built by **Draco**.
 - **Fade-aware tripwire + VRTI** — per-link fade levels judge disturbances against their expected direction (dip vs. rise); a variance channel catches slow movers the mean misses.
 - **SDR FHSS signature detector** — band-plan presets (`--plan fpv/dji/longrange/lora`) and rolling sub-band occupancy hints (`fhss-2g4`, `ofdm-5g`, …): signatures, never identity.
 - **ELRS Gemini signature detection** — RX-only DSP in the SDR bridge finds LoRa chirp trains (ELRS's LoRa modes) and scores the Gemini dual-emission signature: time-correlated trains on two frequencies (~40 MHz apart @ 2.4 GHz) or two bands at once (2.4 GHz + 900 MHz, GemX). Surfaced as upgrade-only corroboration in the evidence view. The first public ELRS-specific detector; see `docs/elrs_detection_spec.md`.
+- **Adaptive baseline + dial-it-in calibration** — per-link reference levels that follow slow environmental drift instead of re-tripping the tripwire; the operator captures a known-clean baseline profile before an event. Calibrates the *reference* — never claims targets, identity, or range.
+- **Direction-split RTI imaging** — the shadow heatmap weights disturbances with fade-signed, direction-split, area-normalized weights, so blobs land where the link geometry says they should.
+- **ESP32 CSI motion channel** — outdoor-usable Wi-Fi CSI motion sensing on the field-kit nodes: phase-cancellation averaging, a wind gate, and link-budget gates that zero-weight the channel on weak links. Meters-class tripwire — existence evidence, never identity.
+- **Doppler-only track refinement** — the SDR bridge measures radial velocity off ambient LTE downlink (~0.16 m/s resolution at 1.86 GHz) as a second opinion on a track's motion. Upgrade-only: agreement can raise confidence, disagreement never deletes a track.
+- **WPP-IDP passive radar** — no-clean-reference passive radar on signals of opportunity: per-packet energy → DC removal → STFT chain, with a waveform rule scoring candidate illuminators. Micro-Doppler corroborates *motion*, never *identity*. Meters-to-tens-of-meters.
+- **Validation benches** — AERPAW flight-test replay through the fusion machinery (validates the fusion, not the sensing) and an ESP32 500 fps CSI frame-rate go/no-go bench.
 - **Operator tools** — event timeline scrubber, alert triage (ACK / false-alarm with tuning stats), spectrum-band panel, node health map, record/replay with "why did it alert" evidence view.
 
 ## What it works with
@@ -93,6 +99,11 @@ Shepherd states its limits in the UI, not just here:
 - Type guesses are heuristic and always labeled low-confidence.
 - The embedded AI classifies closed events — it never suppresses alerts.
 - RF signatures (ELRS Gemini, FHSS hints) say "consistent with", never "confirmed" — the detector can't distinguish ELRS from other LoRa FHSS emitters with certainty, and the UI enforces that wording.
+- Paper accuracy numbers are not transferred: cited figures come from other regimes (30+ node meshes, stationary humans) — Shepherd's 6-node, on-the-move, airborne-target regime re-measures from zero. Features are implemented per spec and bench-tested; field validation is pending.
+- Micro-Doppler is never used for identity — it corroborates motion only: "consistent with, never confirmed".
+- CSI motion is a meters-class tripwire: existence evidence in the gated merger, never a position fix.
+- Doppler disagreement never deletes tracks — the refinement layer is upgrade-only.
+- WPP-IDP passive radar is meters-to-tens-of-meters accuracy — never fire-control quality.
 
 ## Layout
 

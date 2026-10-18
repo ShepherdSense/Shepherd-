@@ -15,12 +15,14 @@ import '../services/gps_positioning.dart';
 import '../services/health.dart';
 import '../services/tracker.dart';
 import '../services/tripwire.dart';
+import '../services/adaptive_baseline.dart';
 import '../services/field_activity.dart';
 import '../services/radio_driver.dart';
 import '../services/meshtastic_driver.dart';
 import '../services/esp32_driver.dart';
 import '../services/camera_driver.dart';
 import '../services/confidence_merger.dart';
+import '../services/sensor_protocol.dart';
 import '../services/track_consistency.dart';
 import '../services/generic_sensor_driver.dart';
 import '../models/sensor_observation.dart';
@@ -78,6 +80,11 @@ class AppSettings {
     this.zmetaSecured = false,
     this.zmetaHeartbeatEnabled = false,
     this.zmetaHeartbeatIntervalSec = 60,
+    this.sdrStationLat,
+    this.sdrStationLon,
+    this.sdrEnbLat,
+    this.sdrEnbLon,
+    this.sdrEnbCenterMhz,
   });
 
   String radioIp;
@@ -112,6 +119,22 @@ class AppSettings {
   /// Heartbeat cadence in seconds, clamped 15..600 at apply time.
   int zmetaHeartbeatIntervalSec;
 
+  /// SDR station geometry for the passive-Doppler correlator (WGS84).
+  /// Null until the operator configures it in Settings → SDR station;
+  /// without all four coordinates the correlator abstains. Converted
+  /// to field-local meters (via the GPS field origin when set, else
+  /// relative to the station) by [AppState.applySdrStationFromSettings]
+  /// and pushed to the SDR drivers with setSdrStation.
+  double? sdrStationLat;
+  double? sdrStationLon;
+  double? sdrEnbLat;
+  double? sdrEnbLon;
+
+  /// LTE eNB center frequency (MHz) the geometry refers to. Operator
+  /// record, persisted with the coordinates; the bridge's Doppler refs
+  /// carry their own tuned center.
+  double? sdrEnbCenterMhz;
+
   TripwireConfig get tripwireConfig => TripwireConfig(
         baselineWindow: baselineWindow,
         dipThreshold: dipThreshold,
@@ -129,6 +152,11 @@ class AppSettings {
         'zmetaSecured': zmetaSecured,
         'zmetaHeartbeatEnabled': zmetaHeartbeatEnabled,
         'zmetaHeartbeatIntervalSec': zmetaHeartbeatIntervalSec,
+        'sdrStationLat': sdrStationLat,
+        'sdrStationLon': sdrStationLon,
+        'sdrEnbLat': sdrEnbLat,
+        'sdrEnbLon': sdrEnbLon,
+        'sdrEnbCenterMhz': sdrEnbCenterMhz,
       };
 
   void applyJson(Map<String, dynamic> j) {
@@ -146,6 +174,40 @@ class AppSettings {
     if (hb is bool) zmetaHeartbeatEnabled = hb;
     final hbi = j['zmetaHeartbeatIntervalSec'];
     if (hbi is int) zmetaHeartbeatIntervalSec = hbi.clamp(15, 600);
+    double? lat(String k) {
+      final v = j[k];
+      if (v is num) {
+        final d = v.toDouble();
+        if (d.isFinite) return d;
+      }
+      return null;
+    }
+
+    final slat = lat('sdrStationLat');
+    final slon = lat('sdrStationLon');
+    final elat = lat('sdrEnbLat');
+    final elon = lat('sdrEnbLon');
+    // All-or-nothing: a partial saved geometry is unconfigured, not a
+    // half-applied one. Range-checked like the settings UI.
+    if (slat != null &&
+        slon != null &&
+        elat != null &&
+        elon != null &&
+        slat >= -90 &&
+        slat <= 90 &&
+        elat >= -90 &&
+        elat <= 90 &&
+        slon >= -180 &&
+        slon <= 180 &&
+        elon >= -180 &&
+        elon <= 180) {
+      sdrStationLat = slat;
+      sdrStationLon = slon;
+      sdrEnbLat = elat;
+      sdrEnbLon = elon;
+      final mhz = lat('sdrEnbCenterMhz');
+      sdrEnbCenterMhz = (mhz != null && mhz > 0) ? mhz : null;
+    }
   }
 }
 
@@ -174,8 +236,27 @@ class CameraConfirmationResult {
   final String note;
 }
 
+/// Calibration state machine (adaptive_baseline_spec.md): the
+/// deploy-time guided "Dial it in" routine plus the always-on ARTI
+/// updater. idle → calibrating → stable; degraded when the routine ran
+/// without a proper vacant window, or when ARTI suspect links pile up.
+enum CalibrationState {
+  /// No calibration performed this session.
+  idle,
+
+  /// Guided routine collecting a vacant window.
+  calibrating,
+
+  /// Guided routine finished on a proper vacant window.
+  stable,
+
+  /// Degraded-mode routine, or suspect links eroding trust.
+  degraded,
+}
+
 class AppState extends ChangeNotifier {
   AppState() {
+    _tripwire.attachAdaptiveBaseline(_adaptive);
     _loadLayout();
     _loadGpsOrigin();
     _loadZmetaSettings();
@@ -386,6 +467,40 @@ class AppState extends ChangeNotifier {
   Tripwire _tripwire = Tripwire();
   final Tracker _tracker = Tracker();
 
+  /// ARTI geometrically-gated online reference updater + guided
+  /// calibration routine (adaptive_baseline_spec.md). Sits next to the
+  /// tripwire, not inside it: detection stays deterministic; ARTI
+  /// never suppresses an alert. Survives settings changes (anchors
+  /// persist); the tripwire is re-attached on every rebuild.
+  final AdaptiveBaseline _adaptive = AdaptiveBaseline();
+
+  Tripwire _newTripwire() {
+    final tw = Tripwire(config: settings.tripwireConfig);
+    tw.attachAdaptiveBaseline(_adaptive);
+    return tw;
+  }
+
+  /// Calibration state machine + guided routine state.
+  CalibrationState calibrationState = CalibrationState.idle;
+  CalibrationRecord? lastCalibration;
+  String? calibrationNote;
+  DateTime? _calibStartAt;
+  int _calibQuietPolls = 0;
+  DateTime? _lastArtiStatsAt;
+
+  /// Bands with completed TX-power characterization
+  /// (rti_imaging_weights_spec §3). 'mesh' is characterized by the
+  /// guided routine; SDR bands join via [markBandCharacterized] after
+  /// the lab attenuator procedure passes (per-band fade levels agree
+  /// within 2 dB). Uncharacterized + deep-fade links are flagged in
+  /// health so the imager never silently trusts an uncalibrated band.
+  final Set<String> characterizedBands = {'mesh'};
+
+  void markBandCharacterized(String band) {
+    characterizedBands.add(band);
+    notifyListeners();
+  }
+
   /// One live poller per configured radio. Each driver polls on its own
   /// timer (an SNMP Harris radio won't keep up with a 4 Hz Silvus), and
   /// node IDs are driver-namespaced so link keys can never collide
@@ -421,9 +536,14 @@ class AppState extends ChangeNotifier {
   final Map<AlertKind, DateTime> _lastAlertAt = {};
 
   /// How far a CLEAR verdict can be trusted right now. Recomputed on
-  /// demand from radio status, link freshness and baseline resets.
+  /// demand from radio status, link freshness, baseline resets, ARTI
+  /// divergence-suspect links, fade levels, and uncalibrated bands.
   HealthReport get health {
     final now = DateTime.now();
+    final lastByLink = {
+      for (final e in history.entries)
+        if (e.value.isNotEmpty) e.key: e.value.last,
+    };
     return assessHealth(
       now: now,
       startedAt: _startedAt,
@@ -437,13 +557,29 @@ class AppState extends ChangeNotifier {
             error: p.status.error,
           ),
       ],
-      lastByLink: {
-        for (final e in history.entries)
-          if (e.value.isNotEmpty) e.key: e.value.last,
-      },
+      lastByLink: lastByLink,
       staleAfter: _staleAfter,
       rebaselines: _tripwire.rebaselinedAt,
+      suspectLinks: _adaptive.suspectLinkKeys,
+      fadeLevels: {
+        for (final e in lastByLink.entries) e.key: e.value.fadeLevel,
+      },
+      uncalibratedBands: _uncalibratedDeepFadeLinks(lastByLink),
     );
+  }
+
+  /// Link keys that are BOTH deep-fade and on an uncharacterized band —
+  /// the imager must never silently trust these (rti_imaging_weights).
+  Set<String> _uncalibratedDeepFadeLinks(
+      Map<String, LinkSample> lastByLink) {
+    final out = <String>{};
+    for (final e in lastByLink.entries) {
+      final band = bandChannelOf(e.key);
+      if (!characterizedBands.contains(band) && e.value.fadeLevel < -6.0) {
+        out.add(e.key);
+      }
+    }
+    return out;
   }
 
   /// Dashboard radio card data, rebuilt on every poll cycle.
@@ -585,6 +721,11 @@ class AppState extends ChangeNotifier {
 
   /// Latest shadow (attenuation) grid for the tracking map.
   List<ShadowCell> shadow = [];
+
+  /// Latest fused RTI disturbance image (rti_imaging_weights_spec):
+  /// probability mass over the ground plane — "estimated disturbance
+  /// location (ground projection)", never a located object.
+  List<RtiCell> rtiImage = [];
 
   /// Nodes the tracker actually uses: the sim's canonical layout in
   /// simulated mode, the user's own layout in live mode.
@@ -954,7 +1095,7 @@ class AppState extends ChangeNotifier {
     _tracker.reset();
     _clearTrackState();
     history.clear();
-    _tripwire = Tripwire(config: settings.tripwireConfig);
+    _tripwire = _newTripwire();
     _latestByPoller.clear();
     _lastSampleTs.clear();
     _lastFuse = null;
@@ -998,6 +1139,8 @@ class AppState extends ChangeNotifier {
           ? 'No radios enabled — add one in Settings'
           : 'Connecting…';
     }
+    // Re-arm the persisted Doppler geometry on the fresh drivers.
+    applySdrStationFromSettings();
     notifyListeners();
     for (final p in _pollers) {
       _tickPoller(p);
@@ -1083,7 +1226,7 @@ class AppState extends ChangeNotifier {
       await recorder.stop();
     }
     replaying = true;
-    _tripwire = Tripwire(config: settings.tripwireConfig);
+    _tripwire = _newTripwire();
     _tracker.reset();
     _clearTrackState();
     history.clear();
@@ -1189,6 +1332,16 @@ class AppState extends ChangeNotifier {
         }
       }
       _latestByPoller[_pollers.indexOf(p)] = enrichedAll;
+      // ARTI online updater (adaptive_baseline_spec.md): runs on every
+      // poll, silently. Detection already happened above — ARTI only
+      // adapts the reference layer beneath it and never suppresses an
+      // alert. Uses the previous fused track (1-cycle lag); the gates
+      // are statistical, not control-critical.
+      _updateAdaptiveBaseline(enrichedAll);
+      if (calibrationState == CalibrationState.calibrating) {
+        _accumulateCalibration(enrichedAll);
+      }
+      _maybeRecordArtiStats();
       final fresh = _tripwire.drainEvents();
       final classified = [
         for (final e in fresh) _classifyEvent(e, p.config.pollInterval),
@@ -1285,6 +1438,16 @@ class AppState extends ChangeNotifier {
       nodes: effectiveNodes,
       dipThreshold: settings.dipThreshold,
     );
+    // Fused RTI disturbance image (rti_imaging_weights_spec): two
+    // direction images with area-normalized weights, fused after
+    // weighting. Probability mass over the ground plane — an
+    // estimated disturbance location, never a located object.
+    rtiImage = _tracker.rtiImage(
+      samples: geo,
+      nodes: effectiveNodes,
+      dipThreshold: settings.dipThreshold,
+      bandOf: bandChannelOf,
+    );
     // Track stitching: the deterministic tracker fuses whatever is
     // disturbed right now; the stitcher watches for handoffs — a new
     // detection on one driver that continues a recently-quiet one on
@@ -1377,11 +1540,155 @@ class AppState extends ChangeNotifier {
     // ELRS Gemini signature: protocol-pattern existence evidence from
     // the SDR bridge (no geometry claimed -- see _elrsCorroborations).
     gated.addAll(_elrsCorroborations(now));
+    // CSI motion: upgrade-only corroboration, gated by the per-link
+    // health gates (wind / path-loss / imbalance).
+    gated.addAll(_csiCorroborations(now, t));
+    // Passive Doppler: velocity-consistency evidence; disagreement
+    // contributes exactly 0 and never touches C_RF.
+    gated.addAll(_dopplerCorroborations(now, t));
+    // WPP-IDP: upgrade-only existence evidence; moving-node events
+    // contribute exactly 0 (ego-motion gate).
+    gated.addAll(_wppIdpCorroborations(now));
     return mergeTrackConfidence(
       baseConfidence: rfCoreConfidence(linksUsed: t.linksUsed),
       contributions: gated,
       trackConsistent: _consistencyMonitor.consistent,
     );
+  }
+
+  /// CSI corroborations for the merger (esp32_csi_pipeline_spec.md).
+  ///
+  /// e_csi from the dev_hz band table (weak 0.05 / moderate 0.10 /
+  /// strong 0.15); w_csi = freshness · health · quality. Any gate
+  /// failure (wind-gated, link-budget-gated, stale, no wind source)
+  /// forces the weight to exactly 0 — the AV-FDTI zero-weight case.
+  /// While the track is INCONSISTENT all upgrades suspend (merger).
+  List<GatedCorroboration> _csiCorroborations(
+      DateTime now, TrackEstimate t) {
+    final out = <GatedCorroboration>[];
+    for (final p in _pollers) {
+      final d = p.driver;
+      if (d is! GenericSensorDriver) continue;
+      for (final o in d.liveCsiObservations(now)) {
+        final h = d.csiHealthFor(o.sensorId, now);
+        if (!h.enabled) continue; // gated ⇒ weight exactly 0
+        final e = csiBoostFor(o.devHz);
+        if (e <= 0) continue; // below the noise floor: no claim
+        final q = _csiGeometryQuality(o, t);
+        final w = reliabilityGate(
+          alignmentQuality: q,
+          age: now.difference(o.timestamp),
+          stalenessHorizon: CsiObservation.stalenessHorizon,
+          sourceHealthy: true,
+        );
+        if (w <= 0) continue;
+        out.add(GatedCorroboration(
+          sensorId: 'csi:${o.sensorId}',
+          boost: e,
+          gateWeight: w,
+          note: 'CSI ${o.devHz.toStringAsFixed(1)} Hz consistent with '
+              'track (link association)',
+        ));
+      }
+    }
+    return out;
+  }
+
+  /// Geometry-alignment quality for a CSI observation: the motion is
+  /// attributed to the sniffed AP link, so quality is the proximity of
+  /// the track to the sniffing node (the only endpoint we know).
+  /// Heuristic 0..1, documented as such — misalignment ⇒ ~0 weight.
+  double _csiGeometryQuality(CsiObservation o, TrackEstimate t) {
+    final lat = o.sensorLat;
+    final lon = o.sensorLon;
+    final origin = gpsOrigin;
+    if (lat == null || lon == null || origin == null) return 0.0;
+    final m = latLonToMeters(lat, lon, origin.lat, origin.lon);
+    final dx = t.x - m.x;
+    final dy = t.y - m.y;
+    final dist = math.sqrt(dx * dx + dy * dy);
+    return (1 - dist / 60.0).clamp(0.0, 1.0);
+  }
+
+  /// Doppler corroborations for the merger
+  /// (doppler_refinement_spec.md): velocity-consistency evidence,
+  /// boost 0.10. w_dop = freshness · health · quality; ref-unlocked ⇒
+  /// 0; disagreement or sub-bar ⇒ exactly 0 (never subtractive).
+  List<GatedCorroboration> _dopplerCorroborations(
+      DateTime now, TrackEstimate t) {
+    final out = <GatedCorroboration>[];
+    for (final p in _pollers) {
+      final d = p.driver;
+      if (d is! SdrDriver) continue;
+      final sx = d.stationX, sy = d.stationY, ex = d.enbX, ey = d.enbY;
+      if (sx == null || sy == null || ex == null || ey == null) {
+        continue; // unconfigured stations: the correlator abstains
+      }
+      final v = DopplerCorrelator.correlate(
+        track: t,
+        refs: d.recentDopplerRefs,
+        now: now,
+        radioX: sx,
+        radioY: sy,
+        enbX: ex,
+        enbY: ey,
+      );
+      if (!v.qualified) continue; // disagreement ⇒ exactly 0
+      final newest = v.newestAgreementAt;
+      final age = newest == null
+          ? DopplerCorrelator.agreementWindow
+          : now.difference(newest);
+      final w = reliabilityGate(
+        alignmentQuality: v.score,
+        age: age,
+        stalenessHorizon: kDopplerStalenessHorizon,
+        sourceHealthy: _sdrSourceHealthy(now),
+      );
+      if (w <= 0) continue;
+      out.add(GatedCorroboration(
+        sensorId: 'doppler:${d.host}:${d.port}',
+        boost: kDopplerBoost,
+        gateWeight: w,
+        note: 'Doppler radial velocity consistent with track '
+            '(${v.agreements} agreements)',
+      ));
+    }
+    return out;
+  }
+
+  /// WPP-IDP corroborations for the merger
+  /// (passive_radar_wpp_idp_spec.md): upgrade-only existence evidence,
+  /// boost 0.10. Moving-node events contribute exactly 0 (ego-motion
+  /// gate); micro-Doppler is never identity (Kozlov constraint).
+  List<GatedCorroboration> _wppIdpCorroborations(DateTime now) {
+    final out = <GatedCorroboration>[];
+    for (final p in _pollers) {
+      final d = p.driver;
+      if (d is! SdrDriver) continue;
+      for (final w in d.recentWppIdp) {
+        // Ego-motion gate: moving-node events contribute exactly 0.
+        if (!w.mergesIntoConfidence) continue;
+        final age = now.difference(w.t);
+        if (age.isNegative || age > kWppIdpStalenessHorizon) continue;
+        // Quality from strength over a 3 dB floor (starting estimate).
+        final q = ((w.strength - 3.0) / 12.0).clamp(0.0, 1.0);
+        final gw = reliabilityGate(
+          alignmentQuality: q,
+          age: age,
+          stalenessHorizon: kWppIdpStalenessHorizon,
+          sourceHealthy: _sdrSourceHealthy(now),
+        );
+        if (gw <= 0) continue;
+        final a = w.assess();
+        out.add(GatedCorroboration(
+          sensorId: 'wpp_idp:${w.radio}',
+          boost: kWppIdpBoost,
+          gateWeight: gw,
+          note: a.label + (a.rcsMismatch ? ' — RCS MISMATCH FLAGGED' : ''),
+        ));
+      }
+    }
+    return out;
   }
 
   /// Source health for one observation: the producing driver must be
@@ -1414,7 +1721,318 @@ class AppState extends ChangeNotifier {
     track = null;
     trackConfidence = null;
     trackConsistency = null;
+    rtiImage = const [];
     _consistencyMonitor.reset();
+  }
+
+  // ---- Adaptive baseline (ARTI) + guided calibration ----
+
+  /// Band/channel label for calibration and imaging tables: SDR
+  /// virtual links carry `sdr:band-<label>`; mesh links are 'mesh'.
+  static String bandChannelOf(String linkKey) {
+    final m = RegExp(r'sdr:band-([a-z0-9]+)', caseSensitive: false)
+        .firstMatch(linkKey);
+    if (m != null) return m.group(1)!;
+    return 'mesh';
+  }
+
+  /// Feed one poll's enriched samples through the ARTI updater.
+  void _updateAdaptiveBaseline(List<LinkSample> samples) {
+    final now = DateTime.now();
+    final arti = <ArtiSample>[];
+    for (final s in samples) {
+      final level = s.snr;
+      if (level == null || !level.isFinite) continue;
+      final th = s.effectiveThreshold(settings.dipThreshold);
+      final ch = bandChannelOf(s.linkKey);
+      for (final dir in const ['dip', 'rise']) {
+        arti.add(ArtiSample(
+          linkKey: s.linkKey,
+          channel: ch,
+          direction: dir,
+          level: level,
+          madThreshold: th,
+        ));
+      }
+    }
+    _adaptive.update(
+      now: now,
+      samples: arti,
+      tracks: track == null ? const [] : [track!],
+      nodes: effectiveNodes,
+      heldLinks: _tripwire.heldLinkPolls,
+    );
+  }
+
+  /// Collect static RSS into the guided routine's accumulator while
+  /// calibrating. Only nodes flagging `calib` in their beacon count
+  /// toward the fit (a node mid-reboot must not contaminate it);
+  /// mesh (non-ESP32) links are always eligible.
+  void _accumulateCalibration(List<LinkSample> samples) {
+    final calibNodes = <String>{};
+    for (final p in _pollers) {
+      final d = p.driver;
+      if (d is Esp32Driver) calibNodes.addAll(d.calibNodes);
+    }
+    for (final s in samples) {
+      final level = s.snr;
+      if (level == null || !level.isFinite) continue;
+      if (driverOf(s.fromNode) == 'esp32' &&
+          !calibNodes.contains(s.fromNode.replaceFirst('esp32:', ''))) {
+        continue;
+      }
+      _adaptive.observeCalibration(
+        linkKey: s.linkKey,
+        channel: bandChannelOf(s.linkKey),
+        rssi: level,
+      );
+    }
+    if (track == null) _calibQuietPolls++;
+  }
+
+  /// Throttled ARTI runtime-stats persistence (1/min aggregates).
+  void _maybeRecordArtiStats() {
+    final now = DateTime.now();
+    final last = _lastArtiStatsAt;
+    if (last != null &&
+        now.difference(last) < const Duration(seconds: 60)) {
+      return;
+    }
+    _lastArtiStatsAt = now;
+    unawaited(recorder.recordJson(_adaptive.stats.toJson(now)));
+  }
+
+  /// Begin the deploy-time guided "Dial it in" routine. The operator
+  /// emplaces nodes, taps Calibrate, stands clear 30–60 s, then nudges
+  /// the named worst node and taps Re-measure until fade levels stop
+  /// improving (or Done). Degraded mode runs on whatever quiet the
+  /// tactical situation allows, and says so.
+  void startCalibration({bool degradedMode = false}) {
+    _adaptive.beginGuidedCalibration(degraded: degradedMode);
+    calibrationState = CalibrationState.calibrating;
+    _calibStartAt = DateTime.now();
+    _calibQuietPolls = 0;
+    calibrationNote = degradedMode
+        ? 'DEGRADED MODE — running on whatever quiet is available; '
+            'fade levels are provisional'
+        : 'VACANT WINDOW — keep the area clear for 30–60 s';
+    notifyListeners();
+  }
+
+  /// One nudge/re-measure round done (operator moved the named node).
+  void calibrationNudgeRound() {
+    _adaptive.nudgeRound();
+    notifyListeners();
+  }
+
+  /// Finish the routine: fit path loss, rank links by fade level, set
+  /// mu_calib anchors, persist the calibration record.
+  Future<void> finishCalibration() async {
+    final start = _calibStartAt;
+    final vacantSecs = start == null
+        ? 0.0
+        : _calibQuietPolls * settings.pollInterval;
+    final record = _adaptive.finishGuidedCalibration(
+      nodes: effectiveNodes,
+      vacantSecs: vacantSecs,
+    );
+    _calibStartAt = null;
+    if (record == null) {
+      calibrationState = CalibrationState.idle;
+      calibrationNote = 'NO SAMPLES COLLECTED — routine discarded';
+    } else {
+      lastCalibration = record;
+      calibrationState = record.degraded
+          ? CalibrationState.degraded
+          : CalibrationState.stable;
+      calibrationNote = record.degraded
+          ? 'CALIBRATED (DEGRADED MODE) — ${record.links.length} link-channels'
+          : 'CALIBRATED — ${record.links.length} link-channels, '
+              'worst: ${record.worstFirst.isEmpty ? '—' : record.worstFirst.first.link}';
+      unawaited(recorder.recordJson(record.toJson()));
+    }
+    notifyListeners();
+  }
+
+  /// Abort the routine without anchoring anything.
+  void cancelCalibration() {
+    _adaptive.cancelGuidedCalibration();
+    calibrationState = CalibrationState.idle;
+    calibrationNote = null;
+    _calibStartAt = null;
+    notifyListeners();
+  }
+
+  /// Worst-link ranking for the guided routine: worst fade first.
+  List<CalibrationLink> get calibrationWorstLinks =>
+      lastCalibration?.worstFirst ?? const [];
+
+  /// Owning-node summary for the ranked list, e.g.
+  /// "RAPTOR-2 owns 4 of the 5 worst links".
+  String get calibrationOwnerSummary {
+    final worst = calibrationWorstLinks.take(5).toList();
+    if (worst.isEmpty) return '';
+    final counts = <String, int>{};
+    for (final l in worst) {
+      for (final id in l.link.split(' → ')) {
+        counts[id] = (counts[id] ?? 0) + 1;
+      }
+    }
+    final top = counts.entries
+        .reduce((a, b) => a.value >= b.value ? a : b);
+    final name = nodePositions[top.key]?.displayName ?? top.key;
+    return '$name owns ${top.value} of the ${worst.length} worst links';
+  }
+
+  /// ARTI suspect links (divergence safeguard froze them).
+  Set<String> get suspectLinks => _adaptive.suspectLinkKeys;
+
+  // ---- CSI / Doppler / WPP-IDP evidence lines + merger wiring ----
+
+  /// CSI evidence lines for the evidence view. Honesty wording only:
+  /// "Possible … consistent with …" — never identity.
+  List<String> get csiEvidenceLines {
+    final now = DateTime.now();
+    final lines = <String>[];
+    for (final p in _pollers) {
+      final d = p.driver;
+      if (d is! GenericSensorDriver) continue;
+      for (final o in d.liveCsiObservations(now)) {
+        final h = d.csiHealthFor(o.sensorId, now);
+        final band = csiBoostFor(o.devHz);
+        if (band <= 0) continue;
+        final cls = switch (o.band) {
+          CsiBand.smallMover => 'small-mover',
+          CsiBand.personAnimal => 'person/animal-class',
+          CsiBand.vehicleClass => 'vehicle-class',
+          CsiBand.noise => 'noise',
+        };
+        lines.add(h.enabled
+            ? 'Possible $cls disturbance (CSI ${o.devHz.toStringAsFixed(1)} Hz) — '
+                'consistent with motion on the sniffed link'
+            : 'CSI ${o.devHz.toStringAsFixed(1)} Hz on ${o.sensorId} — '
+                'gated (${h.reason}); contributes nothing');
+      }
+      final flips = d.csiGateEvents;
+      for (final g in flips.skip(
+          flips.length > 3 ? flips.length - 3 : 0)) {
+        lines.add(g);
+      }
+    }
+    return lines;
+  }
+
+  /// Doppler evidence lines for the evidence view.
+  List<String> get dopplerEvidenceLines {
+    final now = DateTime.now();
+    final lines = <String>[];
+    for (final p in _pollers) {
+      final d = p.driver;
+      if (d is! SdrDriver) continue;
+      final refs = d.recentDopplerRefs;
+      if (refs.isEmpty) continue;
+      final locked = refs.where((r) => r.refLocked).toList();
+      if (locked.length < refs.length) {
+        lines.add('Doppler reference unlocked on ${d.host}:${d.port} — '
+            'no coherent measurement, contributes nothing');
+      }
+      final t = track;
+      final sx = d.stationX, sy = d.stationY, ex = d.enbX, ey = d.enbY;
+      if (t == null || sx == null || sy == null || ex == null || ey == null) {
+        continue;
+      }
+      final v = DopplerCorrelator.correlate(
+        track: t,
+        refs: refs,
+        now: now,
+        radioX: sx,
+        radioY: sy,
+        enbX: ex,
+        enbY: ey,
+      );
+      if (v.qualified) {
+        lines.add('Doppler radial velocity consistent with track '
+            '(${v.agreements} agreement${v.agreements == 1 ? '' : 's'})');
+      } else if (v.agreements > 0) {
+        lines.add('Doppler peaks present but below the agreement bar — '
+            'contributes nothing (disagreement never downgrades a track)');
+      }
+    }
+    return lines;
+  }
+
+  /// WPP-IDP evidence lines for the evidence view.
+  List<String> get wppIdpEvidenceLines {
+    final now = DateTime.now();
+    final lines = <String>[];
+    for (final p in _pollers) {
+      final d = p.driver;
+      if (d is! SdrDriver) continue;
+      for (final w in d.recentWppIdp) {
+        if (now.difference(w.t) > SdrDriver.wppIdpWindow) continue;
+        if (!w.nodeStatic) {
+          lines.add('WPP-IDP detection from moving node ${w.radio} — '
+              'R&D logging only, contributes nothing (ego-motion gate)');
+          continue;
+        }
+        final a = w.assess();
+        lines.add(a.label +
+            (a.rcsMismatch ? ' — RCS MISMATCH FLAGGED' : ''));
+      }
+    }
+    return lines;
+  }
+
+  /// Operator-configured station data for the Doppler correlator
+  /// (field-local meters): the SDR radio's position and the LTE eNB's
+  /// position. Without both, the correlator abstains.
+  void setSdrStation({
+    required double stationX,
+    required double stationY,
+    required double enbX,
+    required double enbY,
+  }) {
+    for (final p in _pollers) {
+      final d = p.driver;
+      if (d is SdrDriver) {
+        d.stationX = stationX;
+        d.stationY = stationY;
+        d.enbX = enbX;
+        d.enbY = enbY;
+      }
+    }
+    notifyListeners();
+  }
+
+  /// Push the persisted SDR station / LTE eNB geometry (Settings → SDR
+  /// station) to the SDR drivers for the Doppler correlator.
+  ///
+  /// Lat/lon → field-local meters via the GPS field origin when one is
+  /// set; otherwise the station itself is the local origin (0,0) and
+  /// the eNB is placed relative to it. No-op until all four
+  /// coordinates are configured — the correlator abstains without
+  /// them (silence, never a guess). Called on start() so a restart
+  /// re-arms the persisted geometry, and after settings are saved.
+  void applySdrStationFromSettings() {
+    final s = settings;
+    final slat = s.sdrStationLat;
+    final slon = s.sdrStationLon;
+    final elat = s.sdrEnbLat;
+    final elon = s.sdrEnbLon;
+    if (slat == null || slon == null || elat == null || elon == null) {
+      return;
+    }
+    final origin = gpsOrigin;
+    final refLat = origin?.lat ?? slat;
+    final refLon = origin?.lon ?? slon;
+    final st = latLonToMeters(slat, slon, refLat, refLon);
+    final en = latLonToMeters(elat, elon, refLat, refLon);
+    setSdrStation(
+      stationX: st.x,
+      stationY: st.y,
+      enbX: en.x,
+      enbY: en.y,
+    );
   }
 
   DateTime? _lastFuse;

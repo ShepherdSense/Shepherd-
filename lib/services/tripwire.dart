@@ -2,6 +2,7 @@ import 'dart:collection';
 import 'dart:math' as math;
 
 import '../models/link_sample.dart';
+import 'adaptive_baseline.dart';
 
 /// Tunables for the tripwire detector. Mirrors silvus_tripwire.py defaults,
 /// plus the adaptive-threshold and baseline-hold options.
@@ -157,6 +158,23 @@ class Tripwire {
   /// (lasting level change). Diagnostic.
   int get rebaselineCount => _rebaselines;
 
+  /// Links currently holding their baseline during a continuous
+  /// disturbance, with the held-poll count. The ARTI layer reads this
+  /// so its stats can carry the drift-compensated mu at hold start/end.
+  Map<String, int> get heldLinkPolls => Map.unmodifiable(_held);
+
+  /// Attach the ARTI calibration layer (adaptive_baseline.dart). The
+  /// detector keeps its own rolling-median baseline and thresholds;
+  /// ARTI only supplies (a) mu_calib anchors, (b) drift-compensated mu
+  /// for the fade-level computation, and (c) phi sign for the
+  /// fade-signed deviation. Detection stays deterministic — ARTI never
+  /// suppresses an alert.
+  void attachAdaptiveBaseline(AdaptiveBaseline adaptive) {
+    _adaptive = adaptive;
+  }
+
+  AdaptiveBaseline? _adaptive;
+
   /// When each link last gave up holding its baseline. After a reset the
   /// detector treats the new level as normal, so anything still standing
   /// there is invisible; callers should surface this, not show CLEAR.
@@ -187,6 +205,13 @@ class Tripwire {
     var threshold = config.dipThreshold;
     var dev = 0.0;
     var direction = 'dip';
+    // Direction-split Δr and per-link fade level: first-class outputs
+    // for the imaging layer (rti_imaging_weights_spec.md). Computed
+    // alongside — never folded into |Δr| — and purely additive: the
+    // detection logic below is untouched.
+    var deltaDown = 0.0;
+    var deltaUp = 0.0;
+    var fadeLevel = 0.0;
 
     if (trusted) {
       final sorted = hist.toList()..sort();
@@ -197,6 +222,9 @@ class Tripwire {
         final sign = _expectedSign(key);
         final d = baseline - snr;
         final r = snr - baseline;
+        deltaDown = math.max(0.0, d);
+        deltaUp = math.max(0.0, r);
+        fadeLevel = _fadeLevel(key);
         if (sign > 0) {
           dev = d;
           direction = 'dip';
@@ -318,7 +346,13 @@ class Tripwire {
       _resetEpisode(key);
     }
 
-    return raw.copyWith(dip: dev, baseline: baseline, threshold: threshold);
+    return raw.copyWith(
+        dip: dev,
+        deltaDown: deltaDown,
+        deltaUp: deltaUp,
+        fadeLevel: fadeLevel,
+        baseline: baseline,
+        threshold: threshold);
   }
 
   /// Take and clear confirmed events.
@@ -335,21 +369,50 @@ class Tripwire {
     _varFired.remove(key);
   }
 
-  /// Fade-level proxy for a link: its baseline median vs the network
-  /// median of link medians. Positive = anti-fade (expect dips),
-  /// negative = deep fade (expect rises). Wilson & Patwari 2012 use a
-  /// fitted path-loss model as the reference; the network median is the
-  /// honest no-model proxy. Needs 2+ links; a lone link is intermediate.
+  /// Fade-level proxy for a link: its reference level vs the network
+  /// median of link reference levels. Positive = anti-fade (expect
+  /// dips), negative = deep fade (expect rises). Wilson & Patwari
+  /// 2012 use a fitted path-loss model as the reference; the network
+  /// median is the honest no-model proxy. Needs 2+ links; a lone link
+  /// is intermediate.
+  ///
+  /// When the ARTI layer is attached and holds drift-compensated mu
+  /// for a link, that mu replaces the tripwire's own rolling median in
+  /// THIS computation only (spec feed (b)). The deviation baseline,
+  /// the MAD thresholds, and the detection decisions stay on the
+  /// tripwire's rolling-median history — detection stays deterministic.
   double _fadeLevel(String key) {
-    final med = _linkMedian[key];
-    if (med == null || _linkMedian.length < 2) return 0.0;
-    final all = _linkMedian.values.toList()..sort();
-    return med - _medianSorted(all);
+    final med = _artiMuFor(key) ?? _linkMedian[key];
+    if (med == null) return 0.0;
+    // Network reference on the same population: each link's
+    // drift-compensated mu where ARTI has one, the tripwire's own
+    // median where it abstains.
+    final refs = <double>[];
+    for (final k in _linkMedian.keys) {
+      refs.add(_artiMuFor(k) ?? _linkMedian[k]!);
+    }
+    if (refs.length < 2) return 0.0;
+    refs.sort();
+    return med - _medianSorted(refs);
   }
+
+  /// ARTI's drift-compensated mu for [key], or null when the adaptive
+  /// layer is absent / has no usable state for the link (abstains).
+  double? _artiMuFor(String key) => _adaptive?.muForLink(key);
 
   /// Expected disturbance sign: +1 dip (baseline−snr), −1 rise
   /// (snr−baseline), 0 intermediate (either may signal).
+  ///
+  /// When the ARTI layer is attached and has a learned phi sign for
+  /// this link, it takes precedence over the static fade-level rule
+  /// (the sign the estimator converged to beats the one the quiet
+  /// window guessed). When ARTI abstains (0), the existing rule stands.
   int _expectedSign(String key) {
+    final adaptive = _adaptive;
+    if (adaptive != null) {
+      final phiSign = adaptive.expectedDirectionSign(key);
+      if (phiSign != 0) return phiSign;
+    }
     if (!config.signedDetection) return 1;
     final f = _fadeLevel(key);
     if (f > config.fadeGate) return 1;

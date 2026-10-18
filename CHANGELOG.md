@@ -1,5 +1,102 @@
 # Changelog
 
+## v0.17.0 — 2026-10-18
+
+### ARTI adaptive baseline + dial-it-in calibration
+
+- **Adaptive baseline** (`lib/services/adaptive_baseline.dart`):
+  per-link reference levels that follow slow environmental drift
+  (diurnal/temperature creep) instead of re-tripping the tripwire
+  on it. Calibration sets the *reference* the detector compares
+  against — it never claims a target is present, never claims
+  identity, never improves sensing range.
+- **Dial-it-in calibration routine**: the operator walks the field
+  and captures the per-link baseline profile before an event — a
+  known-clean reference so deployment-day conditions, not
+  guesswork, define "quiet".
+
+### Direction-split, area-normalized RTI imaging weights
+
+- The shadow heatmap now weights link disturbances with
+  fade-signed, direction-split, area-normalized weights instead of
+  raw dip depth — blobs land where the link geometry says they
+  should, and each link's contribution scales with the ellipse area
+  it actually covers (spec: `docs/rti_imaging_weights_spec.md`).
+- Output is still a disturbance heatmap — blobs and trails, never
+  imagery, never identity, never fire-control-quality tracks.
+
+### ESP32 CSI motion pipeline
+
+- The field-kit node gains an outdoor-usable CSI motion channel:
+  Suzuki phase-cancellation averaging (commodity CSI phase usable
+  outdoors without regression sanitization), a wind gate
+  (`wind_gated` — no wind source, no CSI claim), and link-budget
+  gates that zero-weight the channel on weak links (the AV-FDTI
+  zero-weight case).
+- **Protocol**: two new additive `obs` verbs on the UDP JSON path
+  (port 49160) — `CSI` (`dev_hz`, `pairs_active`,
+  `path_loss_db`, `wind_gated`) and `WIND` (`wind_ms`,
+  `gust_ms`) — parsed by `sensor_protocol.dart`, feeding `e_csi`
+  into the §5a gated merger as existence evidence only (spec:
+  `docs/esp32_csi_pipeline_spec.md`; §5a addendum in
+  `docs/sensor_protocol_spec.md`).
+
+### Doppler-only track refinement
+
+- **Bridge** (`field_kit/sdr_bridge/doppler_detect.py`): RX-only —
+  listens to ambient LTE downlink (a signal the carrier transmits
+  anyway) and measures what moving objects do to it. A 0.5 s CPI
+  buys ~2 Hz Doppler resolution (~0.16 m/s radial velocity at
+  1.86 GHz) on ordinary SDR hardware.
+- **App** (`DopplerRef`/`DopplerCorrelator` in
+  `lib/services/radio_driver.dart`): a second opinion on a tripwire
+  track's motion — radial velocity, never a position. Upgrade-only
+  corroboration in the gated merger: Doppler agreement can raise
+  confidence; Doppler disagreement never deletes or downgrades a
+  track.
+
+### WPP-IDP passive radar (no-clean-reference)
+
+- **Bridge** (`field_kit/sdr_bridge/wpp_idp_detect.py`) +
+  reference implementation (`field_kit/passive_radar/wpp_idp.py`):
+  passive radar on signals of opportunity using the WPP-IDP
+  architecture — no clean reference signal required (per-packet
+  energy → DC removal → STFT chain, plus the waveform rule that
+  scores candidate illuminators before trusting a detection).
+- **App** (`WppIdpDoppler` in
+  `lib/services/radio_driver.dart`): wires detections into the
+  correlator pipeline.
+- **Constraint, test-enforced**: micro-Doppler is never used for
+  identity — it corroborates *motion*, never says *what*.
+  Meters-to-tens-of-meters, never fire-control quality (spec:
+  `docs/passive_radar_wpp_idp_spec.md`).
+
+### Validation benches
+
+- **AERPAW replay harness**
+  (`tools/stone_soup_bench/replay_aerpaw.py`): replays public
+  AERPAW flight-test data through the fusion machinery (gated
+  merger, innovation monitor, track stitcher). It validates the
+  *fusion machinery*, not Shepherd's sensing — AERPAW has no
+  RF-shadowing ground truth.
+- **ESP32 500 fps bench mode**: a one-measurement go/no-go test for
+  CSI frame-rate feasibility on the node firmware, run before the
+  CSI pipeline is trusted.
+- Spec: `docs/validation_benches_spec.md`.
+
+### Honesty contract (whole release)
+
+- RX-only, defensive-only: every feature in this release listens,
+  measures, and scores. Nothing transmits, jams, deauths, spoofs,
+  or probes.
+- Paper accuracy numbers are NOT transferred to Shepherd's regime
+  (6 nodes, dismounted, on the move, Group 2–3 UAS targets) — the
+  specs cite them with their original regimes attached. Features
+  are implemented per spec and bench-tested; **field validation is
+  pending**.
+- Wording stays "consistent with, never confirmed" wherever a
+  signature or micro-Doppler claim appears.
+
 ## v0.16.0 — 2026-10-17
 
 ### ELRS Gemini signature detection (protocol-pattern corroboration)

@@ -1,0 +1,16 @@
+{
+ "provenance": "synthetic-standin",
+ "label": "SYNTHETIC STAND-IN -- NOT AERPAW DATA. Schema mirrors Dickerson et al. arXiv:2512.14608 as documented in aerpaw_adapter.py. Deterministic seed recorded in the companion .meta.json.",
+ "seed": 20261018,
+ "paper": "Dickerson et al., arXiv:2512.14608",
+ "dataset_doi": "10.5061/dryad.7d7wm3898",
+ "dataset_download": "NOT OBTAINED (Dryad file streams HTTP 403, 2026-10-18)",
+ "files": {
+  "aerpaw_standin_truth.csv": "aerpaw_standin_truth.csv",
+  "aerpaw_standin_radar.csv": "aerpaw_standin_radar.csv",
+  "aerpaw_standin_rf.csv": "aerpaw_standin_rf.csv"
+ },
+ "n_truth": 240,
+ "n_radar": 224,
+ "n_rf": 14
+}

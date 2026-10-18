@@ -50,6 +50,61 @@ const double kMaxDisplayConfidence = 0.95;
 /// [rfCoreConfidence]); corroboration must always have headroom.
 const double kRfCoreCap = 0.80;
 
+// ---------------------------------------------------------------------------
+// CSI / Doppler / WPP-IDP evidence (v0.17.0).
+//
+// All three are EXISTENCE/CONSISTENCY evidence under the same
+// upgrade-only contract as every other sensor: they corroborate a
+// track the RF tripwire already supports, never originate one, never
+// subtract, and suspend while the track is INCONSISTENT. The merger
+// core ([mergeTrackConfidence]) is unchanged — these constants and
+// helpers only *instantiate* it for the new evidence types.
+//
+// Gate semantics (enforced at the wiring in app_state.dart):
+//  - wind_gated (CSI) ⇒ w_csi = 0 exactly (AV-FDTI zero-weight case).
+//  - link-budget/imbalance gated (CSI) ⇒ w_csi = 0 exactly.
+//  - ref_locked == false (Doppler) ⇒ w_dop = 0 exactly.
+//  - Doppler disagreement ⇒ contributes exactly 0, and never touches
+//    C_RF (a null is uninformative: tangential motion, payload-
+//    stripped RCS, or RF-quiet-to-this-geometry).
+//  - moving-node WPP-IDP events ⇒ contribute exactly 0 (ego-motion
+//    gate: the paper assumes a static receiver).
+// ---------------------------------------------------------------------------
+
+/// CSI Hz-deviation boost banding (esp32_csi_pipeline_spec.md):
+/// size-class heuristics with confidence, never identity. Starting
+/// estimates to field-calibrate, not constants.
+const double kCsiBoostWeak = 0.05; // 3–10 Hz, small-mover band
+const double kCsiBoostModerate = 0.10; // 10–30 Hz, person/animal class
+const double kCsiBoostStrong = 0.15; // > 30 Hz, vehicle-class
+
+/// CSI boost for a Hz-deviation: 0 below the 3 Hz noise floor, then
+/// the weak/moderate/strong banding. Capped below camera-motion
+/// class — a CSI deviation is corroboration, not a sighting.
+double csiBoostFor(double devHz) {
+  if (!devHz.isFinite || devHz < 3.0) return 0.0;
+  if (devHz < 10.0) return kCsiBoostWeak;
+  if (devHz < 30.0) return kCsiBoostModerate;
+  return kCsiBoostStrong;
+}
+
+/// Doppler boost class: velocity-consistency (doppler_refinement_spec).
+/// Below camera-motion's 0.15 — Doppler corroborates motion, not
+/// position or identity.
+const double kDopplerBoost = 0.10;
+
+/// WPP-IDP boost class: upgrade-only existence evidence
+/// (passive_radar_wpp_idp_spec). Meters-to-tens-of-meters perimeter
+/// evidence; never identity (Kozlov deception constraint).
+const double kWppIdpBoost = 0.10;
+
+/// Doppler staleness horizon: 60 s (Doppler arrives at 2 Hz but a
+/// track's velocity estimate evolves slowly).
+const Duration kDopplerStalenessHorizon = Duration(seconds: 60);
+
+/// WPP-IDP staleness horizon: 30 s (ENERGY-class cadence).
+const Duration kWppIdpStalenessHorizon = Duration(seconds: 30);
+
 /// How long an observation of each type stays admissible as
 /// corroboration. Past the horizon the observation carries no measured
 /// information about the *current* track — the AV-FDTI "degraded

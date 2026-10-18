@@ -14,6 +14,8 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart';
+
 import '../models/link_sample.dart';
 import '../models/tracking.dart';
 import 'silvus_api.dart';
@@ -591,6 +593,339 @@ class GeminiCorrelator {
   }
 }
 
+/// One passive-Doppler peak from the bridge's Doppler detector
+/// (doppler_refinement_spec.md). RX-only: the bridge listens to an
+/// ambient LTE downlink the carrier transmits anyway and measures what
+/// moving objects do to it. The output is RADIAL VELOCITY, not a
+/// position — it answers "the track's motion is Doppler-consistent".
+class DopplerRef {
+  DopplerRef({
+    required this.radio,
+    required this.centerMhz,
+    required this.dopplerHz,
+    required this.radialMs,
+    required this.snrDb,
+    required this.refLocked,
+    required this.t,
+  });
+
+  final String radio;
+  final double centerMhz;
+
+  /// Measured Doppler shift of the peak, Hz (signed).
+  final double dopplerHz;
+
+  /// Radial velocity implied at the tuned center, m/s.
+  /// Negative = approaching (documented convention).
+  final double radialMs;
+
+  /// Peak SNR over the clutter-canceled noise floor, dB.
+  final double snrDb;
+
+  /// Direct-path reference healthy. False ⇒ no coherent measurement;
+  /// the app treats it as zero weight.
+  final bool refLocked;
+  final DateTime t;
+
+  /// Parse a decoded bridge datagram. Null for wrong kinds/versions
+  /// and malformed packets (never throws).
+  static DopplerRef? tryParse(Map<String, dynamic> j) {
+    try {
+      if (j['v'] != 1 || j['kind'] != 'doppler_ref') return null;
+      double asDouble(String k) => (j[k] as num).toDouble();
+      final doppler = asDouble('doppler_hz');
+      final radial = asDouble('radial_ms');
+      final snr = asDouble('snr_db');
+      if (!doppler.isFinite || !radial.isFinite || !snr.isFinite) {
+        return null;
+      }
+      return DopplerRef(
+        radio: '${j['radio']}',
+        centerMhz: asDouble('center_mhz'),
+        dopplerHz: doppler,
+        radialMs: radial,
+        snrDb: snr,
+        refLocked: j['ref_locked'] == true,
+        t: DateTime.fromMillisecondsSinceEpoch(
+            ((j['t'] as num).toDouble() * 1000).round()),
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+}
+
+/// Verdict of the Doppler correlation: how many observed Doppler peaks
+/// agreed with the track's predicted bistatic radial velocity.
+class DopplerVerdict {
+  const DopplerVerdict({
+    required this.agreements,
+    required this.score,
+    required this.qualified,
+    this.newestAgreementAt,
+  });
+
+  final int agreements;
+
+  /// 1 − exp(−agreements/2) — saturating, like the ELRS scorers.
+  final double score;
+
+  /// True when ≥ 2 agreements, or a single > 12 dB SNR agreement (the
+  /// single-coincidence bar from the ELRS Urban-LoRa lesson).
+  final bool qualified;
+
+  final DateTime? newestAgreementAt;
+}
+
+/// App-side Doppler correlator (doppler_refinement_spec.md, Stage 2).
+///
+/// Predicted bistatic radial velocity of the RF tripwire track along
+/// the radio↔eNB geometry vs observed doppler_ref events in a 120 s
+/// window. Pure function over inputs: deterministic, unit-tested, no
+/// I/O. Station positions are operator-configured field-local meters
+/// (x east, y north) — the app converts from lat/lon with its GPS
+/// origin; this stays projection-free.
+///
+/// A Doppler DISAGREEMENT contributes exactly 0 and never deletes or
+/// downgrades the tripwire track: a null can mean tangential motion
+/// (zero radial component), a payload-stripped RCS ~22 dB below the
+/// brochure number, or the mover being RF-quiet to this geometry —
+/// none of which disproves the tripwire.
+class DopplerCorrelator {
+  /// How far back Doppler refs stay eligible for correlation.
+  static const agreementWindow = Duration(seconds: 120);
+
+  /// Minimum in-gate agreements for the score to count.
+  static const minAgreements = 2;
+
+  /// A single agreement above this SNR counts (high-SNR exception).
+  static const singleHighSnrDb = 12.0;
+
+  static DopplerVerdict correlate({
+    required TrackEstimate track,
+    required List<DopplerRef> refs,
+    required DateTime now,
+    required double radioX,
+    required double radioY,
+    required double enbX,
+    required double enbY,
+  }) {
+    final speed = track.speedMps;
+    final heading = track.headingDeg;
+    if (speed == null || heading == null || speed < 0.2) {
+      // No velocity estimate (or effectively stationary): nothing to
+      // predict — silence, not disagreement.
+      return const DopplerVerdict(
+          agreements: 0, score: 0.0, qualified: false);
+    }
+    // Track velocity vector (heading clockwise from north).
+    final hr = heading * math.pi / 180;
+    final vx = speed * math.sin(hr);
+    final vy = speed * math.cos(hr);
+    // Predicted bistatic radial velocity: v · (û_tx + û_rx) / 2, with
+    // û_tx = unit vector target→eNB, û_rx = target→radio.
+    var tx = enbX - track.x, ty = enbY - track.y;
+    var rx = radioX - track.x, ry = radioY - track.y;
+    final tl = math.sqrt(tx * tx + ty * ty);
+    final rl = math.sqrt(rx * rx + ry * ry);
+    if (tl < 1e-6 || rl < 1e-6) {
+      return const DopplerVerdict(
+          agreements: 0, score: 0.0, qualified: false);
+    }
+    tx /= tl;
+    ty /= tl;
+    rx /= rl;
+    ry /= rl;
+    // Sign convention (documented): approaching = negative, matching
+    // the bridge's radial_ms and the app tracker's velocity sign.
+    // v·û > 0 means moving toward the station ⇒ negate.
+    final predicted = -(vx * (tx + rx) + vy * (ty + ry)) / 2;
+    final gate = math.max(0.5, 0.25 * predicted.abs());
+
+    final cutoff = now.subtract(agreementWindow);
+    var agreements = 0;
+    var highSnrSingle = false;
+    DateTime? newest;
+    for (final r in refs) {
+      if (!r.refLocked) continue; // no reference, no measurement
+      if (r.t.isBefore(cutoff) || r.t.isAfter(now)) continue;
+      if ((predicted - r.radialMs).abs() <= gate) {
+        agreements++;
+        if (r.snrDb > singleHighSnrDb) highSnrSingle = true;
+        if (newest == null || r.t.isAfter(newest)) newest = r.t;
+      }
+    }
+    final qualified =
+        agreements >= minAgreements || (agreements == 1 && highSnrSingle);
+    return DopplerVerdict(
+      agreements: agreements,
+      score: 1 - math.exp(-agreements / 2),
+      qualified: qualified,
+      newestAgreementAt: newest,
+    );
+  }
+}
+
+/// One WPP-IDP Doppler-line detection (passive_radar_wpp_idp_spec.md).
+///
+/// Single-RX-channel, no-clean-reference passive radar: per-packet
+/// (preamble) energy → DC removal → STFT → Doppler-line detector.
+/// RX-only; listens to signals of opportunity. Output is a
+/// *disturbance bearing estimate* — never an identity, never a
+/// position fix. Demonstrated geometry is meters to tens of meters:
+/// a perimeter/area gap-filler, not a standoff sensor.
+class WppIdpDoppler {
+  WppIdpDoppler({
+    required this.radio,
+    required this.band,
+    required this.dopplerHz,
+    required this.strength,
+    required this.motionState,
+    required this.t,
+    this.bladeFlashHz,
+    this.rcsDbm2,
+  });
+
+  /// Radio/node id that produced the detection.
+  final String radio;
+  final String band;
+
+  /// Doppler line frequency, Hz (signed: sign gives inbound/outbound
+  /// relative to the baseline).
+  final double dopplerHz;
+
+  /// Detector strength (dB over the CFAR threshold).
+  final double strength;
+
+  /// 'static' or 'moving' — the NODE's motion state. The paper assumes
+  /// a static receiver; moving-node outputs are R&D logging only and
+  /// must not merge into track confidence (ego-motion gate).
+  final String motionState;
+
+  final DateTime t;
+
+  /// Blade-pass modulation frequency, Hz (opt) — ONE corroborating
+  /// feature behind the RCS-reasonableness gate, never identity
+  /// (Kozlov deception constraint: micro-Doppler is spoofable).
+  final double? bladeFlashHz;
+
+  /// Estimated RCS in dBsm (opt) — the counter-countermeasure the
+  /// deception paper itself names.
+  final double? rcsDbm2;
+
+  bool get nodeStatic => motionState == 'static';
+
+  /// Ego-motion gate (passive_radar_wpp_idp_spec.md): the paper assumes
+  /// a static receiver — node motion impresses its own slow amplitude
+  /// modulation on the packet-energy series and masquerades as Doppler.
+  /// Moving-node outputs are R&D logging only: they contribute exactly
+  /// 0 to track confidence. This is the predicate the merger wiring
+  /// uses; tested directly.
+  bool get mergesIntoConfidence => nodeStatic;
+
+  /// Parse a decoded bridge/node datagram. Null for wrong
+  /// kinds/versions and malformed packets (never throws).
+  static WppIdpDoppler? tryParse(Map<String, dynamic> j) {
+    try {
+      if (j['v'] != 1 || j['kind'] != 'wpp_idp_doppler') return null;
+      double asDouble(String k) => (j[k] as num).toDouble();
+      final doppler = asDouble('doppler_hz');
+      final strength = asDouble('strength');
+      if (!doppler.isFinite || !strength.isFinite) return null;
+      double? opt(String k) {
+        final v = j[k];
+        return v is num && v.isFinite ? v.toDouble() : null;
+      }
+
+      final ms = '${j['motion_state'] ?? ''}';
+      return WppIdpDoppler(
+        radio: '${j['radio']}',
+        band: '${j['band'] ?? ''}',
+        dopplerHz: doppler,
+        strength: strength,
+        // Fail-safe default: an unknown motion state is treated as
+        // moving (R&D logging only, never merged).
+        motionState: ms == 'static' ? 'static' : 'moving',
+        t: DateTime.fromMillisecondsSinceEpoch(
+            ((j['t'] as num).toDouble() * 1000).round()),
+        bladeFlashHz: opt('blade_flash_hz'),
+        rcsDbm2: opt('rcs_dbm2'),
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Honesty + deception-constraint assessment. The label ALWAYS says
+  /// "Possible"/"consistent with" — never a type assertion. A
+  /// textbook helicopter-like blade flash on a 250 g-quad RCS is
+  /// flagged as an RCS mismatch, not an identification.
+  WppIdpAssessment assess() {
+    final buf = StringBuffer(
+        'Possible moving reflector (WPP-IDP Doppler ${dopplerHz.toStringAsFixed(1)} Hz, '
+        'strength ${strength.toStringAsFixed(1)} dB) — consistent with a baseline crossing');
+    var mismatch = false;
+    String? rcsNote;
+    final bf = bladeFlashHz;
+    final rcs = rcsDbm2;
+    if (bf != null && bf.isFinite && bf > 0) {
+      buf.write('; blade-flash-like modulation ~${bf.toStringAsFixed(0)} Hz '
+          '(one corroborating feature, never identity)');
+      if (rcs != null && rcs.isFinite) {
+        mismatch = _rcsMismatch(bf, rcs);
+        if (mismatch) {
+          rcsNote =
+              'RCS-reasonableness gate: blade modulation implies a larger rotor class than '
+              '${rcs.toStringAsFixed(0)} dBsm supports — treating as possible deception/spoof, not identification';
+          buf.write('. $rcsNote');
+        }
+      }
+    }
+    return WppIdpAssessment(
+      label: buf.toString(),
+      rcsMismatch: mismatch,
+      note: rcsNote ?? '',
+    );
+  }
+
+  /// Coarse heuristic (documented, not physics): blade-pass frequency
+  /// implies a rotor-size class (WIDELY REPORTED: frequency = blade
+  /// count × RPM); RCS implies a size class. Differing by more than
+  /// one class step is flagged. This is the counter-countermeasure
+  /// the Kozlov paper names — a Mini 2 cannot have a helicopter's
+  /// RCS, so the lie fails the sanity check.
+  static bool _rcsMismatch(double bladeFlashHz, double rcsDbm2) {
+    final flashClass = bladeFlashHz >= 120
+        ? 2
+        : bladeFlashHz >= 40
+            ? 1
+            : 0;
+    final rcsClass = rcsDbm2 >= -5
+        ? 2
+        : rcsDbm2 >= -15
+            ? 1
+            : 0;
+    return (flashClass - rcsClass).abs() > 1;
+  }
+}
+
+/// Honesty/deception assessment of one WPP-IDP detection.
+class WppIdpAssessment {
+  const WppIdpAssessment({
+    required this.label,
+    required this.rcsMismatch,
+    required this.note,
+  });
+
+  /// User-facing text. Always "Possible"/"consistent with" — never a
+  /// type assertion, never "confirmed/located/identified".
+  final String label;
+
+  /// True when the blade-flash feature contradicts the RCS estimate.
+  final bool rcsMismatch;
+  final String note;
+}
+
 class SdrDriver extends RadioDriver {
   SdrDriver({required this.host, required this.port});
 
@@ -636,6 +971,26 @@ class SdrDriver extends RadioDriver {
   /// Latest bridge-local Gemini signature per radio (elrs_signature).
   final Map<String, ElrsSignature> _signatures = {};
 
+  /// Recent passive-Doppler peaks (doppler_ref events), oldest-first.
+  /// Bounded; pruned to [DopplerCorrelator.agreementWindow] in _handle.
+  final List<DopplerRef> _dopplerRefs = [];
+
+  /// Recent WPP-IDP Doppler-line detections, oldest-first.
+  /// Bounded; pruned to [_wppIdpWindow] in _handle.
+  final List<WppIdpDoppler> _wppIdp = [];
+
+  /// WPP-IDP observation window (120 s, like the ELRS/Doppler paths).
+  static const Duration wppIdpWindow = Duration(seconds: 120);
+
+  /// Operator-configured station data for the Doppler correlator
+  /// (field-local meters, x east / y north): the SDR radio's position
+  /// and the LTE eNB's position. Null until configured — the
+  /// correlator abstains without them (silence, never a guess).
+  double? stationX;
+  double? stationY;
+  double? enbX;
+  double? enbY;
+
   /// What the bridge last announced itself as ('' until first beacon).
   String get bridgeBackend => _bridgeBackend;
 
@@ -650,6 +1005,14 @@ class SdrDriver extends RadioDriver {
   List<ElrsSignature> get latestSignatures =>
       List.unmodifiable(_signatures.values);
 
+  /// Recent passive-Doppler peaks for the app-level correlator.
+  /// Read-only: pruning happens in _handle, never here.
+  List<DopplerRef> get recentDopplerRefs => List.unmodifiable(_dopplerRefs);
+
+  /// Recent WPP-IDP Doppler-line detections. Read-only: pruning
+  /// happens in _handle, never here.
+  List<WppIdpDoppler> get recentWppIdp => List.unmodifiable(_wppIdp);
+
   Future<void> _ensureSocket() async {
     if (_socket != null) return;
     // `InternetAddress(host)` throws for anything but an IP literal;
@@ -658,8 +1021,12 @@ class SdrDriver extends RadioDriver {
     _socket = await RawDatagramSocket.bind(ip, port);
   }
 
-  void _handle(List<int> data) {
-    Map<String, dynamic>? j;
+  /// Test hook: feed one raw UDP datagram body through the parser.
+  @visibleForTesting
+  void datagramForTest(String text) =>
+      _handle(utf8.encode(text));
+
+  void _handle(List<int> data) {    Map<String, dynamic>? j;
     try {
       j = jsonDecode(utf8.decode(data)) as Map<String, dynamic>;
     } catch (_) {
@@ -694,6 +1061,35 @@ class SdrDriver extends RadioDriver {
       final s = ElrsSignature.tryParse(j);
       if (s != null) {
         _signatures[s.radio] = s;
+        _lastDataAt = DateTime.now();
+      }
+      return;
+    }
+    // Passive-Doppler peaks: additive, older bridges never send them.
+    if (j['kind'] == 'doppler_ref') {
+      final r = DopplerRef.tryParse(j);
+      if (r != null) {
+        _dopplerRefs.add(r);
+        if (_dopplerRefs.length > 300) {
+          _dopplerRefs.removeRange(0, _dopplerRefs.length - 300);
+        }
+        final cutoff =
+            DateTime.now().subtract(DopplerCorrelator.agreementWindow);
+        _dopplerRefs.removeWhere((e) => e.t.isBefore(cutoff));
+        _lastDataAt = DateTime.now();
+      }
+      return;
+    }
+    // WPP-IDP Doppler lines: additive, same transport.
+    if (j['kind'] == 'wpp_idp_doppler') {
+      final w = WppIdpDoppler.tryParse(j);
+      if (w != null) {
+        _wppIdp.add(w);
+        if (_wppIdp.length > 300) {
+          _wppIdp.removeRange(0, _wppIdp.length - 300);
+        }
+        final cutoff = DateTime.now().subtract(wppIdpWindow);
+        _wppIdp.removeWhere((e) => e.t.isBefore(cutoff));
         _lastDataAt = DateTime.now();
       }
       return;
@@ -786,6 +1182,8 @@ class SdrDriver extends RadioDriver {
     _arrivedAt.clear();
     _chirps.clear();
     _signatures.clear();
+    _dopplerRefs.clear();
+    _wppIdp.clear();
   }
 }
 

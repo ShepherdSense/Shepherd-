@@ -17,8 +17,14 @@ import 'sensor_overlay.dart';
 /// Honest by construction: altitude shows "unknown" when nodes are
 /// coplanar, heading/speed appear only once the target moves between
 /// fixes, and the type guess is always labeled low-confidence.
-class TrackingScreen extends StatefulWidget {
-  const TrackingScreen({super.key, required this.state});
+/// UI label for the fused RTI disturbance image (rti_imaging_weights).
+/// Honesty contract: "estimated disturbance location (ground
+/// projection)" — probability mass over the ground plane, never a
+/// located object, never an identified target, never confirmed.
+const String rtiImageLabel =
+    'ESTIMATED DISTURBANCE LOCATION (GROUND PROJECTION)';
+
+class TrackingScreen extends StatefulWidget {  const TrackingScreen({super.key, required this.state});
 
   final AppState state;
 
@@ -32,6 +38,9 @@ class _TrackingScreenState extends State<TrackingScreen> {
 
   /// Shadow (attenuation) heatmap overlay on the field map.
   bool _showShadow = true;
+
+  /// Fused RTI disturbance image overlay (rtiImageLabel).
+  bool _showRti = true;
 
   /// Node health overlay: recolor node dots by link freshness
   /// (green/amber/red/grey) instead of driver color.
@@ -122,6 +131,10 @@ class _TrackingScreenState extends State<TrackingScreen> {
                     _showShadow ? 'SHADOW ON' : 'SHADOW OFF'),
               ),
               TextButton(
+                onPressed: () => setState(() => _showRti = !_showRti),
+                child: Text(_showRti ? 'RTI ON' : 'RTI OFF'),
+              ),
+              TextButton(
                 onPressed: () =>
                     setState(() => _showHealth = !_showHealth),
                 child: Text(
@@ -146,6 +159,13 @@ class _TrackingScreenState extends State<TrackingScreen> {
             'DRAG NODES TO THEIR REAL SPOTS. DRAG THE RED MARKER TO MOVE THE DEFENDED POINT. '
             'THE SHADOW IS WHERE THE RF FIELD DIMS — WHAT THE WAVES ARE HITTING. '
             'SCROLL OR USE +/− TO ZOOM. ONE MAP, EVERY RADIO: NODE COLORS MARK THE DRIVER.',
+            style: SentryType.section(10),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            'FUSED IMAGE: $rtiImageLabel — PROBABILITY MASS OVER THE GROUND PLANE FROM THE '
+            'DIRECTION-SPLIT, AREA-NORMALIZED RTI LAYER. AN ESTIMATE OF WHERE THE FIELD IS '
+            'DISTURBED — NEVER A POSITION FIX, NEVER AN IDENTIFICATION.',
             style: SentryType.section(10),
           ),
           const SizedBox(height: 8),
@@ -205,6 +225,8 @@ class _TrackingScreenState extends State<TrackingScreen> {
                     track: state.track,
                     shadow: state.shadow,
                     showShadow: _showShadow,
+                    rti: state.rtiImage,
+                    showRti: _showRti,
                     showHealth: _showHealth,
                     nodeHealth: _showHealth ? state.nodeHealthMap : const {},
                   ),
@@ -422,6 +444,21 @@ class _TrackingScreenState extends State<TrackingScreen> {
             _row('TYPE GUESS', '${t.typeGuess} — LOW CONFIDENCE',
                 SentryColors.muted),
             _row('LINKS USED', '${t.linksUsed}', SentryColors.muted),
+            if (state.trackConfidence != null)
+              _row(
+                'CONFIDENCE',
+                '${(state.trackConfidence!.displayed * 100).toStringAsFixed(0)}% EST'
+                ' — RF ${(state.trackConfidence!.base * 100).toStringAsFixed(0)}%'
+                '${state.trackConfidence!.upgrade > 0.005 ? ' +${(state.trackConfidence!.upgrade * 100).toStringAsFixed(0)}% ${state.trackConfidence!.applied.length} SENSOR${state.trackConfidence!.applied.length == 1 ? '' : 'S'}' : ''}',
+                SentryColors.green,
+              ),
+            if (state.trackConsistency != null &&
+                !state.trackConsistency!.consistent)
+              _row(
+                'TRACK STATE',
+                'INCONSISTENT — ${state.trackConsistency!.reason ?? 'fix jumps exceed the motion model'}',
+                SentryColors.red,
+              ),
             if (t.stitchLabel != null)
               _row(
                   'STITCH',
@@ -839,6 +876,8 @@ class _TrackingMapPainter extends CustomPainter {
     required this.track,
     required this.shadow,
     required this.showShadow,
+    this.rti = const [],
+    this.showRti = true,
     this.showHealth = false,
     this.nodeHealth = const {},
   });
@@ -850,6 +889,10 @@ class _TrackingMapPainter extends CustomPainter {
   final TrackEstimate? track;
   final List<ShadowCell> shadow;
   final bool showShadow;
+
+  /// Fused RTI disturbance image cells ([rtiImageLabel]).
+  final List<RtiCell> rti;
+  final bool showRti;
 
   /// When true, node dots are colored by link freshness instead of
   /// driver color. Disturbed nodes still glow amber on top.
@@ -944,6 +987,31 @@ class _TrackingMapPainter extends CustomPainter {
             Paint()
               ..color = SentryColors.orange
                   .withAlpha((c.v * 150 * fall).round()));
+      }
+    }
+
+    // Fused RTI disturbance image (rti_imaging_weights_spec): purple
+    // probability-mass discs, drawn under the track dot. This is the
+    // estimated disturbance location (ground projection) — never a
+    // located object.
+    if (showRti && rti.isNotEmpty) {
+      final rr = 2.2 * tr.scale * 0.85;
+      for (final c in rti) {
+        canvas.drawCircle(
+            tr.toScreen(c.x, c.y),
+            rr,
+            Paint()
+              ..color =
+                  SentryColors.purple.withAlpha((c.v * 110).round()));
+      }
+      for (final c in rti) {
+        if (c.v < 0.55) continue;
+        canvas.drawCircle(
+            tr.toScreen(c.x, c.y),
+            rr * 0.55,
+            Paint()
+              ..color =
+                  SentryColors.purple.withAlpha((c.v * 170).round()));
       }
     }
 

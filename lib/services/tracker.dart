@@ -32,12 +32,29 @@ class Tracker {
   Tracker(
       {this.fixMinIntervalSecs = 1.5,
       this.idleResetSecs = 10.0,
-      this.sigma = 11.0});
+      this.sigma = 11.0}) {
+    imagingBands['default'] = ImagingBandParams.defaults();
+    imagingBands['mesh'] = ImagingBandParams.defaults();
+  }
 
   final List<_Fix> _fixes = [];
   double? _vx;
   double? _vy;
   DateTime? _lastDetect;
+
+  /// Per-band imaging parameter tables for the RTI layer
+  /// ([TrackerImaging]); 'default'/'mesh' seeded in the constructor.
+  final Map<String, ImagingBandParams> _imagingBands = {};
+
+  /// Band label for an undirected pair key, for the imaging tables:
+  /// SDR virtual links carry `sdr:band-<label>`; mesh links are 'mesh'.
+  static String _bandOfLink(String pairKey) {
+    final m =
+        RegExp(r'sdr:band-([a-z0-9]+)', caseSensitive: false)
+            .firstMatch(pairKey);
+    if (m != null) return m.group(1)!;
+    return 'mesh';
+  }
 
   /// Fuse one poll of enriched samples into a track, or null when
   /// nothing is currently disturbed.
@@ -504,4 +521,491 @@ class _Fix {
   final DateTime t;
   final double x;
   final double y;
+}
+
+// ---------------------------------------------------------------------------
+// RTI imaging weights — multi-scale spatial model (rti_imaging_weights_spec).
+//
+// Method ported from Kaltiokallio, Bocca & Patwari, arXiv:1302.5914
+/// (CONFIRMED at 30–33 nodes, 2D, ground-plane, stationary humans).
+/// What ports is the *method* — fade-signed, direction-split,
+/// area-normalized weighting. The paper's ellipse parameters and its
+/// ≤ 0.30 m accuracy figure do NOT port (6 nodes, airborne Group 2–3
+/// UAS); field validation re-measures from zero.
+///
+/// Pipeline:
+///  1. The tripwire's direction-split Δr (deltaDown/deltaUp on
+///     LinkSample) feeds two measurement vectors, p⁻ and p⁺, each with
+///     its own ellipse set and probability mapping:
+///       p^δ = 1 − exp(−β^δ · |Δr^δ|),  δ ∈ {−, +}
+///     stacked to 2·L·C rows (L links, C bands, 2 directions).
+///  2. Ellipse excess-path parameter per direction from the link's fade
+///     level: λ^δ = b^δ · e^(F / k^δ). Anti-fade links get tight
+///     ellipses on δ=−, deep-fade links tight ellipses on δ=+.
+///  3. Weights are inverse ellipse AREA (not 1/√d): a deep-fade link's
+///     diffuse ellipse would otherwise contribute near-uniform "maybe
+///     everywhere" mass that washes out tight anti-fade ellipses —
+///     the highest-leverage change at 6-node sparsity.
+///  4. The two direction images are fused (summed) AFTER weighting —
+///     never before. Summing |Δr| first lets a rise and a dip on the
+///     same pixel cancel or double-count.
+///
+/// Parameters are per-band starting estimates in the paper's functional
+/// forms — NOT the paper's Table I numbers (CC2530-in-rooms fits).
+/// Refit them from our own calibration data via
+/// [refitImagingBand]; shipping with the paper's numbers would be
+/// cargo-culting.
+///
+/// Fresnel-zone weighting is deliberately ABSENT (open research
+/// question per the spec — unvalidated; do not add it).
+/// ---------------------------------------------------------------------------
+
+/// Weight scheme for the imaging layer. [area] is the shipped model;
+/// [invSqrtDist] exists only as the test control proving area
+/// normalization matters (spec test 2).
+enum WeightScheme { area, invSqrtDist }
+
+/// Per-band imaging parameters: the paper's functional forms with OUR
+/// fitted constants (starting estimates until refit).
+///
+///   λ^δ(F) = b^δ · e^(F / k^δ)     (ellipse excess-path, meters)
+///   β⁻     = betaMinus             (fixed, like the paper)
+///   β⁺(F)  = beta0Plus · e^(F / kBeta)
+///
+/// F is the link fade level in the tripwire's radio units. Starting
+/// estimates are round, physically-motivated placeholders (ellipse
+/// excess of order meters, mild fade dependence) — refit from
+/// calibration crossings before trusting them. They are NOT the
+/// paper's Table I values.
+class ImagingBandParams {
+  const ImagingBandParams({
+    required this.bMinus,
+    required this.kMinus,
+    required this.bPlus,
+    required this.kPlus,
+    required this.betaMinus,
+    required this.beta0Plus,
+    required this.kBeta,
+  });
+
+  /// Starting estimates — placeholders, not paper values, not truth.
+  ///
+  /// The paper's b^δ (≈0.21/0.50 m) was fit for 2–5 m indoor links.
+  /// Shepherd's field links are 30–60 m; at that length a 0.2 m
+  /// excess-path ellipse is a razor that covers almost no pixel, and
+  /// the image fragments into link-crossing artifacts instead of
+  /// localizing the disturbance. The starting b is therefore scaled
+  /// so the ellipse's semi-minor axis covers a few meters
+  /// (~link-length/10) — the plausible disturbance region at our
+  /// sparsity. Refit from calibration crossings before trusting it;
+  /// the refit hook exists precisely because these are guesses.
+  factory ImagingBandParams.defaults() => const ImagingBandParams(
+        bMinus: 2.0,
+        kMinus: -8.0,
+        bPlus: 2.0,
+        kPlus: 80.0,
+        betaMinus: 0.12,
+        beta0Plus: 0.18,
+        kBeta: 13.0,
+      );
+
+  final double bMinus;
+  final double kMinus;
+  final double bPlus;
+  final double kPlus;
+  final double betaMinus;
+  final double beta0Plus;
+  final double kBeta;
+
+  /// Excess-path ellipse parameter for the dip direction (δ=−).
+  double lambdaMinus(double fadeDb) =>
+      (bMinus * math.exp(fadeDb / kMinus)).clamp(0.02, 60.0);
+
+  /// Excess-path ellipse parameter for the rise direction (δ=+).
+  double lambdaPlus(double fadeDb) =>
+      (bPlus * math.exp(fadeDb / kPlus)).clamp(0.02, 60.0);
+
+  double betaFor(String direction, double fadeDb) => direction == 'dip'
+      ? betaMinus
+      : (beta0Plus * math.exp(fadeDb / kBeta)).clamp(0.01, 2.0);
+
+  /// Refit the functional-form parameters from our own calibration
+  /// crossings: log-linear regression of ln(λ) and ln(β⁺) on fade
+  /// level F. [points] carry measured (fade, lambdaMinus,
+  /// lambdaPlus, betaPlus) from controlled crossings. β⁻ refits as the
+  /// median of measured betaMinus. Needs ≥ 3 points with fade spread;
+  /// otherwise returns `this` unchanged (never fit on nothing).
+  ImagingBandParams refitFrom(List<ImagingFitPoint> points) {
+    if (points.length < 3) return this;
+    final fs = [for (final p in points) p.fadeDb];
+    final spread = fs.reduce(math.max) - fs.reduce(math.min);
+    if (spread < 1e-6) return this;
+    final lMinus = _logLinFit(points, (p) => p.lambdaMinus);
+    final lPlus = _logLinFit(points, (p) => p.lambdaPlus);
+    final bPlus = _logLinFit(points, (p) => p.betaPlus);
+    final betaMinusFit = _median([for (final p in points) p.betaMinus]);
+    return ImagingBandParams(
+      bMinus: math.exp(lMinus.intercept),
+      kMinus: lMinus.slope.abs() < 1e-9 ? kMinus : 1 / lMinus.slope,
+      bPlus: math.exp(lPlus.intercept),
+      kPlus: lPlus.slope.abs() < 1e-9 ? kPlus : 1 / lPlus.slope,
+      betaMinus: betaMinusFit > 0 ? betaMinusFit : betaMinus,
+      beta0Plus: math.exp(bPlus.intercept),
+      kBeta: bPlus.slope.abs() < 1e-9 ? kBeta : 1 / bPlus.slope,
+    );
+  }
+
+  static ({double slope, double intercept}) _logLinFit(
+      List<ImagingFitPoint> points, double Function(ImagingFitPoint) pick) {
+    final xs = <double>[], ys = <double>[];
+    for (final p in points) {
+      final v = pick(p);
+      if (v > 0 && v.isFinite) {
+        xs.add(p.fadeDb);
+        ys.add(math.log(v));
+      }
+    }
+    if (xs.length < 3) return (slope: 0.0, intercept: 0.0);
+    final n = xs.length;
+    final mx = xs.reduce((a, b) => a + b) / n;
+    final my = ys.reduce((a, b) => a + b) / n;
+    var sxx = 0.0, sxy = 0.0;
+    for (var i = 0; i < n; i++) {
+      sxx += (xs[i] - mx) * (xs[i] - mx);
+      sxy += (xs[i] - mx) * (ys[i] - my);
+    }
+    final slope = sxx < 1e-12 ? 0.0 : sxy / sxx;
+    return (slope: slope, intercept: my - slope * mx);
+  }
+
+  static double _median(List<double> xs) {
+    if (xs.isEmpty) return 0.0;
+    xs.sort();
+    final n = xs.length;
+    return n.isOdd ? xs[n ~/ 2] : (xs[n ~/ 2 - 1] + xs[n ~/ 2]) / 2;
+  }
+}
+
+/// One measured calibration crossing for the refit hook.
+class ImagingFitPoint {
+  const ImagingFitPoint({
+    required this.fadeDb,
+    required this.lambdaMinus,
+    required this.lambdaPlus,
+    required this.betaMinus,
+    required this.betaPlus,
+  });
+
+  final double fadeDb;
+  final double lambdaMinus;
+  final double lambdaPlus;
+  final double betaMinus;
+  final double betaPlus;
+}
+
+/// One row of the stacked measurement system: (link, band, direction).
+class RtiRow {
+  const RtiRow({
+    required this.linkKey,
+    required this.band,
+    required this.direction,
+    required this.lambdaM,
+    required this.prob,
+    required this.fadeDb,
+    required this.delta,
+    required this.a,
+    required this.b,
+    required this.area,
+  });
+
+  final String linkKey;
+  final String band;
+
+  /// 'dip' (δ=−) or 'rise' (δ=+).
+  final String direction;
+
+  /// Ellipse excess-path parameter (m).
+  final double lambdaM;
+
+  /// p^δ = 1 − exp(−β^δ · |Δr^δ|).
+  final double prob;
+  final double fadeDb;
+  final double delta;
+
+  /// Link endpoints (field meters, ground plane).
+  final NodePosition a;
+  final NodePosition b;
+
+  /// Ellipse area (m²) — the normalization weight is 1/area.
+  final double area;
+}
+
+/// One cell of the fused disturbance image (ground-plane projection).
+class RtiCell {
+  const RtiCell({
+    required this.x,
+    required this.y,
+    required this.v,
+    this.vMinus = 0.0,
+    this.vPlus = 0.0,
+  });
+
+  final double x;
+  final double y;
+
+  /// Fused normalized 0..1 intensity (v⁻ + v⁺ after weighting).
+  final double v;
+  final double vMinus;
+  final double vPlus;
+}
+
+/// Imaging methods on [Tracker]: the weight matrix W, the probability
+/// measurement vector, and the fused image. The Kalman/data-association
+/// tracker itself is unchanged; it consumes the improved image.
+extension TrackerImaging on Tracker {
+  /// Per-band parameter table. 'default' is the fallback; add bands
+  /// ('433', '915', …) via [setImagingBand] after refit.
+  Map<String, ImagingBandParams> get imagingBands => _imagingBands;
+
+  void setImagingBand(String band, ImagingBandParams params) {
+    _imagingBands[band] = params;
+  }
+
+  /// Refit one band's functional-form parameters from our own
+  /// calibration crossings (no paper numbers involved).
+  void refitImagingBand(String band, List<ImagingFitPoint> points) {
+    final cur = _imagingBands[band] ?? ImagingBandParams.defaults();
+    _imagingBands[band] = cur.refitFrom(points);
+  }
+
+  /// Build the stacked measurement rows: 2 directions × L links
+  /// (× C bands — one band per sample batch here; multi-band meshes
+  /// stack rows across drivers' samples).
+  List<RtiRow> imagingRows({
+    required List<LinkSample> samples,
+    required Map<String, NodePosition> nodes,
+    required double dipThreshold,
+    String Function(String linkKey)? bandOf,
+  }) {
+    final pairs = _dedupePairDirs(samples, nodes, dipThreshold);
+    final rows = <RtiRow>[];
+    for (final p in pairs.values) {
+      final band =
+          bandOf?.call(p.key) ?? Tracker._bandOfLink(p.key);
+      final params = _imagingBands[band] ??
+          _imagingBands['mesh'] ??
+          _imagingBands['default']!;
+      final d = _linkLen(p.a, p.b);
+      for (final dir in const ['dip', 'rise']) {
+        final delta = dir == 'dip' ? p.deltaDown : p.deltaUp;
+        final lambda = dir == 'dip'
+            ? params.lambdaMinus(p.fadeLevel)
+            : params.lambdaPlus(p.fadeLevel);
+        final beta = params.betaFor(dir, p.fadeLevel);
+        final prob = 1 - math.exp(-beta * delta);
+        final area = _ellipseArea(d, lambda);
+        rows.add(RtiRow(
+          linkKey: p.key,
+          band: band,
+          direction: dir,
+          lambdaM: lambda,
+          prob: prob,
+          fadeDb: p.fadeLevel,
+          delta: delta,
+          a: p.a,
+          b: p.b,
+          area: area,
+        ));
+      }
+    }
+    return rows;
+  }
+
+  /// Fused disturbance image: two direction images built with
+  /// area-normalized weights, fused (summed) AFTER weighting.
+  ///
+  /// Returns cells normalized 0..1 unless [normalize] is false (raw
+  /// probability mass — for tests comparing evidence preserved across
+  /// pipeline variants). This is a probability-mass image over the
+  /// ground plane — "estimated disturbance location (ground
+  /// projection)", never a located object.
+  List<RtiCell> rtiImage({
+    required List<LinkSample> samples,
+    required Map<String, NodePosition> nodes,
+    required double dipThreshold,
+    double cellM = 2.5,
+    WeightScheme scheme = WeightScheme.area,
+    String Function(String linkKey)? bandOf,
+    bool normalize = true,
+  }) {
+    final rows = imagingRows(
+      samples: samples,
+      nodes: nodes,
+      dipThreshold: dipThreshold,
+      bandOf: bandOf,
+    );
+    final live = [for (final r in rows) if (r.prob > 1e-4) r];
+    if (live.isEmpty || nodes.isEmpty) return const [];
+
+    var minX = double.infinity,
+        maxX = -double.infinity,
+        minY = double.infinity,
+        maxY = -double.infinity;
+    for (final n in nodes.values) {
+      if (n.x < minX) minX = n.x;
+      if (n.x > maxX) maxX = n.x;
+      if (n.y < minY) minY = n.y;
+      if (n.y > maxY) maxY = n.y;
+    }
+    minX -= 12;
+    maxX += 12;
+    minY -= 12;
+    maxY += 12;
+    var cell = cellM;
+    while (((maxX - minX) / cell + 1) * ((maxY - minY) / cell + 1) > 6000 &&
+        cell < 20.0) {
+      cell *= 1.25;
+    }
+
+    final xs = <double>[];
+    final ys = <double>[];
+    for (var x = minX; x <= maxX; x += cell) {
+      for (var y = minY; y <= maxY; y += cell) {
+        xs.add(x);
+        ys.add(y);
+      }
+    }
+    final vMinus = List<double>.filled(xs.length, 0.0);
+    final vPlus = List<double>.filled(xs.length, 0.0);
+    for (final r in live) {
+      final w = scheme == WeightScheme.area
+          ? 1.0 / r.area
+          : null; // per-pixel below
+      final d = _linkLen(r.a, r.b);
+      final aSemi = (d + r.lambdaM) / 2;
+      final bSemi = math.sqrt(
+          math.max(r.lambdaM * (2 * d + r.lambdaM), 1e-9)) /
+          2;
+      final ux = (r.b.x - r.a.x) / math.max(d, 1e-9);
+      final uy = (r.b.y - r.a.y) / math.max(d, 1e-9);
+      final target = r.direction == 'dip' ? vMinus : vPlus;
+      for (var i = 0; i < xs.length; i++) {
+        final px = xs[i] - r.a.x, py = ys[i] - r.a.y;
+        // Link-aligned coords: u along the link, v perpendicular.
+        final u = px * ux + py * uy;
+        final v = -px * uy + py * ux;
+        final uc = u - d / 2;
+        final inside = (uc * uc) / (aSemi * aSemi) +
+                (v * v) / math.max(bSemi * bSemi, 1e-9) <=
+            1.0;
+        if (!inside) continue;
+        double weight;
+        if (w != null) {
+          weight = w;
+        } else {
+          // Control scheme: 1/sqrt(distance to link), the pre-change
+          // falloff the area model replaces.
+          final dist = Tracker._distPtSeg2D(xs[i], ys[i], r.a, r.b);
+          weight = 1.0 / math.sqrt(math.max(dist, 0.25));
+        }
+        target[i] += r.prob * weight;
+      }
+    }
+    var peak = 0.0;
+    for (var i = 0; i < xs.length; i++) {
+      final s = vMinus[i] + vPlus[i];
+      if (s > peak) peak = s;
+    }
+    if (peak < 1e-12) return const [];
+    final out = <RtiCell>[];
+    for (var i = 0; i < xs.length; i++) {
+      final vm = normalize ? vMinus[i] / peak : vMinus[i];
+      final vp = normalize ? vPlus[i] / peak : vPlus[i];
+      final v = vm + vp;
+      if (!normalize || v > 0.03) {
+        out.add(RtiCell(x: xs[i], y: ys[i], v: v, vMinus: vm, vPlus: vp));
+      }
+    }
+    return out;
+  }
+
+  static double _linkLen(NodePosition a, NodePosition b) {
+    final dx = b.x - a.x, dy = b.y - a.y;
+    return math.sqrt(dx * dx + dy * dy);
+  }
+
+  /// Ellipse area for excess-path λ over link length d: a = (d+λ)/2,
+  /// b = √(λ(2d+λ))/2, area = πab. Guarded: never below 1e-6.
+  static double _ellipseArea(double d, double lambda) {
+    final a = (d + lambda) / 2;
+    final b = math.sqrt(math.max(lambda * (2 * d + lambda), 1e-9)) / 2;
+    return math.max(math.pi * a * b, 1e-6);
+  }
+
+  /// Collapse directed samples into undirected pairs, keeping the max
+  /// per-direction Δr (no cancellation: dip and rise stay separate).
+  static Map<String, _PairDirs> _dedupePairDirs(
+    List<LinkSample> samples,
+    Map<String, NodePosition> nodes,
+    double dipThreshold,
+  ) {
+    final pairs = <String, _PairDirs>{};
+    for (final s in samples) {
+      final a = nodes[s.fromNode];
+      final b = nodes[s.toNode];
+      if (a == null || b == null) continue;
+      final key = Tracker._pairKey(s.fromNode, s.toNode);
+      final prev = pairs[key];
+      if (prev == null) {
+        pairs[key] = _PairDirs(
+          key: key,
+          a: a,
+          b: b,
+          deltaDown: s.deltaDown,
+          deltaUp: s.deltaUp,
+          fadeLevel: s.fadeLevel,
+          threshold: s.effectiveThreshold(dipThreshold),
+        );
+      } else {
+        final down = math.max(prev.deltaDown, s.deltaDown);
+        final up = math.max(prev.deltaUp, s.deltaUp);
+        // Fade level follows the direction carrying the disturbance.
+        final fade = (s.deltaDown + s.deltaUp) >=
+                (prev.deltaDown + prev.deltaUp)
+            ? s.fadeLevel
+            : prev.fadeLevel;
+        pairs[key] = _PairDirs(
+          key: key,
+          a: a,
+          b: b,
+          deltaDown: down,
+          deltaUp: up,
+          fadeLevel: fade,
+          threshold: math.min(
+              prev.threshold, s.effectiveThreshold(dipThreshold)),
+        );
+      }
+    }
+    return pairs;
+  }
+}
+
+class _PairDirs {
+  _PairDirs({
+    required this.key,
+    required this.a,
+    required this.b,
+    required this.deltaDown,
+    required this.deltaUp,
+    required this.fadeLevel,
+    required this.threshold,
+  });
+
+  final String key;
+  final NodePosition a;
+  final NodePosition b;
+  final double deltaDown;
+  final double deltaUp;
+  final double fadeLevel;
+  final double threshold;
 }

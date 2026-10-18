@@ -25,10 +25,19 @@ Metrics printed:
       the track's majority truth target ("?" = clutter / no truth)
     - per-track mean position error vs the matched truth trajectory
     - truth targets covered
+    - NEES consistency: mean normalized estimation error squared over
+      the 4-D constant-velocity state (e^T P^-1 e per update, truth
+      velocity from finite differences). A consistent filter sits near
+      the state dimension d=4; NEES >> d flags an overconfident
+      covariance — the failure RMSE alone cannot see (lane3 P8).
 
 Usage:
     python3 synth_data.py                      # -> sample_run.csv
-    python3 bench_jpda.py [csv] [plot.png]
+    python3 bench_jpda.py [csv] [plot.png] [--shrink-covar F]
+
+    --shrink-covar F  scale the measurement-noise covariance by F
+                      (e.g. 0.01) to demonstrate the NEES flag on a
+                      deliberately overconfident filter config.
 """
 import csv
 import math
@@ -172,16 +181,111 @@ def truth_vote(state):
     return best
 
 
+
+def compute_true_nees(neutral_tracks, truth, state_dim=4, verbose=True):
+    """True NEES on the 4-D constant-velocity state: e^T P^-1 e per update.
+
+    neutral_tracks: list of {"id", "matched", "states"}; each state is a
+    (t_iso, state_vector (4,1) [x, vx, y, vy], covar (4,4), vote) tuple,
+    where vote is the truth_id behind that update (None if unknown).
+    truth: truth_id -> {t_iso: (x, y)}; truth velocity comes from central
+    finite differences of the truth trajectory.
+    A consistent filter averages near the state dimension d = 4.
+    NEES >> d  -> overconfident covariance (shrinks gates, missed
+                  associations \u2014 lane3 P8; RMSE alone cannot see it).
+    NEES << d  -> conservative covariance.
+    Only updates whose vote matches the track's matched truth target
+    count (misassociated updates are a data-association failure, not a
+    covariance failure).
+    Returns (mean_nees or None, {track_id: mean}, n_updates).
+    """
+    truth_traj = {}
+    for ttid, traj in truth.items():
+        keys = sorted(traj)
+        pts = []
+        for i, k in enumerate(keys):
+            x, y = traj[k]
+            if 0 < i < len(keys) - 1:
+                tp = datetime.fromisoformat(keys[i - 1])
+                tn = datetime.fromisoformat(keys[i + 1])
+                xp, yp = traj[keys[i - 1]]
+                xn, yn = traj[keys[i + 1]]
+                dt = (tn - tp).total_seconds()
+                vx, vy = ((xn - xp) / dt, (yn - yp) / dt) if dt > 0 else (0.0, 0.0)
+            else:
+                vx, vy = 0.0, 0.0
+            pts.append((k, x, y, vx, vy))
+        truth_traj[ttid] = {p[0]: p[1:] for p in pts}
+
+    nees_all, nees_by_track = [], {}
+    for tr in neutral_tracks:
+        matched = tr["matched"]
+        if not matched or matched not in truth_traj:
+            continue
+        traj = truth_traj[matched]
+        vals = []
+        for (key, sv, cov, vote) in tr["states"]:
+            if vote != matched:
+                continue
+            if key not in traj:
+                continue
+            tx, ty, tvx, tvy = traj[key]
+            e = np.array([[sv[0, 0] - tx], [sv[1, 0] - tvx],
+                          [sv[2, 0] - ty], [sv[3, 0] - tvy]])
+            try:
+                pinv = np.linalg.inv(np.array(cov, dtype=float))
+            except np.linalg.LinAlgError:
+                continue
+            vals.append(float(e.T @ pinv @ e))
+        if vals:
+            nees_by_track[tr["id"]] = sum(vals) / len(vals)
+            nees_all.extend(vals)
+
+    mean_nees = sum(nees_all) / len(nees_all) if nees_all else None
+    if verbose:
+        if nees_all:
+            print(f"\nNEES consistency (state dim d={state_dim}, "
+                  f"n={len(nees_all)} updates):")
+            for tid8, v in sorted(nees_by_track.items()):
+                print(f"  track {tid8}: mean NEES {v:.2f}")
+            print(f"  overall mean NEES: {mean_nees:.2f} (ideal \u2248 {state_dim})")
+            if mean_nees > 2 * state_dim:
+                print("  FLAG: OVERCONFIDENT covariance \u2014 NEES >> d. The filter "
+                      "trusts its state far more than the errors justify; "
+                      "gates shrink, associations will be missed. Do NOT port "
+                      "these covariances to the app.")
+            elif mean_nees < state_dim / 2:
+                print("  NOTE: CONSERVATIVE covariance \u2014 NEES << d. Safe "
+                      "direction (gates stay wide), but the filter leaves "
+                      "precision on the table.")
+            else:
+                print("  OK: statistically consistent.")
+        else:
+            print("\nNEES: no matched updates with truth \u2014 cannot evaluate.")
+    return mean_nees, nees_by_track, len(nees_all)
+
+
+
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
-    csv_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    csv_path = args[0] if len(args) > 0 else os.path.join(
         here, "sample_run.csv")
-    plot_path = sys.argv[2] if len(sys.argv) > 2 else os.path.join(
+    plot_path = args[1] if len(args) > 1 else os.path.join(
         here, "bench_plot.png")
+    # --shrink-covar F: deliberately overconfident filter demo
+    shrink = 1.0
+    for i, a in enumerate(sys.argv):
+        if a == "--shrink-covar" and i + 1 < len(sys.argv):
+            shrink = float(sys.argv[i + 1])
 
+    meas_var = MEAS_NOISE_M ** 2 * shrink
+    if shrink != 1.0:
+        print(f"NOTE: measurement-noise covariance scaled by {shrink} "
+              f"(deliberately overconfident config — NEES should flag it)")
     measurement_model = LinearGaussian(
         ndim_state=4, mapping=[0, 2],
-        noise_covar=CovarianceMatrix(np.diag([MEAS_NOISE_M ** 2] * 2)))
+        noise_covar=CovarianceMatrix(np.diag([meas_var] * 2)))
     rows = load_rows(csv_path)
     truth = build_truth(rows)
     n_timesteps = len({r["t_iso"] for r in rows})
@@ -244,6 +348,23 @@ def main():
         print(f"mean track purity: {sum(purities)/len(purities):.3f}")
     if errs:
         print(f"mean position error vs truth: {sum(errs)/len(errs):.2f} m")
+
+    # ---- NEES consistency (true NEES via compute_true_nees) ------------
+    neutral_tracks = []
+    for r, (tid, tr) in zip(per_track,
+                            sorted(all_tracks.items(), key=lambda kv: str(kv[0]))):
+        states = []
+        for s in tr.states:
+            sv = s.state_vector
+            states.append((s.timestamp.isoformat(),
+                           np.array([[sv[0, 0]], [sv[1, 0]],
+                                     [sv[2, 0]], [sv[3, 0]]]),
+                           np.array(s.covar, dtype=float),
+                           truth_vote(s)))
+        neutral_tracks.append({"id": r["id"], "matched": r["matched"],
+                               "states": states})
+    compute_true_nees(neutral_tracks, truth, state_dim=4, verbose=True)
+
 
     # ---- plot ---------------------------------------------------------
     fig, ax = plt.subplots(figsize=(9, 9))

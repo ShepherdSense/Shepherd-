@@ -1,5 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shepherd/models/link_sample.dart';
+import 'package:shepherd/services/adaptive_baseline.dart';
 import 'package:shepherd/services/tripwire.dart';
 
 final _t0 = DateTime(2026, 1, 1, 12);
@@ -159,6 +160,128 @@ void main() {
       final events = tw.drainEvents();
       expect(events, hasLength(1));
       expect(events.first.direction, 'rise');
+    });
+
+    group('ARTI feed (spec integration b/c)', () {
+      // Four links: an anti-fade pair (80) and a deep-fade pair (60).
+      // A sustained 12 dB dip hits one anti-fade link.
+      List<CrossingEvent> runScenario(
+          Tripwire tw, AdaptiveBaseline? ab) {
+        const links = ['a → b', 'c → d', 'e → f', 'g → h'];
+        double level(String l, int k) {
+          if (l == 'a → b' && k >= 30) return 68.0; // the dip event
+          return (l == 'a → b' || l == 'c → d') ? 80.0 : 60.0;
+        }
+
+        var i = 0;
+        for (var k = 0; k < 34; k++, i++) {
+          for (final l in links) {
+            final parts = l.split(' → ');
+            tw.process(LinkSample(
+              timestamp: _t0.add(Duration(milliseconds: 250 * i)),
+              fromNode: parts[0],
+              toNode: parts[1],
+              snr: level(l, k),
+            ));
+          }
+          // Mirror the app: every poll also feeds the ARTI updater
+          // (vacant window — nothing is tracked in this scenario).
+          final a = ab;
+          if (a != null) {
+            a.update(
+              now: _t0.add(Duration(milliseconds: 250 * i)),
+              samples: [
+                for (final l in links)
+                  for (final dir in const ['dip', 'rise'])
+                    ArtiSample(
+                      linkKey: l,
+                      channel: 'mesh',
+                      direction: dir,
+                      level: level(l, k),
+                      madThreshold: 3.0,
+                    ),
+              ],
+              tracks: const [],
+              nodes: const {},
+              heldLinks: tw.heldLinkPolls,
+            );
+          }
+        }
+        return tw.drainEvents();
+      }
+
+      test('detection outcomes are unchanged with the ARTI feed attached',
+          () {
+        // The feed is live (ARTI learned the quiet levels, phi at the
+        // unset prior): it must change NOTHING — same events, same
+        // depths, same directions. MAD thresholds and detection
+        // decisions stay on the tripwire's own rolling-median baseline.
+        final plain = runScenario(
+            Tripwire(config: const TripwireConfig(confirmPolls: 2)),
+            null);
+        final fedTw =
+            Tripwire(config: const TripwireConfig(confirmPolls: 2));
+        final ab = AdaptiveBaseline();
+        fedTw.attachAdaptiveBaseline(ab);
+        final fed = runScenario(fedTw, ab);
+
+        expect(plain, hasLength(1));
+        expect(fed, hasLength(plain.length));
+        for (var i = 0; i < plain.length; i++) {
+          expect(fed[i].linkKey, plain[i].linkKey);
+          expect(fed[i].direction, plain[i].direction);
+          expect(fed[i].dipDepth, plain[i].dipDepth);
+          expect(fed[i].durationSecs, plain[i].durationSecs);
+          expect(fed[i].viaVariance, plain[i].viaVariance);
+        }
+        // Sanity: the scenario really did detect the dip.
+        expect(plain.first.linkKey, 'a → b');
+        expect(plain.first.direction, 'dip');
+        expect(plain.first.dipDepth, greaterThan(10));
+      });
+
+      test('suspect ARTI entries abstain from the fade-level feed', () {
+        // Drive an entry past the divergence cap: it registers at −60
+        // (muCalib = −60), then the level moves to −50 and mu follows —
+        // |mu − muCalib| ≈ 10 dB > the 6 dB cap → suspect → the feed
+        // abstains instead of handing the detector a runaway reference.
+        final ab = AdaptiveBaseline();
+        List<ArtiSample> at(double level) => [
+              for (final dir in const ['dip', 'rise'])
+                ArtiSample(
+                  linkKey: 'a → b',
+                  channel: 'mesh',
+                  direction: dir,
+                  level: level,
+                  madThreshold: 3.0,
+                ),
+            ];
+        ab.update(
+          now: _t0,
+          samples: at(-60.0),
+          tracks: const [],
+          nodes: const {},
+        );
+        for (var i = 1; i < 40; i++) {
+          ab.update(
+            now: _t0.add(Duration(seconds: i)),
+            samples: at(-50.0),
+            tracks: const [],
+            nodes: const {},
+          );
+        }
+        expect(ab.suspectLinkKeys, contains('a → b'));
+        expect(ab.muForLink('a → b'), isNull);
+        // A healthy link still feeds.
+        ab.register(
+            linkKey: 'c → d',
+            channel: 'mesh',
+            direction: 'dip',
+            mu0: -70.0);
+        expect(ab.muForLink('c → d'), closeTo(-70.0, 1e-9));
+        // Unknown link abstains.
+        expect(ab.muForLink('nope → nope'), isNull);
+      });
     });
   });
 }

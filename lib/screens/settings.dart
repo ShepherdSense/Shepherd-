@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 
 import '../services/discovery.dart';
+import '../services/adaptive_baseline.dart';
 import '../services/radio_driver.dart';
 import '../services/recorder.dart';
 import '../state/app_state.dart';
@@ -36,13 +37,35 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late final TextEditingController _camPort;
   late final TextEditingController _camOnvif;
   late final TextEditingController _camSnap;
+  late final TextEditingController _sdrStationLat;
+  late final TextEditingController _sdrStationLon;
+  late final TextEditingController _sdrEnbLat;
+  late final TextEditingController _sdrEnbLon;
+  late final TextEditingController _sdrEnbMhz;
   late bool _simulated;
   late bool _wifiVision;
   late bool _zmetaEnabled;
   late bool _zmetaSecured;
   late bool _zmetaHeartbeatEnabled;
   late bool _camera;
+  late bool _calibDegraded;
   String _newDriverId = 'silvus';
+
+  /// Last-seen calibration state: AppState notifies on every poll, so
+  /// the listener only rebuilds when the calibration state actually
+  /// changes.
+  CalibrationState? _seenCalibState;
+  String? _seenCalibNote;
+
+  void _onAppStateChanged() {
+    final st = widget.state;
+    if (st.calibrationState != _seenCalibState ||
+        st.calibrationNote != _seenCalibNote) {
+      _seenCalibState = st.calibrationState;
+      _seenCalibNote = st.calibrationNote;
+      if (mounted) setState(() {});
+    }
+  }
 
   bool _scanning = false;
   double _scanProgress = 0;
@@ -94,10 +117,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _zmetaHeartbeatEnabled = s.zmetaHeartbeatEnabled;
     _camera = widget.state.cameraConfirmationEnabled;
     _wifiVision = widget.state.wifiVisionEnabled;
+    _calibDegraded = false;
     final cam = widget.state.cameraSettings;
     _camPort = TextEditingController(text: cam.webhookPort.toString());
     _camOnvif = TextEditingController(text: cam.onvifAddress);
     _camSnap = TextEditingController(text: cam.snapshotUrlTemplate);
+    final ss = widget.state.settings;
+    String lat(double? v) => v == null ? '' : v.toStringAsFixed(6);
+    _sdrStationLat = TextEditingController(text: lat(ss.sdrStationLat));
+    _sdrStationLon = TextEditingController(text: lat(ss.sdrStationLon));
+    _sdrEnbLat = TextEditingController(text: lat(ss.sdrEnbLat));
+    _sdrEnbLon = TextEditingController(text: lat(ss.sdrEnbLon));
+    _sdrEnbMhz = TextEditingController(
+        text: ss.sdrEnbCenterMhz == null
+            ? ''
+            : ss.sdrEnbCenterMhz!.toStringAsFixed(1));
+    _seenCalibState = widget.state.calibrationState;
+    _seenCalibNote = widget.state.calibrationNote;
+    widget.state.addListener(_onAppStateChanged);
     _refreshReplayList();
   }
 
@@ -118,10 +155,76 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _camPort.dispose();
     _camOnvif.dispose();
     _camSnap.dispose();
+    _sdrStationLat.dispose();
+    _sdrStationLon.dispose();
+    _sdrEnbLat.dispose();
+    _sdrEnbLon.dispose();
+    _sdrEnbMhz.dispose();
+    widget.state.removeListener(_onAppStateChanged);
     super.dispose();
   }
 
+  /// Parse the SDR station / eNB fields. All four coordinates blank =
+  /// unconfigured (fine); otherwise all four must parse and be in
+  /// range. Returns null when the fields are invalid.
+  ({double slat, double slon, double elat, double elon, double? mhz})?
+      _parseSdrStation() {
+    final raw = [
+      _sdrStationLat.text.trim(),
+      _sdrStationLon.text.trim(),
+      _sdrEnbLat.text.trim(),
+      _sdrEnbLon.text.trim(),
+    ];
+    if (raw.every((v) => v.isEmpty)) {
+      final mhzRaw = _sdrEnbMhz.text.trim();
+      if (mhzRaw.isNotEmpty) return null; // MHz without geometry: invalid
+      return null; // unconfigured — not an error
+    }
+    if (raw.any((v) => v.isEmpty)) return null;
+    final slat = double.tryParse(raw[0]);
+    final slon = double.tryParse(raw[1]);
+    final elat = double.tryParse(raw[2]);
+    final elon = double.tryParse(raw[3]);
+    if (slat == null ||
+        slon == null ||
+        elat == null ||
+        elon == null ||
+        slat < -90 ||
+        slat > 90 ||
+        elat < -90 ||
+        elat > 90 ||
+        slon < -180 ||
+        slon > 180 ||
+        elon < -180 ||
+        elon > 180) {
+      return null;
+    }
+    double? mhz;
+    final mhzRaw = _sdrEnbMhz.text.trim();
+    if (mhzRaw.isNotEmpty) {
+      mhz = double.tryParse(mhzRaw);
+      if (mhz == null || mhz <= 0) return null;
+    }
+    return (slat: slat, slon: slon, elat: elat, elon: elon, mhz: mhz);
+  }
+
+  bool _sdrStationFieldsTouched() =>
+      _sdrStationLat.text.trim().isNotEmpty ||
+      _sdrStationLon.text.trim().isNotEmpty ||
+      _sdrEnbLat.text.trim().isNotEmpty ||
+      _sdrEnbLon.text.trim().isNotEmpty ||
+      _sdrEnbMhz.text.trim().isNotEmpty;
+
   void _save() {
+    final station = _parseSdrStation();
+    if (station == null && _sdrStationFieldsTouched()) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+            content: Text('STATION / eNB COORDINATES INCOMPLETE OR INVALID '
+                '— FILL ALL FOUR (LAT −90..90, LON −180..180) OR LEAVE BLANK')),
+      );
+      return;
+    }
     final s = AppSettings(
       subnet: _subnet.text.trim(),
       pollInterval:
@@ -152,6 +255,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
       zmetaHeartbeatIntervalSec:
           (int.tryParse(_zmetaHeartbeatInterval.text.trim()) ?? 60)
               .clamp(15, 600),
+      sdrStationLat: station?.slat,
+      sdrStationLon: station?.slon,
+      sdrEnbLat: station?.elat,
+      sdrEnbLon: station?.elon,
+      sdrEnbCenterMhz: station?.mhz,
     );
     widget.state.applySettings(s);
     final cam = widget.state.cameraSettings;
@@ -322,6 +430,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
           const SizedBox(height: 10),
           _field(_window, 'Baseline window (polls)', 'e.g. 60', numeric: true),
         ]),
+        _section('Mesh calibration', _calibrationBody()),
+        _section('SDR station', _sdrStationBody()),
         _section('Wi-Fi sensing', [
           _field(
               _wifiThreshold,
@@ -498,6 +608,208 @@ class _SettingsScreenState extends State<SettingsScreen> {
         const SizedBox(height: 16),
       ],
     );
+  }
+
+  /// Guided "Dial it in" calibration UI, driven by the existing
+  /// AppState methods. Double-click-simple: one button to start, one
+  /// to re-measure after nudging the named node, Done to finish.
+  List<Widget> _calibrationBody() {
+    final st = widget.state;
+    final cs = st.calibrationState;
+    final body = <Widget>[
+      Text(
+        'GUIDED "DIAL IT IN" ROUTINE — EMPLACE NODES, KEEP THE AREA '
+        'CLEAR 30–60 S, THEN NUDGE THE NAMED WORST NODE UNTIL FADE '
+        'LEVELS STOP IMPROVING. SETS THE DRIFT-COMPENSATED REFERENCE '
+        'ANCHORS; DETECTION ITSELF STAYS DETERMINISTIC.',
+        style: SentryType.section(10).copyWith(height: 1.6),
+      ),
+      const SizedBox(height: 10),
+    ];
+    if (cs == CalibrationState.calibrating) {
+      body.addAll([
+        Text(st.calibrationNote ?? 'CALIBRATING…',
+            style: SentryType.rowValue(SentryColors.amber)),
+        const SizedBox(height: 10),
+        Row(
+          children: [
+            Expanded(
+              child: ElevatedButton(
+                onPressed: () => st.calibrationNudgeRound(),
+                child: const Text('Re-measure'),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: ElevatedButton(
+                onPressed: () async {
+                  await st.finishCalibration();
+                  if (mounted) setState(() {});
+                },
+                child: const Text('Done'),
+              ),
+            ),
+            const SizedBox(width: 8),
+            TextButton(
+              onPressed: () => st.cancelCalibration(),
+              child: const Text('Cancel',
+                  style: TextStyle(color: SentryColors.red)),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Text(
+          'ONE ROUND ≈ 10 S AFTER MOVING THE NAMED NODE. STOP WHEN NO '
+          'LINK IMPROVES > 1 DB ACROSS TWO ROUNDS, OR TAP DONE.',
+          style: SentryType.section(10).copyWith(height: 1.6),
+        ),
+      ]);
+    } else if (cs == CalibrationState.stable ||
+        cs == CalibrationState.degraded) {
+      final stable = cs == CalibrationState.stable;
+      body.addAll([
+        Text(
+          stable ? 'FADE LEVELS STABLE' : 'CALIBRATED (DEGRADED MODE)',
+          style: SentryType.rowValue(
+              stable ? SentryColors.green : SentryColors.amber),
+        ),
+        if (st.calibrationNote != null) ...[
+          const SizedBox(height: 4),
+          Text(st.calibrationNote!,
+              style: SentryType.section(10).copyWith(height: 1.6)),
+        ],
+        if (st.calibrationOwnerSummary.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          Text(st.calibrationOwnerSummary.toUpperCase(),
+              style: SentryType.rowValue(SentryColors.onDark)
+                  .copyWith(fontSize: 12)),
+        ],
+        const SizedBox(height: 6),
+        for (final l in st.calibrationWorstLinks.take(5)) _calibLinkRow(l),
+        const SizedBox(height: 10),
+        ElevatedButton(
+          onPressed: () =>
+              st.startCalibration(degradedMode: _calibDegraded),
+          child: const Text('Re-calibrate'),
+        ),
+      ]);
+    } else {
+      body.addAll([
+        SwitchListTile(
+          title: Text('DEGRADED MODE',
+              style: SentryType.rowValue(SentryColors.onDark)),
+          subtitle: Text(
+            'RUN ON WHATEVER QUIET IS AVAILABLE — FADE LEVELS ARE '
+            'PROVISIONAL AND SAY SO.',
+            style: SentryType.section(10).copyWith(height: 1.6),
+          ),
+          value: _calibDegraded,
+          onChanged: (v) => setState(() => _calibDegraded = v),
+        ),
+        const SizedBox(height: 6),
+        ElevatedButton(
+          onPressed: () =>
+              st.startCalibration(degradedMode: _calibDegraded),
+          child: const Text('Calibrate'),
+        ),
+      ]);
+    }
+    return body;
+  }
+
+  /// One ranked worst-link row, naming the owning nodes by their
+  /// display names.
+  Widget _calibLinkRow(CalibrationLink l) {
+    final st = widget.state;
+    String name(String id) =>
+        st.nodePositions[id]?.displayName ?? id;
+    final parts = l.link.split(' → ');
+    final label = parts.length == 2
+        ? '${name(parts[0])} → ${name(parts[1])}'
+        : l.link;
+    final deep = l.fadeDb < -3.0;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(label,
+                style: SentryType.rowValue(SentryColors.onDark)
+                    .copyWith(fontSize: 12)),
+          ),
+          Text(
+            '${l.fadeDb >= 0 ? '+' : ''}${l.fadeDb.toStringAsFixed(1)} dB',
+            style: SentryType.rowValue(
+                    deep ? SentryColors.red : SentryColors.muted)
+                .copyWith(fontSize: 12),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// SDR station geometry for the passive-Doppler correlator: the SDR
+  /// radio's position and the LTE eNB's position (WGS84), converted to
+  /// field-local meters at apply time. Without both, the correlator
+  /// abstains — silence, never a guess.
+  List<Widget> _sdrStationBody() {
+    final station = _parseSdrStation();
+    final touched = _sdrStationFieldsTouched();
+    final status = station != null
+        ? 'STATUS: CONFIGURED — DOPPLER CORRELATOR ARMED ON SAVE / START'
+        : touched
+            ? 'STATUS: INVALID — FILL ALL FOUR COORDINATES OR LEAVE BLANK'
+            : 'STATUS: NOT CONFIGURED — THE DOPPLER CORRELATOR ABSTAINS '
+                'UNTIL STATION + eNB ARE SET';
+    final statusColor = station != null
+        ? SentryColors.green
+        : touched
+            ? SentryColors.red
+            : SentryColors.muted;
+    return [
+      Text(
+        'PASSIVE-DOPPLER GEOMETRY. CONVERTED TO FIELD-LOCAL METERS AT '
+        'APPLY TIME (GPS FIELD ORIGIN WHEN SET, ELSE RELATIVE TO THE '
+        'STATION). PERSISTED WITH THE OTHER SETTINGS.',
+        style: SentryType.section(10).copyWith(height: 1.6),
+      ),
+      const SizedBox(height: 10),
+      Row(
+        children: [
+          Expanded(
+              child: _field(_sdrStationLat, 'Station latitude',
+                  'e.g. 35.123456',
+                  numeric: true, onChanged: (_) => setState(() {}))),
+          const SizedBox(width: 8),
+          Expanded(
+              child: _field(_sdrStationLon, 'Station longitude',
+                  'e.g. -78.123456',
+                  numeric: true, onChanged: (_) => setState(() {}))),
+        ],
+      ),
+      const SizedBox(height: 10),
+      Row(
+        children: [
+          Expanded(
+              child: _field(_sdrEnbLat, 'LTE eNB latitude',
+                  'e.g. 35.124000',
+                  numeric: true, onChanged: (_) => setState(() {}))),
+          const SizedBox(width: 8),
+          Expanded(
+              child: _field(_sdrEnbLon, 'LTE eNB longitude',
+                  'e.g. -78.124000',
+                  numeric: true, onChanged: (_) => setState(() {}))),
+        ],
+      ),
+      const SizedBox(height: 10),
+      _field(_sdrEnbMhz, 'LTE eNB center (MHz, optional)',
+          'e.g. 1865',
+          numeric: true, onChanged: (_) => setState(() {})),
+      const SizedBox(height: 8),
+      Text(status,
+          style: SentryType.section(10)
+              .copyWith(height: 1.6, color: statusColor)),
+    ];
   }
 
   Widget _radioRow(int i) {
