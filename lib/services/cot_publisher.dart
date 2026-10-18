@@ -63,7 +63,7 @@ class CotPublisherConfig {
     this.multicastGroup = '239.2.3.1',
     this.multicastPort = 6969,
     this.takHost = '',
-    this.takPort = 8089,
+    this.takPort = 8087,
     this.callsignPrefix = 'SHEPHERD-',
     this.staleSeconds = 30,
     this.publishFloor = 0.3,
@@ -304,7 +304,12 @@ class CotPublisher {
     if (config.useMulticast) {
       final udp = await _udpSocket();
       final group = InternetAddress(config.multicastGroup);
-      udp.send(bytes, group, config.multicastPort);
+      final sent = udp.send(bytes, group, config.multicastPort);
+      if (sent <= 0) {
+        // send() reports a full socket buffer / no route as 0, not an
+        // exception — don't count that as a published event.
+        throw StateError('multicast send returned 0 bytes');
+      }
       return;
     }
     final sock = await _ensureTakSocket();
@@ -315,24 +320,54 @@ class CotPublisher {
     await sock.flush();
   }
 
+  /// Shared in-flight connect: two tracks publishing at once must not
+  /// both connect and leak one socket (same fix as [_udpBind]).
+  Future<Socket?>? _takConnecting;
+  bool _disposed = false;
+
   /// TAK TCP socket with exponential backoff (1 s -> 60 s). Returns
   /// null when the server is currently unreachable (retry later).
-  Future<Socket?> _ensureTakSocket() async {
-    if (_tak != null) return _tak;
+  Future<Socket?> _ensureTakSocket() {
+    final cur = _tak;
+    if (cur != null) return Future.value(cur);
+    final inflight = _takConnecting;
+    if (inflight != null) return inflight;
+    final f = _connectTak().whenComplete(() => _takConnecting = null);
+    _takConnecting = f;
+    return f;
+  }
+
+  Future<Socket?> _connectTak() async {
     final now = DateTime.now().toUtc();
     if (_takNextRetryAt != null && now.isBefore(_takNextRetryAt!)) {
       return null;
     }
     try {
-      _tak = await Socket.connect(
+      final sock = await Socket.connect(
         config.takHost,
         config.takPort,
         timeout: const Duration(seconds: 5),
       );
+      if (_disposed) {
+        sock.destroy();
+        return null;
+      }
+      _tak = sock;
       _takBackoffSeconds = 1;
       _takNextRetryAt = null;
-      _tak!.done.then((_) => _tak = null).catchError((_) => _tak = null);
-      return _tak;
+      void lost() {
+        if (identical(_tak, sock)) _tak = null;
+        sock.destroy();
+      }
+
+      // Drain inbound bytes. TAK Server streams its own traffic to
+      // every client; never reading lets the buffers fill and the
+      // server drop us. Listening also surfaces a server-side close
+      // immediately instead of on the next failed write.
+      sock.listen((_) {},
+          onError: (Object _) => lost(), onDone: lost, cancelOnError: true);
+      sock.done.then((_) => lost()).catchError((Object _) => lost());
+      return sock;
     } catch (e) {
       _lastError = 'TAK connect failed: $e';
       _takNextRetryAt = now.add(Duration(seconds: _takBackoffSeconds));
@@ -354,6 +389,7 @@ class CotPublisher {
   int get publishedCount => _publishedCount;
 
   void dispose() {
+    _disposed = true;
     try {
       _udp?.close();
     } catch (_) {}

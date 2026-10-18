@@ -1,5 +1,56 @@
 # Changelog
 
+## v0.18.0 — 2026-10-18 — Predator-RF CoT integration
+
+Bilateral integration with Predator RF (see `docs/predator_integration_spec.md`):
+Shepherd publishes its tracks as CoT (`SHEPHERD-` callsigns) and ingests
+Predator's emitter tracks (`PREDATOR-`) as upgrade-only corroboration via the
+gated confidence merger. Wire-protocol-only across the GPL-3.0/MIT boundary —
+no shared code.
+
+- CoT emit: `lib/services/cot_publisher.dart` — 1 Hz/track throttle, UDP
+  multicast 239.2.3.1:6969 default + TAK Server TCP, publish floor 0.3,
+  affiliation always unknown.
+- CoT ingest: `lib/services/cot_listener.dart` — 60 s emitter window, 50 m
+  coincidence radius, 0.10 boost, never originates or subtracts tracks.
+- **Android multicast ingest**: `CHANGE_WIFI_MULTICAST_STATE` permission and
+  a `MulticastLock` (`MainActivity.kt`, `lib/services/multicast_lock.dart`)
+  held while the listener runs. Without it most Android Wi-Fi stacks drop
+  inbound multicast and the listener hears nothing.
+- **Listener socket loss**: stream `onError`/`onDone` clear `isListening`
+  and set `lastError`; a 15 s watchdog retries via the generation-guarded
+  reconfigure path (never resurrects a discarded listener).
+- **Reconfigure race**: `CotListener.start()/stop()` serialized; a
+  superseded `_configureCot` never stops a listener the newer generation
+  reuses; the publisher rebuilds only when its own config changed (keeps
+  the 1 Hz throttle and the TAK connection).
+- **TAK TCP**: default port 8087 (plaintext; 8089 is TLS, which the
+  publisher does not speak). Existing saved settings keep their port.
+
+## Unreleased — CoT adapter bug-review fixes (folded into v0.18.0 above)
+
+Author's note (2026-10-18): written without a Dart/Flutter toolchain on hand;
+verified before publish — `flutter analyze` clean, 251/251 tests pass. The
+Kotlin `MainActivity.kt` changes are standard `WifiManager` MulticastLock API
+usage, reviewed by inspection; not yet compiled into an APK.
+
+- **Android multicast ingest**: added `CHANGE_WIFI_MULTICAST_STATE` and a
+  `MulticastLock` (`MainActivity.kt`, `lib/services/multicast_lock.dart`)
+  held while the listener runs. Without it most Android Wi-Fi stacks drop
+  inbound multicast and the listener heard nothing.
+- **Listener socket loss**: stream `onError`/`onDone` now clear
+  `isListening` and set `lastError`; the watchdog retries every 15 s. The
+  receive callback drains all queued datagrams from the socket it was
+  bound to.
+- **Reconfigure race**: `CotListener.start()/stop()` are serialized; a
+  superseded `_configureCot` no longer stops a listener the newer
+  generation reuses; the publisher is rebuilt only when its own config
+  changed (keeps the 1 Hz throttle and the TAK connection).
+- **TAK TCP**: default port 8087 (plaintext; 8089 is TLS, which the
+  publisher does not speak). Existing saved settings keep their port.
+  Inbound bytes are drained, server-side close is detected, concurrent
+  first sends share one connect, and a 0-byte multicast send is an error.
+
 ## v0.17.0 — 2026-10-18
 
 ### ARTI adaptive baseline + dial-it-in calibration

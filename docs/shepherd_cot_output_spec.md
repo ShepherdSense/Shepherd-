@@ -72,7 +72,7 @@ Two destinations, multicast default:
 1. **UDP multicast 239.2.3.1:6969** (default CoT multicast group — the same
    group the BEAST+ CoT capture tool listens on). Zero-config on a LAN with
    ATAK clients. One datagram per event.
-2. **TAK Server TCP** (default port 8089): persistent connection, reconnect
+2. **TAK Server TCP** (default port 8087 — plaintext TCP; 8089 is TLS and needs client certs, which this publisher does not do): persistent connection, reconnect
    with backoff. For the enterprise net. TLS left to the server's config;
    the publisher sends plaintext CoT over the established socket.
 

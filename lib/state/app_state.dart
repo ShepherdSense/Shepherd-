@@ -93,7 +93,7 @@ class AppSettings {
     this.cotMulticastGroup = '239.2.3.1',
     this.cotMulticastPort = 6969,
     this.cotTakHost = '',
-    this.cotTakPort = 8089,
+    this.cotTakPort = 8087,
     this.cotStaleSeconds = 30,
     this.cotPublishFloor = 0.3,
     this.cotCallsignPrefix = 'SHEPHERD-',
@@ -598,6 +598,18 @@ class AppState extends ChangeNotifier {
         airTypeThreshold: settings.cotAirTypeThreshold,
       );
 
+  static bool _samePublisherConfig(CotPublisherConfig a, CotPublisherConfig b) =>
+      a.enabled == b.enabled &&
+      a.useMulticast == b.useMulticast &&
+      a.multicastGroup == b.multicastGroup &&
+      a.multicastPort == b.multicastPort &&
+      a.takHost == b.takHost &&
+      a.takPort == b.takPort &&
+      a.callsignPrefix == b.callsignPrefix &&
+      a.staleSeconds == b.staleSeconds &&
+      a.publishFloor == b.publishFloor &&
+      a.airTypeThreshold == b.airTypeThreshold;
+
   /// Configure-generation counter: the CoT setters (and applySettings)
   /// fire-and-forget [_configureCot], so a rapid ON→OFF toggle can
   /// interleave two configures across the socket awaits and strand a
@@ -613,8 +625,15 @@ class AppState extends ChangeNotifier {
   /// after configure time); the listener socket starts/stops here.
   Future<void> _configureCot() async {
     final gen = ++_cotConfigureGen;
-    _cotPublisher?.dispose();
-    _cotPublisher = CotPublisher(config: _cotPublisherConfig());
+    // Rebuild the publisher only when ITS config changed: unrelated
+    // edits (listener radius, prefix, ...) used to dispose it, which
+    // reset the 1 Hz throttle and dropped the TAK connection.
+    final pubCfg = _cotPublisherConfig();
+    final oldPub = _cotPublisher;
+    if (oldPub == null || !_samePublisherConfig(oldPub.config, pubCfg)) {
+      oldPub?.dispose();
+      _cotPublisher = CotPublisher(config: pubCfg);
+    }
     final listener = _cotListener;
     if (settings.cotListenEnabled) {
       final configChanged = listener == null ||
@@ -652,9 +671,11 @@ class AppState extends ChangeNotifier {
           // is best-effort; detection authority is untouched.
           await l.start();
         } catch (_) {}
-        if (gen != _cotConfigureGen) {
-          // Superseded while starting: our just-bound socket belongs
-          // to a stale generation — tear it down, don't leak it.
+        if (gen != _cotConfigureGen && !identical(l, _cotListener)) {
+          // Superseded while starting AND the newer generation
+          // replaced this listener: tear down our orphan. If the
+          // newer generation reuses [l], it owns it — stopping it here
+          // would silently kill the live listener.
           await l.stop();
         }
       }
@@ -882,7 +903,9 @@ class AppState extends ChangeNotifier {
         // activeEmitterCount excludes future-dated observations —
         // they can never coincide, so they are not "tracked".
         final m = listener.activeEmitterCount;
-        segs.add('listening ($m emitter${m == 1 ? '' : 's'} tracked)');
+        final warn = listener.warning;
+        segs.add('listening ($m emitter${m == 1 ? '' : 's'} tracked'
+            '${warn == null ? '' : ' · $warn'})');
       }
     }
     if (segs.isEmpty) return null;
@@ -1618,7 +1641,29 @@ class AppState extends ChangeNotifier {
     );
   }
 
+  DateTime? _cotListenRetryAt;
+
+  /// A listener whose bind failed or whose socket died is retried
+  /// every 15 s instead of staying dead until the next settings edit.
+  /// Routed through _configureCot (not l.start() directly) so the retry
+  /// always operates on the current listener under the generation guards —
+  /// a bare l.start() could resurrect a discarded listener and leak an
+  /// orphan multicast socket.
+  void _retryCotListener() {
+    final l = _cotListener;
+    if (!settings.cotListenEnabled || l == null) return;
+    if (l.isListening || l.lastError == null) return;
+    final now = DateTime.now();
+    final last = _cotListenRetryAt;
+    if (last != null && now.difference(last) < const Duration(seconds: 15)) {
+      return;
+    }
+    _cotListenRetryAt = now;
+    unawaited(_configureCot());
+  }
+
   void _watchdogTick() {
+    _retryCotListener();
     if (!polling) return;
     final level = health.level;
     final prev = _lastCoverage;

@@ -2,6 +2,7 @@ package com.example.rf_sentry
 
 import android.content.Context
 import android.content.pm.PackageManager
+import android.net.wifi.WifiManager
 import android.net.wifi.aware.AttachCallback
 import android.net.wifi.aware.DiscoverySession
 import android.net.wifi.aware.DiscoverySessionCallback
@@ -37,7 +38,10 @@ class MainActivity : FlutterActivity() {
     companion object {
         private const val AWARE_METHOD = "rf_sentry/wifi_aware"
         private const val AWARE_EVENTS = "rf_sentry/wifi_aware_events"
+        private const val MCAST_METHOD = "shepherd/multicast_lock"
     }
+
+    private var multicastLock: WifiManager.MulticastLock? = null
 
     private var eventSink: EventChannel.EventSink? = null
     private var discoverySession: DiscoverySession? = null
@@ -45,6 +49,19 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        // Multicast lock for CoT ingest (cot_listener.dart). Held only
+        // while the listener is running.
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, MCAST_METHOD)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "acquire" -> result.success(acquireMulticastLock())
+                    "release" -> {
+                        releaseMulticastLock()
+                        result.success(null)
+                    }
+                    else -> result.notImplemented()
+                }
+            }
         // --- AWARE block start (safe to delete; see class doc) ---
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, AWARE_METHOD)
             .setMethodCallHandler { call, result ->
@@ -71,6 +88,34 @@ class MainActivity : FlutterActivity() {
                 }
             })
         // --- AWARE block end ---
+    }
+
+    private fun acquireMulticastLock(): Boolean {
+        return try {
+            if (multicastLock?.isHeld == true) return true
+            val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE)
+                as? WifiManager ?: return false
+            val lock = wifi.createMulticastLock("shepherd-cot")
+            lock.setReferenceCounted(false)
+            lock.acquire()
+            multicastLock = lock
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun releaseMulticastLock() {
+        try {
+            multicastLock?.let { if (it.isHeld) it.release() }
+        } catch (_: Exception) {
+        }
+        multicastLock = null
+    }
+
+    override fun onDestroy() {
+        releaseMulticastLock()
+        super.onDestroy()
     }
 
     private fun awareManager(): WifiAwareManager? {

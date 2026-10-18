@@ -381,4 +381,26 @@ void main() {
       }
     });
   });
+
+  group('start/stop serialization', () {
+    test('concurrent start()s then stop() leave the listener stopped',
+        () async {
+      // Port 0 = ephemeral; works whether or not the host allows
+      // multicast joins (a failed join just records lastError).
+      final l = CotListener(
+          config: const CotListenerConfig(enabled: true, multicastPort: 0));
+      final a = l.start();
+      final b = l.start();
+      final c = l.stop();
+      await Future.wait([a, b, c]);
+      expect(l.isListening, isFalse);
+    });
+
+    test('start() on a disabled listener is a no-op', () async {
+      final l = CotListener(config: const CotListenerConfig());
+      await l.start();
+      expect(l.isListening, isFalse);
+      expect(l.lastError, isNull);
+    });
+  });
 }

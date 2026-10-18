@@ -25,6 +25,8 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 
+import 'multicast_lock.dart';
+
 /// Ingest configuration. Listening is OFF by default — ingesting
 /// someone else's emitter tracks must be a deliberate act.
 class CotListenerConfig {
@@ -314,34 +316,86 @@ class CotListener {
     return out;
   }
 
+  /// start()/stop() run strictly one after another. Concurrent calls
+  /// (rapid settings edits) used to interleave across the socket
+  /// awaits, leaking a socket or stopping one a newer call relied on.
+  Future<void> _opChain = Future<void>.value();
+
+  Future<void> _serialize(Future<void> Function() op) {
+    final next = _opChain.then((_) => op()).catchError((Object _) {});
+    _opChain = next;
+    return next;
+  }
+
+  /// Non-fatal condition (listening, but degraded), e.g. the Android
+  /// multicast lock could not be taken. Null when healthy.
+  String? _warning;
+  String? get warning => _warning;
+
   /// Join the CoT multicast group and ingest datagrams. No-op when
   /// disabled. A bind failure does NOT throw: it is recorded in
   /// [lastError] and the listener reports not-listening, so the
-  /// dashboard can say so instead of claiming to listen.
-  Future<void> start() async {
+  /// dashboard can say so instead of claiming to listen. A socket that
+  /// dies later (network change, interface down) is detected through
+  /// the stream's error/done handlers and also reported.
+  Future<void> start() => _serialize(_start);
+
+  Future<void> _start() async {
     if (!config.enabled) return;
-    await stop();
+    await _stop();
     _lastError = null;
-    try {
-      _socket = await RawDatagramSocket.bind(
-          InternetAddress.anyIPv4, config.multicastPort);
-      _socket!.joinMulticast(InternetAddress(config.multicastGroup));
-      _socket!.listen((event) {
-        if (event == RawSocketEvent.read) {
-          final dg = _socket?.receive();
-          if (dg != null) {
-            handleDatagram(dg.data, DateTime.now().toUtc());
-          }
-        }
-      });
-    } catch (e) {
-      _lastError = e.toString();
-      _socket = null;
+    _warning = null;
+    // Android drops inbound multicast without a MulticastLock.
+    final locked = await MulticastLock.acquire();
+    if (!locked) {
+      _warning = 'multicast lock unavailable — Wi-Fi may drop CoT';
     }
+    RawDatagramSocket? sock;
+    try {
+      sock = await RawDatagramSocket.bind(
+          InternetAddress.anyIPv4, config.multicastPort);
+      sock.joinMulticast(InternetAddress(config.multicastGroup));
+    } catch (e) {
+      try {
+        sock?.close();
+      } catch (_) {}
+      _lastError = e.toString();
+      await MulticastLock.release();
+      return;
+    }
+    final bound = sock;
+    _socket = bound;
+    bound.listen(
+      (event) {
+        if (event != RawSocketEvent.read) return;
+        // Drain everything queued; one receive per event can lag.
+        for (var dg = bound.receive(); dg != null; dg = bound.receive()) {
+          handleDatagram(dg.data, DateTime.now().toUtc());
+        }
+      },
+      onError: (Object e) => _socketDied(bound, e.toString()),
+      onDone: () => _socketDied(bound, 'socket closed'),
+      cancelOnError: true,
+    );
+  }
+
+  /// The socket ended without [stop] being called. Only acts when it
+  /// is still the current socket (our own close clears [_socket]
+  /// first, so an intentional stop is ignored here).
+  void _socketDied(RawDatagramSocket sock, String why) {
+    if (!identical(_socket, sock)) return;
+    _socket = null;
+    _lastError = 'listen socket lost: $why';
+    try {
+      sock.close();
+    } catch (_) {}
+    unawaited(MulticastLock.release());
   }
 
   /// Leave the group and close the socket.
-  Future<void> stop() async {
+  Future<void> stop() => _serialize(_stop);
+
+  Future<void> _stop() async {
     final sock = _socket;
     _socket = null;
     if (sock != null) {
@@ -351,6 +405,7 @@ class CotListener {
       try {
         sock.close();
       } catch (_) {}
+      await MulticastLock.release();
     }
   }
 

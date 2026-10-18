@@ -98,6 +98,11 @@ table — the old spec's `SHEPHERD <trackId>` with a space is superseded).
 ### 2. CoT ingest — `lib/services/cot_listener.dart` (new)
 - Join UDP multicast `239.2.3.1:6969`; parse CoT XML events (position, time,
   callsign, type).
+- **Android note:** most Android Wi-Fi stacks drop inbound multicast unless
+  the app holds a `MulticastLock` — the listener acquires one
+  (`lib/services/multicast_lock.dart` ↔ `MainActivity.kt`,
+  `CHANGE_WIFI_MULTICAST_STATE`) while running, released on stop. No-op on
+  other platforms.
 - Keep only events whose callsign starts with the configured emitter prefix
   (default `PREDATOR-`; operator-editable so any CoT emitter can feed it).
 - Hold emitter observations in a time window (default 60 s; stale events drop).

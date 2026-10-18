@@ -306,7 +306,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       cotEmitUseMulticast: _cotEmitUseMulticast,
       cotTakHost: _cotTakHost.text.trim(),
       cotTakPort:
-          (int.tryParse(_cotTakPort.text.trim()) ?? 8089).clamp(1, 65535),
+          (int.tryParse(_cotTakPort.text.trim()) ?? 8087).clamp(1, 65535),
       cotStaleSeconds:
           (int.tryParse(_cotStaleSeconds.text.trim()) ?? 30).clamp(5, 300),
       cotPublishFloor: (double.tryParse(_cotPublishFloor.text.trim()) ??
@@ -622,7 +622,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               const SizedBox(height: 10),
               _field(_cotTakHost, 'TAK server host', 'e.g. 192.168.1.10'),
               const SizedBox(height: 10),
-              _field(_cotTakPort, 'TAK server port', 'e.g. 8089',
+              _field(_cotTakPort, 'TAK server port', 'e.g. 8087 (plaintext TCP; 8089 is TLS)',
                   numeric: true),
             ],
             const SizedBox(height: 10),
