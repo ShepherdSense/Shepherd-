@@ -6,12 +6,16 @@
  *
  *   BUILT-IN (always on)
  *     wifi  - WiFi CSI/RSSI promiscuous sniffer + edge tripwire detector
+ *             (+ Suzuki CSI motion channel: symmetric-pair phase averaging
+ *             per frame, 1 s Hz-deviation, wind-gated; with no WIND source
+ *             the motion features stay DISABLED — RSSI tripwire unaffected)
  *     ble   - BLE advertisement scanner (time-sliced; new-device events)
  *   SPI (auto-detected at boot — enabled only if the module answers)
  *     nrf24 - nRF24L01 2.4 GHz band-energy sweep (RPD across ch 0..125)
  *     cc110 - CC1101 sub-GHz RSSI (default 433.92 MHz, changeable)
  *   UART (generic — any external module can stream readings in)
  *     uart  - Serial2 text protocol:  SENSOR <name> <rssi_dbm> [detail]
+ *                                     WIND <name> <wind_ms> [gust_ms]
  *             (compiled out when LD2450_ON — UART2 is either/or)
  *
  * OPTIONAL (compile flags below, all default OFF except GPS time sync)
@@ -36,6 +40,12 @@
 // #define LD2450_ON      // LD2450 radar on UART2 @256000 (either/or with text protocol)
 // #define ESPNOW_RELAY   // ESP-NOW event relay mesh
 // #define IMU_ON         // MPU6050 motion-energy channel
+// #define CSI_BENCH      // CSI frame-rate bench (docs/validation_benches_spec.md
+//                        // Part B). COMPILE FLAG ONLY, OFF BY DEFAULT, NEVER
+//                        // in a shipping build: pushes CSI amplitude reports
+//                        // at 100/250/500/1000 Hz over UDP 49160 with seq
+//                        // numbers, 60 s per step. Build with:
+//                        //   --build-property build.extra_flags="-DCSI_BENCH"
 
 /*
  * Detection is local and deterministic (rolling baseline + MAD threshold,
@@ -48,7 +58,11 @@
  *            "fps":42,"events":3,"uptime_s":1234,
  *            "sensors":["wifi","ble","nrf24"],"ble_seen":5,
  *            "lat":12.345678,"lon":-45.123456,"pps":1,
- *            "rdrop":0,"rch_warn":0}
+ *            "rdrop":0,"rch_warn":0,"calib":0}
+ *            (calib 1 = node is participating in the app's vacant-window
+ *            calibration (docs/adaptive_baseline_spec.md). RAM-only,
+ *            cleared on boot and auto-expired after 3 min — a node that
+ *            reboots mid-window never contaminates the fit.)
  *            (lat/lon 0,0 and pps 0 when no GPS fix/lock; rdrop counts
  *            relay packets dropped (oversize/queue-full/send-fail);
  *            rch_warn 1 = AP channel != relay_ch pref)
@@ -60,6 +74,27 @@
  *            t_us across unlocked nodes. MOTION events carry
  *            "context":true; consumers must filter on sensor+class or
  *            the context flag, never on conf alone.)
+ *   sensor_obs (UDP 49160, 1 Hz, additive):
+ *            {"type":"sensor_obs","obs":"CSI","node":"SHN-XXXX",
+ *            "sensor":"csi_wifi","dev_hz":12.4,"pairs_active":19,
+ *            "path_loss_db":54.0,"link":"wifi_ch6","wind_ms":1.8,
+ *            "wind_gated":false,"lat":..,"lon":..,"t":..}
+ *            dev_hz = max per-pair Hz-deviation of the Suzuki-averaged
+ *            phase (docs/esp32_csi_pipeline_spec.md). dev_hz bands are
+ *            SIZE-CLASS HEURISTICS for the app's merger — never identity
+ *            claims; the 55/60 dB link-budget knees are app-side gates,
+ *            never firmware. path_loss_db is a crude firmware placeholder
+ *            (assumes 20 dBm TX on sniffed frames; -1 = unknown) — the app
+ *            re-derives the real per-link budget. wind_gated:true with
+ *            wind_ms:-1 means NO WIND SOURCE: CSI motion features are
+ *            DISABLED by default (fail-safe); while wind_gated is true
+ *            dev_hz is 0.0 and pairs_active 0 ON THE WIRE (defense in
+ *            depth — a consumer ignoring the flag sees no claim; the
+ *            flag itself is still present). The RSSI tripwire is
+ *            unaffected. t follows the t_us clock caveat above.
+ *            {"type":"sensor_obs","obs":"WIND","node":"SHN-XXXX",
+ *            "sensor":"anem1","wind_ms":4.2,"gust_ms":6.1,"t":..}
+ *            — forwarded when a WIND line arrives on UART (see below).
  *   relay (ESP-NOW only, never on UDP):
  *            {"type":"relay","id":12345,"ttl":4,"ev":{...event...}}
  *
@@ -106,6 +141,10 @@
 #include <BLEScan.h>
 #include "esp_wifi.h"
 #include "driver/gpio.h"   // gpio_pullup_en for the floating GPS RX pin
+#ifdef CSI_BENCH
+#include "esp_timer.h"
+#include "esp_freertos_hooks.h"
+#endif
 #ifdef ESPNOW_RELAY
 #include <esp_now.h>
 #endif
@@ -159,6 +198,16 @@ char nodeCallsign[17] = "";
 uint32_t bootMs = 0;
 uint32_t eventCount = 0;
 float lastWifiMetric = 0;
+float lastCsiDevHz = 0;    // last 1 s CSI aggregation (status page)
+int lastCsiPairs = 0;
+
+// Vacant-window calibration participation (docs/adaptive_baseline_spec.md):
+// RAM-only, cleared on every boot — a node that reboots mid-window must
+// NOT contaminate the app's fit, so this is never persisted and the app
+// must re-confirm via /calib?v=1 after any reboot. Auto-expires after
+// 3 min without a refresh.
+bool calibActive = false;
+uint32_t calibSetMs = 0;
 
 // sensors actually alive on this node (advertised in beacons)
 char sensorList[128] = "wifi,ble";
@@ -369,6 +418,211 @@ void sendEvent(const char *sensor, float durS, float depthDb,
                 dSafe);
 }
 
+#ifdef CSI_BENCH
+// ---------------- CSI frame-rate bench (Part B, validation_benches_spec.md) ----
+// COMPILE FLAG ONLY (-DCSI_BENCH), OFF BY DEFAULT, NEVER IN A SHIPPING
+// BUILD. Measures the raw CSI-report pipeline: pushes CSI amplitude
+// reports at stepped offered rates 100 -> 250 -> 500 -> 1000 frames/s
+// over UDP 49160 with sequence numbers, 60 s per step. Each datagram
+// carries the latest real CSI amplitude vector when one arrived in the
+// last 500 ms ("syn":0), else a synthetic ramp ("syn":1) so the OFFERED
+// rate is exact and reproducible. The RECEIVING host computes the
+// sustained rate and drop % from the sequence numbers; the node logs
+// offered/sent/send-fail/pending-drops + per-core CPU (idle-hook method)
+// + heap low-water + ambient CSI fps per step over Serial:
+//   {"type":"csi_bench","step":2,"hz":500,"seq":12345,"t_us":...,
+//    "syn":0,"a":"<128 hex chars: 64 subcarrier amplitudes>"}
+// What this measures: serialization + UDP + callback cost with the FULL
+// production stack (tripwire, CSI pipeline, beacons) still running. It is
+// a frame-rate feasibility number ONLY — never a localization result.
+// CPU method: per-core FreeRTOS idle-hook counters; a 3 s calm phase at
+// bench start calibrates idle counts/sec, then
+// cpu% = 100*(1 - idle_this_sec/idle_base). Task-watchdog events: the
+// task WDT is deliberately NOT enabled here (a UDP-burst stall would
+// reset the node mid-bench); liveness is the ambient csi_fps column —
+// frames flowing means the Wi-Fi task lives. Auto-starts 15 s after
+// boot; when the flag is off, none of this exists (zero impact on the
+// production 1 s tripwire cadence).
+
+#define BENCH_NSTEPS 4
+const int BENCH_HZ[BENCH_NSTEPS] = {100, 250, 500, 1000};
+#define BENCH_STEP_MS 60000UL
+#define BENCH_CALM_MS 3000UL
+#define BENCH_AUTOSTART_MS 15000UL
+
+uint8_t benchAmp[64];          // latest real per-subcarrier amplitudes
+bool benchAmpFresh = false;
+uint32_t benchAmpMs = 0;
+
+struct BenchState {
+  bool running = false, done = false, calm = false;
+  int step = 0;
+  uint32_t stepStartMs = 0, autoStartMs = 0, calmStartMs = 0;
+  uint32_t seq = 0, offered = 0, sent = 0, sendFail = 0, pendDrop = 0;
+  uint32_t idleBase[2] = {0, 0};
+  uint32_t idlePrev[2] = {0, 0};
+  uint32_t calmIdle[2] = {0, 0};
+  uint32_t cpuSum[2] = {0, 0};
+  int cpuN = 0;
+  uint32_t heapMin = 0, csiFpsSum = 0;
+  int fpsN = 0;
+  volatile uint32_t idleCnt[2] = {0, 0};
+};
+BenchState bench;
+volatile uint32_t benchPending = 0;   // timer ticks awaiting datagrams
+esp_timer_handle_t benchTimer = NULL;
+
+static bool IRAM_ATTR benchIdle0() { bench.idleCnt[0]++; return false; }
+static bool IRAM_ATTR benchIdle1() { bench.idleCnt[1]++; return false; }
+static void IRAM_ATTR benchTickIsr(void *arg) {
+  (void)arg;
+  benchPending++;   // offered is counted when the tick is drained/sent
+}
+
+// fwd: g_csiMux is declared just below (CSI section)
+extern portMUX_TYPE g_csiMux;
+
+static void benchSendOne() {
+  bench.offered++;
+  bench.seq++;
+  // Payload: latest real amplitudes if fresh, else a synthetic ramp.
+  uint8_t a[64];
+  bool syn = true;
+  uint32_t nowMs = millis();
+  if (benchAmpFresh && nowMs - benchAmpMs < 500) {
+    portENTER_CRITICAL(&g_csiMux);   // csi_cb may be writing benchAmp
+    memcpy(a, benchAmp, 64);
+    portEXIT_CRITICAL(&g_csiMux);
+    syn = false;
+  } else {
+    for (int i = 0; i < 64; i++) a[i] = (uint8_t)((i * 4) & 0xFF);
+  }
+  static const char *hd = "0123456789abcdef";
+  char hex[129];
+  for (int i = 0; i < 64; i++) {
+    hex[2 * i] = hd[a[i] >> 4]; hex[2 * i + 1] = hd[a[i] & 15];
+  }
+  hex[128] = 0;
+  char buf[320];
+  int n = snprintf(buf, sizeof(buf),
+    "{\"type\":\"csi_bench\",\"step\":%d,\"hz\":%d,\"seq\":%lu,"
+    "\"t_us\":%llu,\"syn\":%d,\"a\":\"%s\"}",
+    bench.step, BENCH_HZ[bench.step], (unsigned long)bench.seq,
+    (unsigned long long)nodeNowUs(), syn ? 1 : 0, hex);
+  bool ok = false;
+  if (n > 0 && n < (int)sizeof(buf)) {
+    udp.beginPacket(IPAddress(192, 168, 4, 255), BEACON_PORT);
+    udp.write((uint8_t *)buf, n);
+    ok = (udp.endPacket() == 1);
+  }
+  if (ok) bench.sent++; else bench.sendFail++;
+}
+
+static void benchStartStep(int s) {
+  bench.step = s;
+  bench.offered = bench.sent = bench.sendFail = bench.pendDrop = 0;
+  bench.cpuSum[0] = bench.cpuSum[1] = 0; bench.cpuN = 0;
+  bench.heapMin = ESP.getFreeHeap();
+  bench.csiFpsSum = 0; bench.fpsN = 0;
+  bench.idlePrev[0] = bench.idleCnt[0];
+  bench.idlePrev[1] = bench.idleCnt[1];
+  bench.stepStartMs = millis();
+  benchPending = 0;
+  if (benchTimer) {
+    esp_timer_stop(benchTimer);
+    esp_timer_start_periodic(benchTimer, 1000000 / BENCH_HZ[s]);
+  }
+  Serial.printf("[BENCH] step %d: offering %d Hz for 60 s\n", s, BENCH_HZ[s]);
+}
+
+static void benchEndStep() {
+  if (benchTimer) esp_timer_stop(benchTimer);
+  uint32_t dt = millis() - bench.stepStartMs;
+  float cpu0 = bench.cpuN ? (float)bench.cpuSum[0] / bench.cpuN : -1;
+  float cpu1 = bench.cpuN ? (float)bench.cpuSum[1] / bench.cpuN : -1;
+  float fps = bench.fpsN ? (float)bench.csiFpsSum / bench.fpsN : 0;
+  // offered vs sent here; the RECEIVING host derives sustained rate and
+  // drop % from the seq numbers (that is the B1 measurement).
+  Serial.printf("[BENCH] step %d hz=%d t=%.1fs offered=%lu sent=%lu "
+                "send_fail=%lu pend_drop=%lu cpu0=%.0f%% cpu1=%.0f%% "
+                "heap_min=%lu csi_fps=%.1f\n",
+                bench.step, BENCH_HZ[bench.step], dt / 1000.0f,
+                (unsigned long)bench.offered, (unsigned long)bench.sent,
+                (unsigned long)bench.sendFail, (unsigned long)bench.pendDrop,
+                cpu0, cpu1, (unsigned long)bench.heapMin, fps);
+}
+
+static void benchStart() {
+  esp_timer_create_args_t args;
+  memset(&args, 0, sizeof(args));
+  args.callback = &benchTickIsr;
+  args.dispatch_method = ESP_TIMER_TASK;   // timer-task context is plenty:
+                                          // the callback only bumps a counter
+  args.name = "csi_bench";
+  if (esp_timer_create(&args, &benchTimer) != ESP_OK) {
+    Serial.println("[BENCH] timer create failed; bench off");
+    bench.done = true;
+    return;
+  }
+  esp_register_freertos_idle_hook_for_cpu(benchIdle0, 0);
+  esp_register_freertos_idle_hook_for_cpu(benchIdle1, 1);
+  bench.calm = true;
+  bench.calmStartMs = millis();
+  bench.calmIdle[0] = bench.idleCnt[0];
+  bench.calmIdle[1] = bench.idleCnt[1];
+  Serial.println("[BENCH] calibrating idle baseline (3 s calm)...");
+}
+
+// Called from the 1 s tick. csiFps = ambient CSI frames seen that second.
+static void benchSecondTick(uint32_t nowMs, uint32_t csiFps) {
+  if (bench.done) return;
+  if (!bench.running) {
+    if (bench.autoStartMs == 0) bench.autoStartMs = bootMs + BENCH_AUTOSTART_MS;
+    if ((int32_t)(nowMs - bench.autoStartMs) < 0) return;
+    bench.running = true;
+    benchStart();
+    return;
+  }
+  if (bench.calm) {
+    if (nowMs - bench.calmStartMs >= BENCH_CALM_MS) {
+      uint32_t dt = nowMs - bench.calmStartMs;
+      for (int c = 0; c < 2; c++) {
+        uint32_t d = bench.idleCnt[c] - bench.calmIdle[c];
+        bench.idleBase[c] = dt ? (uint32_t)((uint64_t)d * 1000 / dt) : 0;
+      }
+      bench.calm = false;
+      Serial.printf("[BENCH] idle base/s: cpu0=%lu cpu1=%lu\n",
+                    (unsigned long)bench.idleBase[0],
+                    (unsigned long)bench.idleBase[1]);
+      benchStartStep(0);
+    }
+    return;
+  }
+  for (int c = 0; c < 2; c++) {
+    uint32_t d = bench.idleCnt[c] - bench.idlePrev[c];
+    bench.idlePrev[c] = bench.idleCnt[c];
+    if (bench.idleBase[c] > 0) {
+      float cpu = 100.0f * (1.0f - (float)d / (float)bench.idleBase[c]);
+      if (cpu < 0) cpu = 0; if (cpu > 100) cpu = 100;
+      bench.cpuSum[c] += (uint32_t)cpu;
+    }
+  }
+  bench.cpuN++;
+  uint32_t fh = ESP.getFreeHeap();
+  if (fh < bench.heapMin) bench.heapMin = fh;
+  bench.csiFpsSum += csiFps; bench.fpsN++;
+  if (nowMs - bench.stepStartMs >= BENCH_STEP_MS) {
+    benchEndStep();
+    if (bench.step + 1 < BENCH_NSTEPS) benchStartStep(bench.step + 1);
+    else {
+      bench.running = false; bench.done = true;
+      Serial.println("[BENCH] DONE — all 4 steps complete. "
+                     "This build is bench-only; NEVER ship it.");
+    }
+  }
+}
+#endif  // CSI_BENCH
+
 // ---------------- WiFi CSI sniffer ----------------
 volatile uint32_t g_frames = 0;
 volatile int32_t  g_rssiSum = 0;
@@ -377,12 +631,228 @@ volatile int32_t  g_rssiSum = 0;
 // the read and the reset was silently lost.
 portMUX_TYPE g_csiMux = portMUX_INITIALIZER_UNLOCKED;
 
+// ---- Suzuki symmetric-subcarrier phase pipeline (Stage 1 firmware) ----
+// docs/esp32_csi_pipeline_spec.md: per CSI frame, for each symmetric pair
+// (+k,-k) in the 20 MHz HT CSI, m(k) = (c(+k) + conj(c(-k)))/2. CFO/SFO/
+// packet-delay phase errors are ~linear across subcarriers (+k*alpha on
+// +k, -k*alpha on -k) so they cancel in the sum; the true channel phase
+// (even-symmetric under conjugation) adds. NO phase unwrapping, NO
+// regression fit. arg(m(k)) lands in a per-pair 1 s ring (nodeNowUs()
+// timestamps); once a second the loop computes the per-pair Hz-deviation
+// (zero-crossing rate of the detrended phase) and reports the max pair
+// as the link dev_hz. RX-only: this sniffs ambient frames, nothing here
+// transmits.
+//
+// Buffer layout (ESP32, this node's CSI config: lltf+htltf merged,
+// channel filter on): data->len == 192 -> 64 subcarriers x 3 bytes
+// (I int8, Q int8, reserved). Subcarrier index i maps to (i-32); the
+// valid 20 MHz data/pilot tones are k = +/-1..28, i.e. 28 symmetric
+// pairs (slots 28..31 stay empty — "up to 32 pairs" per the spec). A
+// len==128 (64 x I/Q) layout is also accepted defensively; anything else
+// is skipped. first_word_invalid only touches subcarrier -32, outside
+// our pairs. Single antenna: this is a SCALAR disturbance metric — no
+// bearing, no identity; dev_hz bands are size-class heuristics only.
+#define CSI_NPAIR 32
+#define CSI_KMAX  28
+#define CSI_RINGN 64
+#define CSI_AMP_FLOOR 2.0f   // mean |m(k)| below this: pair not "active"
+                             // (heuristic noise floor, int8 I/Q units)
+
+struct CsiPairRing {
+  uint32_t t32[CSI_RINGN];  // nodeNowUs() low 32 bits; wrap-safe 1 s window
+  float ph[CSI_RINGN];      // arg(m(k)), radians, wrapped [-pi,pi]
+  float amp[CSI_RINGN];     // |m(k)|, linear int8 units
+  uint8_t head = 0;
+  uint8_t n = 0;
+};
+CsiPairRing csiRing[CSI_NPAIR];
+
+// Parse one CSI frame into the pair rings. Called from csi_cb with
+// g_csiMux already held.
+static void csiPushFrame(wifi_csi_info_t *data, uint32_t t32) {
+  if (!data || !data->buf) return;
+  int8_t *b = data->buf;
+  int stride = 0;
+  if (data->len == 192)      stride = 3;   // 64 subcarriers x (I,Q,res)
+  else if (data->len == 128) stride = 2;   // 64 subcarriers x (I,Q)
+  else return;                             // unknown layout: skip
+#ifdef CSI_BENCH
+  // Bench payload: per-subcarrier amplitude of this frame.
+  for (int i = 0; i < 64; i++) {
+    float iv = b[i * stride], qv = b[i * stride + 1];
+    float a = sqrtf(iv * iv + qv * qv);
+    benchAmp[i] = a > 255.0f ? 255 : (uint8_t)a;
+  }
+  benchAmpFresh = true;
+  benchAmpMs = millis();
+#endif
+  for (int k = 1; k <= CSI_KMAX; k++) {
+    int ip = 32 + k, im = 32 - k;              // subcarrier +k / -k
+    float Ip = b[ip * stride], Qp = b[ip * stride + 1];
+    float Im = b[im * stride], Qm = b[im * stride + 1];
+    // m(k) = (c(+k) + conj(c(-k))) / 2
+    float mr = (Ip + Im) * 0.5f;
+    float mi = (Qp - Qm) * 0.5f;
+    float a = sqrtf(mr * mr + mi * mi);
+    if (a < 0.5f) continue;                    // dead tone: skip rather
+                                               // than store a fake phase
+    CsiPairRing &r = csiRing[k - 1];
+    r.t32[r.head] = t32;
+    r.ph[r.head] = atan2f(mi, mr);
+    r.amp[r.head] = a;
+    r.head = (r.head + 1) % CSI_RINGN;
+    if (r.n < CSI_RINGN) r.n++;
+  }
+}
+
 void csi_cb(void *ctx, wifi_csi_info_t *data) {
+  (void)ctx;
   if (!data) return;
+  uint32_t t32 = (uint32_t)nodeNowUs();  // captured before the lock
   portENTER_CRITICAL(&g_csiMux);
   g_frames++;
   g_rssiSum += data->rx_ctrl.rssi;
+  csiPushFrame(data, t32);   // Suzuki averaging + ring store
   portEXIT_CRITICAL(&g_csiMux);
+}
+
+// Once-per-second CSI aggregation (loop context, g_csiMux held by the
+// caller). Per pair: zero-crossing rate of the detrended phase over the
+// 1 s window — dev_pair = crossings / (2*T). Link dev_hz = max pair.
+// No unwrapping anywhere: the ZCR of wrapped phase still measures the
+// fluctuation rate the paper's metric wants (a monotonic drift wrapped
+// to a sawtooth crosses zero at the same rate as the underlying tone).
+static void csiAggregate1s(uint32_t now32, float &devHz, int &pairsActive,
+                           float &meanAmpAll) {
+  devHz = 0; pairsActive = 0; meanAmpAll = 0;
+  int ampN = 0;
+  for (int p = 0; p < CSI_KMAX; p++) {
+    CsiPairRing &r = csiRing[p];
+    if (r.n < 8) continue;
+    // Chronological walk (single writer: insertion order == time order).
+    int idx = (int)r.head - (int)r.n;
+    if (idx < 0) idx += CSI_RINGN;
+    // First pass: mean phase + mean amplitude over the 1 s window.
+    float mean = 0, ampSum = 0;
+    int m = 0;
+    uint32_t tFirst = 0, tLast = 0;
+    for (int j = 0; j < r.n; j++) {
+      int ii = idx + j;
+      if (ii >= CSI_RINGN) ii -= CSI_RINGN;
+      if (now32 - r.t32[ii] > 1000000UL) continue;   // wrap-safe age
+      mean += r.ph[ii]; m++;
+      ampSum += r.amp[ii];
+      if (tFirst == 0) tFirst = r.t32[ii];
+      tLast = r.t32[ii];
+    }
+    if (m < 8) continue;
+    uint32_t spanUs = tLast - tFirst;                // wrap-safe
+    // Frame-rate ceiling: the ring holds 64 entries/pair. Above ~320
+    // frames/s those 64 entries span < 200 ms, the check below skips
+    // every pair, and dev_hz silently reports 0 for the whole second.
+    // Fail-silent is the correct behavior here (a deviation drawn from
+    // an under-spanned window would be a meaningless number), so this
+    // is documented, not fixed.
+    if (spanUs < 200000UL) continue;                 // need real time span
+    mean /= m;
+    float mAmp = ampSum / m;
+    meanAmpAll += mAmp; ampN++;
+    // Second pass: zero crossings of the detrended series.
+    int cross = 0;
+    bool havePrev = false, prevPos = false;
+    for (int j = 0; j < r.n; j++) {
+      int ii = idx + j;
+      if (ii >= CSI_RINGN) ii -= CSI_RINGN;
+      if (now32 - r.t32[ii] > 1000000UL) continue;
+      bool pos = (r.ph[ii] - mean) >= 0.0f;
+      if (havePrev && pos != prevPos) cross++;
+      prevPos = pos; havePrev = true;
+    }
+    float dev = cross / (2.0f * (spanUs / 1000000.0f));
+    if (dev > devHz) devHz = dev;
+    if (mAmp > CSI_AMP_FLOOR) pairsActive++;
+  }
+  if (ampN > 0) meanAmpAll /= ampN;
+}
+
+// ---- Wind gate (docs/esp32_csi_pipeline_spec.md Stage 2) ----
+// WIND observations arrive on UART as "WIND <name> <wind_ms> [gust_ms]"
+// (parsed like SENSOR lines in uartPoll). There is no UDP RX path on the
+// node, so app-forwarded wind arrives UART-only — documented, not a gap.
+// While wind_ms >= 3.5 (Suzuki's gate) motion claims are suppressed and
+// wind_gated:true is reported. With NO wind source the CSI motion
+// features are DISABLED by default (fail-safe, wind_gated:true
+// permanently); the RSSI tripwire is unaffected.
+char windName[16] = "";
+float windMs = 0, windGustMs = -1;
+bool windHasGust = false, windSeen = false;
+uint32_t windRxMs = 0;
+#define WIND_STALE_MS 300000UL   // 5 min: weather changes slowly
+#define WIND_GATE_MPS 3.5f       // Suzuki's gate
+
+// declared in the GPS section below; needed here for the sensor_obs emit
+extern double gpsLat, gpsLon;
+
+static void sendSensorObsWind(uint64_t nowUs) {
+  char buf[256], sSafe[16];
+  jsonSafe(sSafe, sizeof(sSafe), windName[0] ? windName : "wind");
+  int n;
+  if (windHasGust)
+    n = snprintf(buf, sizeof(buf),
+      "{\"type\":\"sensor_obs\",\"obs\":\"WIND\",\"node\":\"%s\",\"sensor\":\"%s\","
+      "\"wind_ms\":%.1f,\"gust_ms\":%.1f,\"t\":%.1f}",
+      nodeId, sSafe, windMs, windGustMs, nowUs / 1000000.0);
+  else
+    n = snprintf(buf, sizeof(buf),
+      "{\"type\":\"sensor_obs\",\"obs\":\"WIND\",\"node\":\"%s\",\"sensor\":\"%s\","
+      "\"wind_ms\":%.1f,\"t\":%.1f}",
+      nodeId, sSafe, windMs, nowUs / 1000000.0);
+  if (n > 0 && n < (int)sizeof(buf)) {
+    udp.beginPacket(IPAddress(192, 168, 4, 255), BEACON_PORT);
+    udp.write((uint8_t *)buf, n);
+    udp.endPacket();
+  }
+}
+
+// Once-per-second CSI sensor_obs emission (called from the 1 s tick).
+// dev_hz bands are SIZE-CLASS HEURISTICS for the app's merger, never
+// identity claims; the 55/60 dB link-budget knees are app-side gates.
+static void csiSecondTick(uint32_t nowMs, float devHz, int pairsActive,
+                          float pathLossDb) {
+  uint64_t nowUs = nodeNowUs();
+  bool windKnown = windSeen && (nowMs - windRxMs) < WIND_STALE_MS;
+  bool gated = !windKnown || windMs >= WIND_GATE_MPS;
+  // SF3: the "link" label is per-CHANNEL, not per-AP-link. This firmware
+  // aggregates EVERY CSI frame seen on the channel into one scalar
+  // metric (wifi_ch%d) with no per-MAC separation — frames from different
+  // APs carry independent CFO/channel phases, so mixing them muddies the
+  // ZCR metric. Known degradation vs the paper's single-link result
+  // (docs/esp32_csi_pipeline_spec.md Stage 1). Per-AP (per-source) rings
+  // would multiply RAM unsafely and are deliberately NOT implemented —
+  // per-AP separation is future work.
+  char linkId[16];
+  snprintf(linkId, sizeof(linkId), "wifi_ch%d", WiFi.channel());
+  // SF4 (defense-in-depth): while the wind gate is active (no wind
+  // source, or wind >= 3.5 m/s) the wire value is forced to dev_hz 0.0
+  // / pairs_active 0 while wind_gated:true is kept — a consumer that
+  // ignores the flag can never mistake a computed value for a live
+  // claim. The RSSI tripwire is unaffected by CSI gating.
+  if (gated) { devHz = 0.0f; pairsActive = 0; }
+  char buf[400];
+  int n = snprintf(buf, sizeof(buf),
+    "{\"type\":\"sensor_obs\",\"obs\":\"CSI\",\"node\":\"%s\",\"sensor\":\"csi_wifi\","
+    "\"dev_hz\":%.1f,\"pairs_active\":%d,\"path_loss_db\":%.1f,\"link\":\"%s\","
+    "\"wind_ms\":%.1f,\"wind_gated\":%s,\"lat\":%.6f,\"lon\":%.6f,\"t\":%.1f}",
+    nodeId, devHz, pairsActive, pathLossDb, linkId,
+    windKnown ? windMs : -1.0f, gated ? "true" : "false",
+    gpsLat, gpsLon, nowUs / 1000000.0);
+  // t is nodeNowUs()/1e6: UTC-epoch when GPS-locked, node-local
+  // boot-relative otherwise (same caveat as t_us in events).
+  if (n > 0 && n < (int)sizeof(buf)) {
+    udp.beginPacket(IPAddress(192, 168, 4, 255), BEACON_PORT);
+    udp.write((uint8_t *)buf, n);
+    udp.endPacket();
+  }
 }
 
 void wifiSniff(bool on) {
@@ -522,7 +992,26 @@ void uartPoll(uint32_t now) {
       uartLine[uartPos] = 0; uartPos = 0;
       char name[16] = "", detail[32] = "";
       float rssi = 0;
-      if (sscanf(uartLine, "SENSOR %15s %f %31s", name, &rssi, detail) >= 2) {
+      // WIND <name> <wind_ms> [gust_ms] — anemometer input for the CSI
+      // wind gate (docs/esp32_csi_pipeline_spec.md Stage 2). Forwarded to
+      // the app as a WIND sensor_obs so the merger sees it.
+      char wname[16] = "";
+      float wms = 0, wgust = 0;
+      int wn = sscanf(uartLine, "WIND %15s %f %f", wname, &wms, &wgust);
+      if (wn >= 2) {
+        jsonSafe(windName, sizeof(windName), wname);
+        // A negative wind speed is unphysical; without this clamp it
+        // would silently ENABLE CSI motion claims (wind_ms < 3.5 reads
+        // as "calm, claim away"). Clamp to zero.
+        windMs = wms < 0 ? 0 : wms;
+        windHasGust = (wn >= 3);
+        if (windHasGust) windGustMs = wgust;
+        windSeen = true;
+        windRxMs = now;
+        sendSensorObsWind(nodeNowUs());
+        Serial.printf("wind: %s %.1f m/s%s\n", windName, windMs,
+                      windHasGust ? " (+gust)" : "");
+      } else if (sscanf(uartLine, "SENSOR %15s %f %31s", name, &rssi, detail) >= 2) {
         UartCh *u = nullptr;
         for (auto &ch : uartCh) if (ch.used && !strcmp(ch.name, name)) u = &ch;
         if (!u) for (auto &ch : uartCh)
@@ -1036,18 +1525,31 @@ void sendBeacon(float fps) {
     "{\"type\":\"beacon\",\"node\":\"%s\",\"callsign\":\"%s\",\"ip\":\"%s\",\"ch\":%d,"
     "\"fps\":%.0f,\"events\":%lu,\"uptime_s\":%lu,"
     "\"sensors\":[%s],\"ble_seen\":%d,"
-    "\"lat\":%.6f,\"lon\":%.6f,\"pps\":%d,\"rdrop\":%lu,\"rch_warn\":%d}",
+    "\"lat\":%.6f,\"lon\":%.6f,\"pps\":%d,\"rdrop\":%lu,\"rch_warn\":%d,"
+    "\"calib\":%d}",
     nodeId, nodeCallsign, WiFi.softAPIP().toString().c_str(), WiFi.channel(), fps,
     (unsigned long)eventCount, (unsigned long)((millis() - bootMs) / 1000),
     sensorList, bleN, gpsLat, gpsLon, ppsLocked ? 1 : 0,
-    (unsigned long)rd, rcw);
+    (unsigned long)rd, rcw, calibActive ? 1 : 0);
   udp.beginPacket(IPAddress(192, 168, 4, 255), BEACON_PORT);
   udp.write((uint8_t *)buf, strlen(buf));
   udp.endPacket();
 }
 
 void handleRoot() {
-  char html[1900];
+  char html[2400], csiSt[80], windSt[56];
+  if (!windSeen)
+    snprintf(csiSt, sizeof(csiSt), "DISABLED (no wind source)");
+  else if (windMs >= WIND_GATE_MPS)
+    snprintf(csiSt, sizeof(csiSt), "wind-gated (%.1f m/s)", windMs);
+  else
+    snprintf(csiSt, sizeof(csiSt), "active (dev %.1f Hz, %d pairs)",
+             lastCsiDevHz, lastCsiPairs);
+  if (windSeen)
+    snprintf(windSt, sizeof(windSt), "%s %.1f m/s%s", windName, windMs,
+             windHasGust ? " (+gust)" : "");
+  else
+    snprintf(windSt, sizeof(windSt), "(none)");
   snprintf(html, sizeof(html),
     "<html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
     "<style>body{background:#111;color:#c9a7eb;font-family:sans-serif;padding:24px}"
@@ -1055,17 +1557,26 @@ void handleRoot() {
     "input{background:#111;color:#c9a7eb;border:1px solid #a855f7;border-radius:8px;padding:8px}"
     "button{background:#a855f7;color:#111;border:0;border-radius:8px;padding:8px 16px}</style>"
     "</head><body><h1>Shepherd Node %s</h1>"
+#ifdef CSI_BENCH
+    "<div class=card><b>BENCH BUILD</b> — CSI frame-rate bench active. "
+    "Never ship this firmware.</div>"
+#endif
     "<div class=card>Callsign: <b>%s</b><br><form action=/callsign method=get>"
     "<input name=c maxlength=16 placeholder='RAPTOR-1' value='%s'> "
     "<button>Set</button></form></div>"
     "<div class=card>Sensors: %s<br>Uptime %lu s &nbsp; Channel %d<br>"
-    "WiFi metric %.1f dB &nbsp; BLE seen %d &nbsp; Events %lu</div>"
+    "WiFi metric %.1f dB &nbsp; BLE seen %d &nbsp; Events %lu<br>"
+    "CSI motion: %s &nbsp; Wind: %s<br>"
+    "Calibration window: <b>%s</b> "
+    "<a href=/calib?v=1 style=color:#a855f7>start</a> / "
+    "<a href=/calib?v=0 style=color:#a855f7>stop</a></div>"
     "<div class=card>GPS: %s &nbsp; PPS: %s<br>Lat %.6f Lon %.6f</div>"
     "<div class=card>Join this AP from the Shepherd device.<br>"
     "Beacons + events on UDP %d.</div></body></html>",
     nodeId, nodeCallsign[0] ? nodeCallsign : "(none)", nodeCallsign,
     sensorList, (unsigned long)((millis() - bootMs) / 1000),
     WiFi.channel(), lastWifiMetric, bleN, (unsigned long)eventCount,
+    csiSt, windSt, calibActive ? "ACTIVE" : "idle",
     gpsFix ? "fix" : "no fix", ppsLocked ? "locked" : "free-run",
     gpsLat, gpsLon, BEACON_PORT);
   server.send(200, "text/html", html);
@@ -1083,6 +1594,24 @@ void handleCallsign() {
   }
   clean.toCharArray(nodeCallsign, sizeof(nodeCallsign));
   prefs.putString("callsign", String(nodeCallsign));
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+// /calib?v=1 — the app opens the vacant calibration window: this node
+// participates ("calib":1 in beacons). /calib?v=0 (or any other value)
+// closes it. RAM-only by design: a reboot clears it, and it auto-expires
+// after 3 min, so a node that reboots mid-window can never contaminate
+// the app's fit (docs/adaptive_baseline_spec.md).
+void handleCalib() {
+  if (server.arg("v") == "1") {
+    calibActive = true;
+    calibSetMs = millis();
+    Serial.println("calibration window: ACTIVE (this node participates)");
+  } else {
+    calibActive = false;
+    Serial.println("calibration window: idle");
+  }
   server.sendHeader("Location", "/");
   server.send(303);
 }
@@ -1170,6 +1699,7 @@ void setup() {
   udp.begin(BEACON_PORT);
   server.on("/", handleRoot);
   server.on("/callsign", handleCallsign);
+  server.on("/calib", handleCalib);
   server.begin();
   Serial.printf("node %s ready: %s\n", nodeId, sensorList);
 }
@@ -1205,14 +1735,36 @@ void loop() {
   }
 #endif
 
+#ifdef CSI_BENCH
+  // Bench datagram pump: drain timer ticks into UDP datagrams. Runs
+  // every loop pass so the 1 s tick above is never starved.
+  if (bench.running && !bench.calm && benchPending > 0) {
+    if (benchPending > 4000) {   // loop fell behind (e.g. BLE time-slice):
+      bench.pendDrop += benchPending - 4000;   // count it, don't spiral
+      benchPending = 4000;
+    }
+    while (benchPending > 0) { benchPending--; benchSendOne(); }
+  }
+#endif
+
   if (now - lastBle > BLE_EVERY_MS) { lastBle = now; bleScanOnce(); }
 
   if (now - lastSec >= 1000) {
+    // 1 s aggregation cadence: frame/RSSI counters AND the CSI pair
+    // rings are read under one lock hold, so a frame landing mid-read is
+    // never lost and the aggregation sees a consistent snapshot.
+    uint32_t now32 = (uint32_t)nodeNowUs();
+    float csiDevHz = 0, csiMeanAmp = 0;
+    int csiPairs = 0;
+    uint32_t f = 0; int32_t rs = 0;
     portENTER_CRITICAL(&g_csiMux);
-    uint32_t f = g_frames; int32_t rs = g_rssiSum;
+    f = g_frames; rs = g_rssiSum;
     g_frames = 0; g_rssiSum = 0;
+    csiAggregate1s(now32, csiDevHz, csiPairs, csiMeanAmp);
     portEXIT_CRITICAL(&g_csiMux);
+    (void)csiMeanAmp;   // reserved for a future amplitude-health field
     lastSec = now;
+    lastCsiDevHz = csiDevHz; lastCsiPairs = csiPairs;
     if (f > 0) {
       float m = -((float)rs / (float)f);
       lastWifiMetric = m;
@@ -1243,6 +1795,19 @@ void loop() {
         sendEvent("cc110", durS, depth, cls, 0.60f, "subghz-rssi");
       }
     }
+    // CSI motion channel (docs/esp32_csi_pipeline_spec.md). path_loss_db
+    // is a CRUDE firmware placeholder (assumes 20 dBm TX on the sniffed
+    // frames; -1 = unknown) — the app re-derives the real per-link budget
+    // and owns the 55/60 dB gates. Never firmware.
+    csiSecondTick(now, csiDevHz, csiPairs,
+                  f > 0 ? 20.0f - (float)rs / (float)f : -1.0f);
+    // Vacant-window calibration flag: auto-expire after 3 min without a
+    // refresh; a reboot always clears it (RAM-only) so a mid-window
+    // reboot can never contaminate the app's fit.
+    if (calibActive && now - calibSetMs > 180000UL) calibActive = false;
+#ifdef CSI_BENCH
+    benchSecondTick(now, f);
+#endif
   }
 
   if (now - lastBeacon > BEACON_MS) {

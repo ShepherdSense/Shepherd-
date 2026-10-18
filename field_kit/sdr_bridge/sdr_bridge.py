@@ -73,6 +73,39 @@ Protocol (UDP JSON datagrams to the Shepherd host, default 127.0.0.1:49161):
   "obs" counts them. Language contract: "signature consistent with
   ELRS Gemini", NEVER "confirmed ELRS".)
 
+  doppler_ref packet (ambient-LTE Doppler; at most ~1 per 0.5 s CPI
+  while a peak persists):
+    {"v":1,"kind":"doppler_ref","radio":"rtlsdr0",
+     "center_mhz":1865.0,"doppler_hz":-14.2,"radial_ms":-1.14,
+     "snr_db":11.3,"ref_locked":true,"t":1729123456.789}
+
+  (Passive Doppler on the ambient LTE downlink -- the carrier transmits
+  it whether or not we listen; the bridge only receives and never
+  decodes payload bits. Emitted only on a 1.8-1.9 GHz stare (Doppler
+  mode), where it replaces the band-energy packet. doppler_hz /
+  radial_ms are signed with approaching = negative (app convention);
+  radial_ms = doppler_hz * c / (2 * center_hz). snr_db is the peak over
+  the clutter-canceled floor. ref_locked=false means the direct-path
+  reference was lost -- no coherent measurement that CPI; Shepherd must
+  give such events zero weight. Silent when the reference is locked
+  and nothing clears the SNR gate.)
+
+  wpp_idp_doppler packet (single-channel passive-radar Doppler line):
+    {"v":1,"kind":"wpp_idp_doppler","radio":"rtlsdr0","band":"2437",
+     "center_mhz":2437.0,"doppler_hz":40.0,"strength":16.2,
+     "t":1729123456.789,"motion_state":"static"}
+
+  (Bridge-side half of the WPP-IDP chain: per-preamble energy E[n] ->
+  DC removal -> Doppler line. The full STFT/CFAR chain lives in
+  passive_radar/. doppler_hz is the line frequency as a magnitude --
+  the energy time series is real, so its spectrum is symmetric and the
+  inbound/outbound sign is ambiguous here; direction is resolved
+  app-side against track geometry. strength is the line peak-to-median
+  in dB: a disturbance strength, never an identity. motion_state is
+  this node's motion state; Shepherd must not merge moving-node lines
+  into track confidence -- ego-motion compensation for this chain is
+  an unsolved open problem.)
+
   beacon packet (every 3 s, lets Shepherd show bridge status):
     {"v":1,"kind":"beacon","radio":"rtlsdr0","backend":"rtlsdr",
      "bands":["433","915"],"dropped":0,"t":1729123456.789}
@@ -100,6 +133,8 @@ import time
 from collections import deque
 
 import elrs_detect
+import doppler_detect
+import wpp_idp_detect
 
 try:
     import numpy as np
@@ -427,6 +462,16 @@ class SimBackend(RadioBackend):
                 a baseline), then an analog-FPV-like static carrier
                 60-80 s
       433 MHz:  weak always-on LoRa-like carrier
+      1865 MHz: ambient-LTE Doppler demo band (1.8-1.9 GHz): an
+                always-on direct-path tone (the tracker's reference) plus
+                a wall-clock-gated mover echo at +14.2 Hz physical
+                (approaching; reported doppler_hz -14.2, radial -1.14 m/s)
+                15-45 s of each 90 s. Phase-continuous across captures so
+                the 0.5 s CPI is genuinely coherent.
+      2437 MHz: also carries an always-on ambient-WiFi-like frame train
+                (identical 1 ms preamble bursts every 5 ms + random data)
+                with a wall-clock-gated 40 Hz mover echo 30-60 s of each
+                120 s, for the WPP-IDP estimator demo.
     """
 
     name = "simulate"
@@ -438,6 +483,8 @@ class SimBackend(RadioBackend):
         self.rng = np.random.default_rng(7)
         self._cap_n = 0            # total captures (drives the hop slot)
         self._band_caps = {}       # rounded center MHz -> completed captures
+        self._dop_n = 0            # samples emitted on the Doppler band
+        self._wpp_n = 0            # samples emitted on the WPP demo band
 
     def tune(self, center_mhz, bw_mhz, gain_db):
         self.center = center_mhz
@@ -450,6 +497,11 @@ class SimBackend(RadioBackend):
               "hop" (frequency-hopping narrowband), or None.
         """
         el = now - self.t0
+        if 1800.0 <= self.center < 1900.0:
+            # Ambient-LTE Doppler demo band: the direct path (strongest
+            # static component = the tracker's reference) is always
+            # present; the mover echo is wall-clock gated in capture().
+            return 25.0, "doppler"
         # Chirp windows are gated on WALL-CLOCK epoch, not instance
         # time, so two --simulate instances (e.g. 2437 + 915 stares)
         # emit time-correlated trains for the app-level GemX demo
@@ -500,6 +552,8 @@ class SimBackend(RadioBackend):
         x = (self.rng.standard_normal(n) + 1j * self.rng.standard_normal(n))
         x = (x / np.sqrt(2.0)).astype(np.complex64) * floor_lin
         lvl_db, kind = self._emitter(now)
+        if kind == "doppler":
+            return self._synth_doppler(x, n, now, floor_lin)
         if lvl_db > 0:
             amp = floor_lin * (10 ** (lvl_db / 20.0))
             t = np.arange(n) / self.sample_rate
@@ -537,6 +591,11 @@ class SimBackend(RadioBackend):
                 ph = (2 * np.pi * 150e3 * t
                       + 2.0 * np.sin(2 * np.pi * 37.0 * t))
                 x = x + (np.exp(1j * ph) * amp).astype(np.complex64)
+        if abs(self.center - 2437.0) < 1.0:
+            # WPP-IDP demo: ambient WiFi-like frame train (always on)
+            # + wall-clock-gated mover echo. Coexists with the band's
+            # other scripted emitters, like real ambient traffic would.
+            x = self._synth_wpp(x, n, now, floor_lin)
         self._cap_n += 1
         # MHz-normalized band key (round(5780.5) == 5780): a stare at any
         # center in the 5780 branch primes the same gate the burst
@@ -545,6 +604,72 @@ class SimBackend(RadioBackend):
         key = round(self.center)
         self._band_caps[key] = self._band_caps.get(key, 0) + 1
         return x
+
+    def _synth_doppler(self, x, n, now, floor_lin):
+        """Ambient-LTE Doppler demo band (1.8-1.9 GHz).
+
+        The direct path is modeled as its strongest static component --
+        a tone at DC, always present -- not a full LTE waveform; the
+        tracker only needs the phase reference, and the simplification
+        is documented. The mover echo sits 15 dB below the reference at
+        +14.2 Hz physical (approaching), wall-clock gated 15-45 s of
+        each 90 s epoch. Sample-continuous across capture() calls via
+        self._dop_n, so the tracker's 0.5 s CPI is genuinely coherent.
+        RX-only: this is synthetic receive data, not a transmission.
+        """
+        tg = (self._dop_n + np.arange(n)) / self.sample_rate
+        a_ref = floor_lin * 10 ** (25.0 / 20.0)
+        x = x + np.complex64(a_ref)
+        if 15.0 <= (now % 90.0) < 45.0:
+            a_echo = floor_lin * 10 ** (10.0 / 20.0)
+            x = x + (a_echo * np.exp(2j * np.pi * 14.2 * tg)
+                     ).astype(np.complex64)
+        self._dop_n += n
+        self._cap_n += 1
+        key = round(self.center)
+        self._band_caps[key] = self._band_caps.get(key, 0) + 1
+        return x
+
+    def _synth_wpp(self, x, n, now, floor_lin):
+        """WPP-IDP demo: ambient WiFi-like frame train on 2.4 GHz.
+
+        200 frames/s; each frame = 1 ms IDENTICAL wideband preamble
+        burst (fixed prototype, tapered -- wideband like a real 802.11
+        preamble, so its energy spreads across the band instead of
+        sitting hot in one spectral bin) + 4 ms random data symbols at
+        constant amplitude (ambient traffic). The mover echo (0.35x,
+        +40 Hz physical) is wall-clock gated 30-60 s of each 120 s
+        epoch: it impresses the slow 40 Hz amplitude modulation on the
+        per-preamble energy that the WPP-IDP estimator detects.
+        Sample-continuous across captures. RX-only: synthetic receive
+        data, not a transmission.
+        """
+        fs = self.sample_rate
+        tg = (self._wpp_n + np.arange(n)) / fs
+        frame_hz = 200.0
+        ph = (tg * frame_hz) % 1.0
+        is_pre = ph < 0.2
+        a = floor_lin * 10 ** (8.0 / 20.0)
+        # Fixed prototype: identical every frame, every capture.
+        pre_len = max(16, int(round(fs * 0.2 / frame_hz)))
+        prng = np.random.default_rng(1234)
+        proto = ((prng.standard_normal(pre_len)
+                  + 1j * prng.standard_normal(pre_len))
+                 / np.sqrt(2.0)).astype(np.complex64)
+        pre_pos = np.clip(ph / 0.2, 0.0, 1.0)
+        taper = (np.sin(np.pi * pre_pos) ** 2) * is_pre
+        pre_idx = np.minimum((pre_pos * pre_len).astype(np.int64),
+                             pre_len - 1)
+        pre = (a * proto[pre_idx] * taper * is_pre).astype(np.complex64)
+        d = (((self.rng.standard_normal(n)
+               + 1j * self.rng.standard_normal(n)) / np.sqrt(2.0))
+             * (a * (~is_pre))).astype(np.complex64)
+        s = pre + d
+        if 30.0 <= (now % 120.0) < 60.0:
+            s = s + (0.35 * s * np.exp(2j * np.pi * 40.0 * tg)
+                     ).astype(np.complex64)
+        self._wpp_n += n
+        return x + s
 
 
 # ---------------------------------------------------------------- DSP
@@ -867,6 +992,22 @@ def main():
     ap.add_argument("--no-elrs", action="store_true",
                     help="disable the ELRS chirp/Gemini signature detector "
                     "(runs by default on 2.4 GHz / 900 MHz captures)")
+    ap.add_argument("--no-doppler", action="store_true",
+                    help="disable the ambient-LTE Doppler tracker "
+                    "(runs by default on 1.8-1.9 GHz stares)")
+    ap.add_argument("--no-wpp-ids", action="store_true",
+                    help="disable the WPP-IDP per-preamble energy estimator "
+                    "(runs by default on 2.4 GHz captures)")
+    ap.add_argument("--wpp-waveform", default="ofdm",
+                    choices=["dsss", "ofdm"],
+                    help="illuminator waveform for the WPP-IDP chain: dsss "
+                    "(beacons -- every packet usable) or ofdm "
+                    "(preamble-only; data symbols are never processed)")
+    ap.add_argument("--motion-state", default="static",
+                    choices=["static", "moving"],
+                    help="node motion state carried on wpp_idp_doppler "
+                    "events (Shepherd must not merge moving-node lines "
+                    "into track confidence)")
     ap.add_argument("--sweeps", type=int, default=0,
                     help="run N sweeps then exit (0 = run forever)")
     args = ap.parse_args()
@@ -941,6 +1082,14 @@ def main():
     last_warn = 0.0
     sig_hist = SigHistory()  # emitter-signature hints, per band
     elrs = None if args.no_elrs else elrs_detect.ElrsDetector()
+    doppler = None if args.no_doppler else doppler_detect.DopplerTracker()
+    wpp = (None if args.no_wpp_ids
+           else wpp_idp_detect.WppIdpEstimator(waveform=args.wpp_waveform,
+                                               motion_state=args.motion_state))
+    print(f"[bridge] doppler={'off' if args.no_doppler else 'on '
+          '(1.8-1.9 GHz stares)'} "
+          f"wpp_idp={'off' if args.no_wpp_ids
+                         else args.wpp_waveform + ' ' + args.motion_state}")
 
     def finite_all(vals):
         return all(math.isfinite(v) for v in vals)
@@ -949,6 +1098,31 @@ def main():
         while True:
             for label, center, bw in bands:
                 backend.tune(center, bw, args.gain)
+                if doppler is not None and 1800.0 <= center < 1900.0:
+                    # Doppler stare: a DSP chain instead of the
+                    # band-energy chain. Consecutive captures (no retune
+                    # between them) are assembled into 0.5 s CPIs by the
+                    # tracker; the band emits doppler_ref, not band
+                    # packets.
+                    n_cpi = max(1, math.ceil(doppler_detect.CPI_S
+                                             * backend.sample_rate
+                                             / CAPTURE_N))
+                    for _ in range(n_cpi):
+                        x = backend.capture(CAPTURE_N)
+                        if x is None or len(x) < MIN_CAPTURE_N:
+                            dropped += 1
+                            continue
+                        now = time.time()
+                        try:
+                            for p in doppler.observe(
+                                    radio, center, now, x,
+                                    backend.sample_rate):
+                                emit(p)
+                        except Exception as ex:  # DSP never kills the loop
+                            if now - last_warn > 60.0:
+                                last_warn = now
+                                print(f"[bridge] doppler detector error: {ex}")
+                    continue
                 ms = []
                 x_last = None
                 for _ in range(max(1, args.dwell)):
@@ -1012,6 +1186,23 @@ def main():
                             print(f"[bridge] elrs detector error: {ex}")
                     for p in chirps + sigs:
                         emit(p)
+                # WPP-IDP per-preamble energy estimator (RX-only DSP;
+                # detection corroboration, never an identification).
+                # Runs on 2.4 GHz captures; designed for --stare on the
+                # illuminator band (the estimator resets on wall-clock
+                # gaps, so sweep visits accumulate nothing).
+                if (wpp is not None and x_last is not None
+                        and 2400.0 <= center < 2500.0):
+                    try:
+                        for p in wpp.observe(
+                                radio, label, center, now, x_last,
+                                backend.sample_rate,
+                                motion_state=args.motion_state):
+                            emit(p)
+                    except Exception as ex:  # DSP must never kill the sweep
+                        if now - last_warn > 60.0:
+                            last_warn = now
+                            print(f"[bridge] wpp-idp detector error: {ex}")
             sweeps_done += 1
             now = time.time()
             if now - last_beacon >= BEACON_S:

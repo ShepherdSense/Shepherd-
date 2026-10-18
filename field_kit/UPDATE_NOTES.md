@@ -1,5 +1,31 @@
 # Field Kit v1 — update notes (2026-10-16)
 
+## v0.17.0 firmware — ESP32 CSI motion channel (Suzuki pipeline)
+
+**CSI motion channel** in `shepherd_node.ino` (RX-only; sniffs ambient
+frames, nothing transmits). Per CSI frame, in/after `csi_cb`: symmetric-
+subcarrier averaging `m(k) = (c(+k) + conj(c(-k)))/2` over the 28 valid
+20 MHz HT pairs, `arg(m(k))` into per-pair 1 s rings. Once per second:
+per-pair Hz-deviation (zero-crossing rate of detrended phase, no
+unwrapping), link `dev_hz` = max pair, `pairs_active` above the noise
+floor, emitted as `{"type":"sensor_obs","obs":"CSI",...}` on UDP 49160.
+`dev_hz` bands are size-class heuristics only — never identity claims;
+the 55/60 dB link-budget knees are app-side gates, not firmware.
+
+- **Wind gate**: UART `WIND <name> <wind_ms> [gust_ms]` (text-protocol
+  builds); while wind ≥ 3.5 m/s motion claims are suppressed
+  (`wind_gated:true`). **No wind source → CSI motion DISABLED by default**
+  (fail-safe); the RSSI tripwire is unaffected. WIND lines are forwarded
+  as `sensor_obs`/`WIND` so the app merger sees them.
+- **`calib` beacon flag**: `/calib?v=1` marks the node as participating
+  in the app's vacant-window calibration; RAM-only (cleared on boot,
+  auto-expires after 3 min) so a mid-window reboot never contaminates
+  the fit.
+- **Bench mode** (`-DCSI_BENCH`, off by default, never shipped): pushes
+  CSI amplitude reports at 100/250/500/1000 Hz with sequence numbers,
+  60 s per step, over UDP 49160; logs offered/sent/drops, per-core CPU
+  (idle-hook method), heap low-water, and ambient CSI fps per step.
+
 ## v1.2 — SDR bridge for (almost) every SDR (evening)
 
 **Universal SDR bridge** (`field_kit/sdr_bridge/`) — owners of RTL-SDR,
