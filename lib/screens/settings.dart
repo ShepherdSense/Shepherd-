@@ -42,11 +42,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late final TextEditingController _sdrEnbLat;
   late final TextEditingController _sdrEnbLon;
   late final TextEditingController _sdrEnbMhz;
+  late final TextEditingController _cotTakHost;
+  late final TextEditingController _cotTakPort;
+  late final TextEditingController _cotStaleSeconds;
+  late final TextEditingController _cotPublishFloor;
+  late final TextEditingController _cotCallsignPrefix;
+  late final TextEditingController _cotAirTypeThreshold;
+  late final TextEditingController _cotEmitterPrefix;
+  late final TextEditingController _cotCoincidenceRadius;
+  late final TextEditingController _cotListenMulticastGroup;
+  late final TextEditingController _cotListenMulticastPort;
+  late final TextEditingController _cotListenWindowSeconds;
   late bool _simulated;
   late bool _wifiVision;
   late bool _zmetaEnabled;
   late bool _zmetaSecured;
   late bool _zmetaHeartbeatEnabled;
+  late bool _cotEmitEnabled;
+  late bool _cotEmitUseMulticast;
+  late bool _cotListenEnabled;
   late bool _camera;
   late bool _calibDegraded;
   String _newDriverId = 'silvus';
@@ -115,6 +129,28 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _zmetaEnabled = s.zmetaEnabled;
     _zmetaSecured = s.zmetaSecured;
     _zmetaHeartbeatEnabled = s.zmetaHeartbeatEnabled;
+    _cotEmitEnabled = s.cotEmitEnabled;
+    _cotEmitUseMulticast = s.cotEmitUseMulticast;
+    _cotListenEnabled = s.cotListenEnabled;
+    _cotTakHost = TextEditingController(text: s.cotTakHost);
+    _cotTakPort = TextEditingController(text: s.cotTakPort.toString());
+    _cotStaleSeconds =
+        TextEditingController(text: s.cotStaleSeconds.toString());
+    _cotPublishFloor =
+        TextEditingController(text: s.cotPublishFloor.toString());
+    _cotCallsignPrefix =
+        TextEditingController(text: s.cotCallsignPrefix);
+    _cotAirTypeThreshold =
+        TextEditingController(text: s.cotAirTypeThreshold.toString());
+    _cotEmitterPrefix = TextEditingController(text: s.cotEmitterPrefix);
+    _cotCoincidenceRadius =
+        TextEditingController(text: s.cotCoincidenceRadiusM.toString());
+    _cotListenMulticastGroup =
+        TextEditingController(text: s.cotListenMulticastGroup);
+    _cotListenMulticastPort =
+        TextEditingController(text: s.cotListenMulticastPort.toString());
+    _cotListenWindowSeconds =
+        TextEditingController(text: s.cotListenWindowSeconds.toString());
     _camera = widget.state.cameraConfirmationEnabled;
     _wifiVision = widget.state.wifiVisionEnabled;
     _calibDegraded = false;
@@ -160,6 +196,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _sdrEnbLat.dispose();
     _sdrEnbLon.dispose();
     _sdrEnbMhz.dispose();
+    _cotTakHost.dispose();
+    _cotTakPort.dispose();
+    _cotStaleSeconds.dispose();
+    _cotPublishFloor.dispose();
+    _cotCallsignPrefix.dispose();
+    _cotAirTypeThreshold.dispose();
+    _cotEmitterPrefix.dispose();
+    _cotCoincidenceRadius.dispose();
+    _cotListenMulticastGroup.dispose();
+    _cotListenMulticastPort.dispose();
+    _cotListenWindowSeconds.dispose();
     widget.state.removeListener(_onAppStateChanged);
     super.dispose();
   }
@@ -255,6 +302,42 @@ class _SettingsScreenState extends State<SettingsScreen> {
       zmetaHeartbeatIntervalSec:
           (int.tryParse(_zmetaHeartbeatInterval.text.trim()) ?? 60)
               .clamp(15, 600),
+      cotEmitEnabled: _cotEmitEnabled,
+      cotEmitUseMulticast: _cotEmitUseMulticast,
+      cotTakHost: _cotTakHost.text.trim(),
+      cotTakPort:
+          (int.tryParse(_cotTakPort.text.trim()) ?? 8089).clamp(1, 65535),
+      cotStaleSeconds:
+          (int.tryParse(_cotStaleSeconds.text.trim()) ?? 30).clamp(5, 300),
+      cotPublishFloor: (double.tryParse(_cotPublishFloor.text.trim()) ??
+              0.3)
+          .clamp(0.0, 1.0),
+      // Emit callsign prefix: non-empty, no whitespace — invalid
+      // input falls back to the SHEPHERD- default.
+      cotCallsignPrefix: () {
+        final v = _cotCallsignPrefix.text.trim();
+        return (v.isEmpty || RegExp(r'\s').hasMatch(v)) ? 'SHEPHERD-' : v;
+      }(),
+      cotAirTypeThreshold:
+          (double.tryParse(_cotAirTypeThreshold.text.trim()) ?? 0.5)
+              .clamp(0.0, 1.0),
+      cotListenEnabled: _cotListenEnabled,
+      cotListenMulticastGroup: _cotListenMulticastGroup.text.trim().isEmpty
+          ? '239.2.3.1'
+          : _cotListenMulticastGroup.text.trim(),
+      cotListenMulticastPort:
+          (int.tryParse(_cotListenMulticastPort.text.trim()) ?? 6969)
+              .clamp(1, 65535),
+      cotListenWindowSeconds:
+          (int.tryParse(_cotListenWindowSeconds.text.trim()) ?? 60)
+              .clamp(10, 600),
+      cotEmitterPrefix: _cotEmitterPrefix.text.trim().isEmpty
+          ? 'PREDATOR-'
+          : _cotEmitterPrefix.text.trim(),
+      cotCoincidenceRadiusM: (double.tryParse(
+                  _cotCoincidenceRadius.text.trim()) ??
+              50.0)
+          .clamp(5.0, 500.0),
       sdrStationLat: station?.slat,
       sdrStationLon: station?.slon,
       sdrEnbLat: station?.elat,
@@ -494,6 +577,113 @@ class _SettingsScreenState extends State<SettingsScreen> {
           _recordRow(),
           const SizedBox(height: 10),
           _replayList(),
+        ]),
+        _section('Output — CoT', [
+          SwitchListTile(
+            title: Text('EMIT COT TRACKS',
+                style: SentryType.rowValue(SentryColors.onDark)),
+            subtitle: Text(
+              'PUBLISH THE FUSED TRACK AS CURSOR-ON-TARGET EVENTS. '
+              'EMIT-ONLY, DEFENSIVE-ONLY — THE ONLY BYTES SENT ARE '
+              'THIS MESH\'S OWN TRACK EVENTS, AND AFFILIATION IS ALWAYS '
+              'UNKNOWN. DEFAULT OFF.',
+              style: SentryType.section(10).copyWith(height: 1.6),
+            ),
+            value: _cotEmitEnabled,
+            onChanged: (v) {
+              setState(() => _cotEmitEnabled = v);
+              unawaited(widget.state.setCotEmitEnabled(v));
+            },
+          ),
+          if (_cotEmitEnabled) ...[
+            const SizedBox(height: 10),
+            DropdownButtonFormField<bool>(
+              initialValue: _cotEmitUseMulticast,
+              dropdownColor: SentryColors.surface2,
+              style: SentryType.rowValue(SentryColors.onDark),
+              decoration:
+                  const InputDecoration(labelText: 'DESTINATION'),
+              items: [
+                DropdownMenuItem(
+                    value: true,
+                    child: Text(
+                        'MULTICAST ${widget.state.settings.cotMulticastGroup}:'
+                        '${widget.state.settings.cotMulticastPort}')),
+                const DropdownMenuItem(
+                    value: false, child: Text('TAK SERVER')),
+              ],
+              onChanged: (v) {
+                setState(() => _cotEmitUseMulticast = v ?? true);
+                unawaited(
+                    widget.state.setCotEmitUseMulticast(v ?? true));
+              },
+            ),
+            if (!_cotEmitUseMulticast) ...[
+              const SizedBox(height: 10),
+              _field(_cotTakHost, 'TAK server host', 'e.g. 192.168.1.10'),
+              const SizedBox(height: 10),
+              _field(_cotTakPort, 'TAK server port', 'e.g. 8089',
+                  numeric: true),
+            ],
+            const SizedBox(height: 10),
+            _field(_cotStaleSeconds, 'Stale window (seconds)',
+                'e.g. 30 (5–300)',
+                numeric: true),
+            const SizedBox(height: 10),
+            _field(_cotPublishFloor, 'Publish floor (0–1 confidence)',
+                'e.g. 0.3',
+                numeric: true),
+            const SizedBox(height: 10),
+            _field(_cotCallsignPrefix, 'Track callsign prefix',
+                'e.g. SHEPHERD- (no spaces)'),
+            const SizedBox(height: 10),
+            _field(_cotAirTypeThreshold, 'Air type threshold (0–1)',
+                'e.g. 0.5 — air-type guess ≥ this → a-u-A',
+                numeric: true),
+          ],
+          SwitchListTile(
+            title: Text('LISTEN FOR EMITTER TRACKS',
+                style: SentryType.rowValue(SentryColors.onDark)),
+            subtitle: Text(
+              'INGEST COT TRACKS WHOSE CALLSIGN MATCHES THE EMITTER '
+              'PREFIX (RX-ONLY). SPATIAL COINCIDENCES WITH THE SHEPHERD '
+              'TRACK UPGRADE CONFIDENCE ONLY — NEVER SUBTRACT, NEVER '
+              'ORIGINATE A TRACK. DEFAULT OFF.',
+              style: SentryType.section(10).copyWith(height: 1.6),
+            ),
+            value: _cotListenEnabled,
+            onChanged: (v) {
+              setState(() => _cotListenEnabled = v);
+              unawaited(widget.state.setCotListenEnabled(v));
+            },
+          ),
+          if (_cotListenEnabled) ...[
+            const SizedBox(height: 10),
+            Text(
+              'RX-ONLY — LISTENS ON '
+              '${widget.state.settings.cotListenMulticastGroup}:'
+              '${widget.state.settings.cotListenMulticastPort}',
+              style: SentryType.section(10).copyWith(height: 1.6),
+            ),
+            const SizedBox(height: 10),
+            _field(_cotListenMulticastGroup, 'Listen multicast group',
+                'e.g. 239.2.3.1'),
+            const SizedBox(height: 10),
+            _field(_cotListenMulticastPort, 'Listen multicast port',
+                'e.g. 6969',
+                numeric: true),
+            const SizedBox(height: 10),
+            _field(_cotListenWindowSeconds, 'Observation window (seconds)',
+                'e.g. 60 (10–600)',
+                numeric: true),
+            const SizedBox(height: 10),
+            _field(_cotEmitterPrefix, 'Emitter callsign prefix',
+                'e.g. PREDATOR-'),
+            const SizedBox(height: 10),
+            _field(_cotCoincidenceRadius, 'Coincidence radius (meters)',
+                'e.g. 50 (5–500)',
+                numeric: true),
+          ],
         ]),
         _section('ZMeta export', [
           SwitchListTile(

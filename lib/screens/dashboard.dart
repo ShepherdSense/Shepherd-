@@ -244,6 +244,10 @@ class DashboardScreen extends StatelessWidget {
           ),
           const SizedBox(height: 6),
           _dataRow('STATUS', state.connectionLabel, SentryColors.muted),
+          if (state.cotStatusLine != null) ...[
+            const SizedBox(height: 6),
+            _dataRow('COT', state.cotStatusLine!, SentryColors.purple),
+          ],
           if (state.error != null) ...[
             const SizedBox(height: 6),
             Text(state.error!,

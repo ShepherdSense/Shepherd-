@@ -68,6 +68,14 @@ class EvidenceSheet extends StatelessWidget {
             ),
             _evidenceSection(
               state,
+              'EMITTER COINCIDENCE',
+              state.emitterEvidenceLines,
+              'CoT emitter observation spatially coincident with this '
+              'event: consistent with, never confirmed. An emitter is '
+              'not an identification.',
+            ),
+            _evidenceSection(
+              state,
               'CSI DISTURBANCE',
               state.csiEvidenceLines,
               'Class estimates from a synthetic-trained model: possible '

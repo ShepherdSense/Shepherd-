@@ -22,6 +22,9 @@ import '../services/meshtastic_driver.dart';
 import '../services/esp32_driver.dart';
 import '../services/camera_driver.dart';
 import '../services/confidence_merger.dart';
+import '../services/cot_listener.dart';
+import '../services/cot_publisher.dart';
+import '../services/geo_projection.dart';
 import '../services/sensor_protocol.dart';
 import '../services/track_consistency.dart';
 import '../services/generic_sensor_driver.dart';
@@ -43,6 +46,11 @@ export '../utils/node_ids.dart';
 /// Loopback test shared by the settings UI warning and the fail-closed
 /// ZMeta emit gate (canonical definition in services/zmeta_adapter.dart).
 export '../services/zmeta_adapter.dart' show zmetaIsLocalHost;
+
+/// Evidence-line wording for one fresh CoT emitter observation.
+/// Honesty contract: "coincident" — never "confirmed", never identity.
+String cotEmitterEvidenceLine(String callsign) =>
+    'RF emitter reported at this position by $callsign (coincident)';
 
 /// Map color per radio driver for the unified map.
 Color driverColor(String driverId) {
@@ -80,6 +88,22 @@ class AppSettings {
     this.zmetaSecured = false,
     this.zmetaHeartbeatEnabled = false,
     this.zmetaHeartbeatIntervalSec = 60,
+    this.cotEmitEnabled = false,
+    this.cotEmitUseMulticast = true,
+    this.cotMulticastGroup = '239.2.3.1',
+    this.cotMulticastPort = 6969,
+    this.cotTakHost = '',
+    this.cotTakPort = 8089,
+    this.cotStaleSeconds = 30,
+    this.cotPublishFloor = 0.3,
+    this.cotCallsignPrefix = 'SHEPHERD-',
+    this.cotAirTypeThreshold = 0.5,
+    this.cotListenEnabled = false,
+    this.cotListenMulticastGroup = '239.2.3.1',
+    this.cotListenMulticastPort = 6969,
+    this.cotListenWindowSeconds = 60,
+    this.cotEmitterPrefix = 'PREDATOR-',
+    this.cotCoincidenceRadiusM = 50.0,
     this.sdrStationLat,
     this.sdrStationLon,
     this.sdrEnbLat,
@@ -119,6 +143,50 @@ class AppSettings {
   /// Heartbeat cadence in seconds, clamped 15..600 at apply time.
   int zmetaHeartbeatIntervalSec;
 
+  /// CoT track output (emit-only, defensive-only): publish the fused
+  /// track as a CoT event per update — the only bytes Shepherd ever
+  /// sends. Affiliation is always unknown (enforced in CotPublisher).
+  bool cotEmitEnabled;
+
+  /// true = UDP multicast (default), false = TAK Server TCP.
+  bool cotEmitUseMulticast;
+  String cotMulticastGroup;
+  int cotMulticastPort;
+  String cotTakHost;
+  int cotTakPort;
+
+  /// Stale window in seconds (track loss signaled by letting the
+  /// event go stale — no explicit deletes).
+  int cotStaleSeconds;
+
+  /// Tracks below this displayed confidence are never published.
+  double cotPublishFloor;
+
+  /// Emit callsign/uid prefix, e.g. 'SHEPHERD-' (hyphen, no space).
+  /// Non-empty, no whitespace (validated at apply time).
+  String cotCallsignPrefix;
+
+  /// Type-guess confidence at or above this, with an air-type guess,
+  /// emits `a-u-A`; otherwise `a-u-G`. Clamped 0..1.
+  double cotAirTypeThreshold;
+
+  /// CoT emitter ingest (RX-only): keep only events whose callsign
+  /// starts with [cotEmitterPrefix] and feed spatial coincidences
+  /// into the gated merger as upgrade-only corroboration.
+  bool cotListenEnabled;
+
+  /// Listen-side multicast destination (operator-tunable, like the
+  /// emit side). Defaults match the emit default group/port.
+  String cotListenMulticastGroup;
+  int cotListenMulticastPort;
+
+  /// Observation lifetime in seconds for the ingest window.
+  /// Clamped 10..600 at apply time.
+  int cotListenWindowSeconds;
+
+  String cotEmitterPrefix;
+  double cotCoincidenceRadiusM;
+
   /// SDR station geometry for the passive-Doppler correlator (WGS84).
   /// Null until the operator configures it in Settings → SDR station;
   /// without all four coordinates the correlator abstains. Converted
@@ -152,6 +220,22 @@ class AppSettings {
         'zmetaSecured': zmetaSecured,
         'zmetaHeartbeatEnabled': zmetaHeartbeatEnabled,
         'zmetaHeartbeatIntervalSec': zmetaHeartbeatIntervalSec,
+        'cotEmitEnabled': cotEmitEnabled,
+        'cotEmitUseMulticast': cotEmitUseMulticast,
+        'cotMulticastGroup': cotMulticastGroup,
+        'cotMulticastPort': cotMulticastPort,
+        'cotTakHost': cotTakHost,
+        'cotTakPort': cotTakPort,
+        'cotStaleSeconds': cotStaleSeconds,
+        'cotPublishFloor': cotPublishFloor,
+        'cotCallsignPrefix': cotCallsignPrefix,
+        'cotAirTypeThreshold': cotAirTypeThreshold,
+        'cotListenEnabled': cotListenEnabled,
+        'cotListenMulticastGroup': cotListenMulticastGroup,
+        'cotListenMulticastPort': cotListenMulticastPort,
+        'cotListenWindowSeconds': cotListenWindowSeconds,
+        'cotEmitterPrefix': cotEmitterPrefix,
+        'cotCoincidenceRadiusM': cotCoincidenceRadiusM,
         'sdrStationLat': sdrStationLat,
         'sdrStationLon': sdrStationLon,
         'sdrEnbLat': sdrEnbLat,
@@ -174,6 +258,62 @@ class AppSettings {
     if (hb is bool) zmetaHeartbeatEnabled = hb;
     final hbi = j['zmetaHeartbeatIntervalSec'];
     if (hbi is int) zmetaHeartbeatIntervalSec = hbi.clamp(15, 600);
+    final cotEmit = j['cotEmitEnabled'];
+    if (cotEmit is bool) cotEmitEnabled = cotEmit;
+    final cotMulti = j['cotEmitUseMulticast'];
+    if (cotMulti is bool) cotEmitUseMulticast = cotMulti;
+    final cotGroup = j['cotMulticastGroup'];
+    if (cotGroup is String && cotGroup.isNotEmpty) {
+      cotMulticastGroup = cotGroup;
+    }
+    final cotMport = j['cotMulticastPort'];
+    if (cotMport is int && cotMport > 0 && cotMport < 65536) {
+      cotMulticastPort = cotMport;
+    }
+    final cotHost = j['cotTakHost'];
+    if (cotHost is String) cotTakHost = cotHost;
+    final cotTport = j['cotTakPort'];
+    if (cotTport is int && cotTport > 0 && cotTport < 65536) {
+      cotTakPort = cotTport;
+    }
+    final cotStale = j['cotStaleSeconds'];
+    if (cotStale is int) cotStaleSeconds = cotStale.clamp(5, 300);
+    final cotFloor = j['cotPublishFloor'];
+    if (cotFloor is num) cotPublishFloor = cotFloor.clamp(0.0, 1.0).toDouble();
+    final cotCs = j['cotCallsignPrefix'];
+    if (cotCs is String &&
+        cotCs.isNotEmpty &&
+        !RegExp(r'\s').hasMatch(cotCs)) {
+      cotCallsignPrefix = cotCs;
+    }
+    final cotAir = j['cotAirTypeThreshold'];
+    if (cotAir is num) {
+      cotAirTypeThreshold = cotAir.clamp(0.0, 1.0).toDouble();
+    }
+    final cotListen = j['cotListenEnabled'];
+    if (cotListen is bool) cotListenEnabled = cotListen;
+    final cotListenGroup = j['cotListenMulticastGroup'];
+    if (cotListenGroup is String && cotListenGroup.isNotEmpty) {
+      cotListenMulticastGroup = cotListenGroup;
+    }
+    final cotListenPort = j['cotListenMulticastPort'];
+    if (cotListenPort is int &&
+        cotListenPort > 0 &&
+        cotListenPort < 65536) {
+      cotListenMulticastPort = cotListenPort;
+    }
+    final cotListenWindow = j['cotListenWindowSeconds'];
+    if (cotListenWindow is int) {
+      cotListenWindowSeconds = cotListenWindow.clamp(10, 600);
+    }
+    final cotPrefix = j['cotEmitterPrefix'];
+    if (cotPrefix is String && cotPrefix.isNotEmpty) {
+      cotEmitterPrefix = cotPrefix;
+    }
+    final cotRadius = j['cotCoincidenceRadiusM'];
+    if (cotRadius is num) {
+      cotCoincidenceRadiusM = cotRadius.clamp(5.0, 500.0).toDouble();
+    }
     double? lat(String k) {
       final v = j[k];
       if (v is num) {
@@ -427,6 +567,326 @@ class AppState extends ChangeNotifier {
         (_) => unawaited(_emitZmetaHeartbeat()),
       );
     }
+  }
+
+  // ---- CoT output + emitter ingest wiring ----
+
+  /// CoT track publisher (emit-only, defensive-only). Always exists
+  /// after configure; publishTrack drops tracks itself when disabled,
+  /// when the GPS origin is null (no projection), or below the floor.
+  CotPublisher? _cotPublisher;
+
+  /// CoT emitter ingest listener (RX-only). Null unless listening is
+  /// enabled.
+  CotListener? _cotListener;
+
+  /// Stable CoT track identity: the deterministic tracker follows a
+  /// single mover, so one uid per mesh (SHEPHERD-mover-1 via the
+  /// callsign contract in cot_publisher.dart).
+  static const String _cotTrackId = 'mover-1';
+
+  CotPublisherConfig _cotPublisherConfig() => CotPublisherConfig(
+        enabled: settings.cotEmitEnabled,
+        useMulticast: settings.cotEmitUseMulticast,
+        multicastGroup: settings.cotMulticastGroup,
+        multicastPort: settings.cotMulticastPort,
+        takHost: settings.cotTakHost,
+        takPort: settings.cotTakPort,
+        callsignPrefix: settings.cotCallsignPrefix,
+        staleSeconds: settings.cotStaleSeconds,
+        publishFloor: settings.cotPublishFloor,
+        airTypeThreshold: settings.cotAirTypeThreshold,
+      );
+
+  /// Configure-generation counter: the CoT setters (and applySettings)
+  /// fire-and-forget [_configureCot], so a rapid ON→OFF toggle can
+  /// interleave two configures across the socket awaits and strand a
+  /// live socket on a detached listener. Each call takes a generation
+  /// number; a stale generation bails before touching state and tears
+  /// down any socket it started mid-await.
+  int _cotConfigureGen = 0;
+
+  /// (Re)build the publisher and listener from settings. Called from
+  /// applySettings, from the CoT setters, and after the persisted
+  /// settings load on cold start. The publisher's projection is
+  /// refreshed per track publish (the GPS origin can arrive or change
+  /// after configure time); the listener socket starts/stops here.
+  Future<void> _configureCot() async {
+    final gen = ++_cotConfigureGen;
+    _cotPublisher?.dispose();
+    _cotPublisher = CotPublisher(config: _cotPublisherConfig());
+    final listener = _cotListener;
+    if (settings.cotListenEnabled) {
+      final configChanged = listener == null ||
+          listener.config.emitterPrefix != settings.cotEmitterPrefix ||
+          listener.config.coincidenceRadiusM !=
+              settings.cotCoincidenceRadiusM ||
+          listener.config.multicastGroup !=
+              settings.cotListenMulticastGroup ||
+          listener.config.multicastPort != settings.cotListenMulticastPort ||
+          listener.config.windowSeconds != settings.cotListenWindowSeconds;
+      if (configChanged) {
+        await _cotListener?.stop();
+        // A newer configure may have superseded us across the stop
+        // await — never install a listener on a stale generation.
+        if (gen != _cotConfigureGen) return;
+        _cotListener = CotListener(
+          config: CotListenerConfig(
+            enabled: true,
+            multicastGroup: settings.cotListenMulticastGroup,
+            multicastPort: settings.cotListenMulticastPort,
+            windowSeconds: settings.cotListenWindowSeconds,
+            emitterPrefix: settings.cotEmitterPrefix,
+            coincidenceRadiusM: settings.cotCoincidenceRadiusM,
+          ),
+        );
+      }
+      if (gen != _cotConfigureGen) return;
+      final l = _cotListener!;
+      if (!l.isListening) {
+        // (Re)try the bind when the listener has no live socket: a
+        // previous bind failure (see CotListener.lastError) must not
+        // leave a permanently dead listener behind.
+        try {
+          // A failed bind must not break settings apply — the socket
+          // is best-effort; detection authority is untouched.
+          await l.start();
+        } catch (_) {}
+        if (gen != _cotConfigureGen) {
+          // Superseded while starting: our just-bound socket belongs
+          // to a stale generation — tear it down, don't leak it.
+          await l.stop();
+        }
+      }
+    } else if (listener != null) {
+      await listener.stop();
+      if (gen == _cotConfigureGen) _cotListener = null;
+    }
+  }
+
+  /// Emit toggle: rebuild the publisher so the new config takes
+  /// effect immediately.
+  Future<void> setCotEmitEnabled(bool v) async {
+    settings.cotEmitEnabled = v;
+    await _saveSettings();
+    await _configureCot();
+    notifyListeners();
+  }
+
+  /// Listen toggle: start/stop the multicast ingest socket.
+  Future<void> setCotListenEnabled(bool v) async {
+    settings.cotListenEnabled = v;
+    await _saveSettings();
+    await _configureCot();
+    notifyListeners();
+  }
+
+  /// Emit-destination selector: true = UDP multicast, false = TAK
+  /// Server TCP.
+  Future<void> setCotEmitUseMulticast(bool v) async {
+    settings.cotEmitUseMulticast = v;
+    await _saveSettings();
+    await _configureCot();
+    notifyListeners();
+  }
+
+  Future<void> setCotTakHost(String v) async {
+    settings.cotTakHost = v;
+    await _saveSettings();
+    await _configureCot();
+    notifyListeners();
+  }
+
+  Future<void> setCotTakPort(int v) async {
+    settings.cotTakPort = v.clamp(1, 65535);
+    await _saveSettings();
+    await _configureCot();
+    notifyListeners();
+  }
+
+  Future<void> setCotStaleSeconds(int v) async {
+    settings.cotStaleSeconds = v.clamp(5, 300);
+    await _saveSettings();
+    await _configureCot();
+    notifyListeners();
+  }
+
+  Future<void> setCotPublishFloor(double v) async {
+    settings.cotPublishFloor = v.clamp(0.0, 1.0);
+    await _saveSettings();
+    await _configureCot();
+    notifyListeners();
+  }
+
+  Future<void> setCotEmitterPrefix(String v) async {
+    if (v.isNotEmpty) settings.cotEmitterPrefix = v;
+    await _saveSettings();
+    await _configureCot();
+    notifyListeners();
+  }
+
+  Future<void> setCotCoincidenceRadiusM(double v) async {
+    settings.cotCoincidenceRadiusM = v.clamp(5.0, 500.0);
+    await _saveSettings();
+    await _configureCot();
+    notifyListeners();
+  }
+
+  /// Emit callsign/uid prefix (default 'SHEPHERD-'). Must be
+  /// non-empty with no whitespace; invalid input keeps the current
+  /// value.
+  Future<void> setCotCallsignPrefix(String v) async {
+    final t = v.trim();
+    if (t.isNotEmpty && !RegExp(r'\s').hasMatch(t)) {
+      settings.cotCallsignPrefix = t;
+    }
+    await _saveSettings();
+    await _configureCot();
+    notifyListeners();
+  }
+
+  /// Air-type confidence threshold (0..1, default 0.5): a type guess
+  /// naming an airframe class at or above this emits `a-u-A`.
+  Future<void> setCotAirTypeThreshold(double v) async {
+    settings.cotAirTypeThreshold = v.clamp(0.0, 1.0);
+    await _saveSettings();
+    await _configureCot();
+    notifyListeners();
+  }
+
+  /// Listen-side multicast group (default 239.2.3.1).
+  Future<void> setCotListenMulticastGroup(String v) async {
+    final t = v.trim();
+    if (t.isNotEmpty) settings.cotListenMulticastGroup = t;
+    await _saveSettings();
+    await _configureCot();
+    notifyListeners();
+  }
+
+  /// Listen-side multicast port (default 6969).
+  Future<void> setCotListenMulticastPort(int v) async {
+    settings.cotListenMulticastPort = v.clamp(1, 65535);
+    await _saveSettings();
+    await _configureCot();
+    notifyListeners();
+  }
+
+  /// Ingest observation window in seconds (clamped 10..600).
+  Future<void> setCotListenWindowSeconds(int v) async {
+    settings.cotListenWindowSeconds = v.clamp(10, 600);
+    await _saveSettings();
+    await _configureCot();
+    notifyListeners();
+  }
+
+  /// Push the fused track to CoT output. Fire-and-forget: the service
+  /// drops tracks when disabled, unanchored (null projection), or
+  /// below the publish floor, and never throws out of the transport
+  /// path.
+  void _publishCotTrack(TrackEstimate t) {
+    final pub = _cotPublisher;
+    if (pub == null) return;
+    final origin = gpsOrigin;
+    // Nullable projection: exists-but-unanchored means skip sending,
+    // exactly what the service does on a null projection.
+    pub.projection = origin == null
+        ? null
+        : GeoProjection(originLat: origin.lat, originLon: origin.lon);
+    final conf = trackConfidence;
+    unawaited(pub.publishTrack(CotTrackInput(
+      trackId: _cotTrackId,
+      xEast: t.x,
+      yNorth: t.y,
+      headingDeg: t.headingDeg ?? 0.0,
+      speedMps: t.speedMps ?? 0.0,
+      sizeLabel: t.sizeClass,
+      // TrackEstimate carries no calibrated size confidence: 0.5 is a
+      // DOCUMENTED fixed default — "heuristic estimate, not a
+      // measurement" (the integration spec's fixed-defaults rule).
+      sizeConfidence: 0.5,
+      typeGuess: t.typeGuess,
+      typeConfidence: t.typeConfidence,
+      inboundOutbound: t.relation,
+      confidence: conf?.displayed ?? 0.0,
+      // TrackEstimate has no position-uncertainty field: 15.0 m is a
+      // DOCUMENTED fixed default (single-mover tripwire fix, no
+      // stated error) — feeds the CoT ce/le elements.
+      positionUncertaintyM: 15.0,
+    )));
+  }
+
+  /// Emitter-mover coincidences for the merger: upgrade-only,
+  /// freshness-weighted, never subtractive (the service emits boost
+  /// >= 0 only — no subtraction logic here by design).
+  List<GatedCorroboration> _emitterCoincidences(
+      DateTime now, TrackEstimate t) {
+    final out = <GatedCorroboration>[];
+    final listener = _cotListener;
+    final origin = gpsOrigin;
+    if (listener == null || origin == null) return out;
+    final geo = GeoProjection(originLat: origin.lat, originLon: origin.lon)
+        .metersToLatLon(t.x, t.y);
+    for (final h in listener.checkCoincidence(
+        [TrackPosition(id: _cotTrackId, lat: geo.lat, lon: geo.lon)],
+        now)) {
+      out.add(GatedCorroboration(
+        sensorId: 'cot-emitter:${h.emitterCallsign}',
+        boost: h.boost, // 0.10, upgrade-only
+        gateWeight: h.freshness01,
+        note: 'RF emitter ${h.emitterCallsign} coincident with track '
+            '(${h.distanceM.toStringAsFixed(0)}m) — consistent with, '
+            'not confirmed',
+      ));
+    }
+    return out;
+  }
+
+  /// Evidence lines for fresh emitter observations, using the
+  /// listener's own window (activeEmitters already prunes to it, so
+  /// the filter below is belt-and-braces on the same window).
+  /// Wording is the honesty contract: "coincident", never "confirmed",
+  /// never identity.
+  List<String> get emitterEvidenceLines {
+    final listener = _cotListener;
+    if (listener == null) return const [];
+    final now = DateTime.now();
+    final window = Duration(seconds: listener.config.windowSeconds);
+    return [
+      for (final e in listener.activeEmitters)
+        if (now.difference(e.time) <= window)
+          cotEmitterEvidenceLine(e.callsign),
+    ];
+  }
+
+  /// Dashboard status line. Null when both paths are off — the
+  /// dashboard renders nothing in that case.
+  String? get cotStatusLine {
+    final segs = <String>[];
+    if (settings.cotEmitEnabled) {
+      final dest = settings.cotEmitUseMulticast
+          ? '${settings.cotMulticastGroup}:${settings.cotMulticastPort}'
+          : '${settings.cotTakHost}:${settings.cotTakPort}';
+      final n = _cotPublisher?.stats.tracksPublishing ?? 0;
+      segs.add('CoT → $dest · $n publishing');
+    }
+    if (settings.cotListenEnabled) {
+      final listener = _cotListener;
+      // A failed bind must surface: the dashboard may not claim
+      // "listening" while the socket never bound.
+      final err = listener?.lastError;
+      if (err != null) {
+        segs.add('listening FAILED: $err');
+      } else if (listener == null || !listener.isListening) {
+        segs.add('listening (socket not started)');
+      } else {
+        // activeEmitterCount excludes future-dated observations —
+        // they can never coincide, so they are not "tracked".
+        final m = listener.activeEmitterCount;
+        segs.add('listening ($m emitter${m == 1 ? '' : 's'} tracked)');
+      }
+    }
+    if (segs.isEmpty) return null;
+    return segs.join(' · ');
   }
 
   /// One opt-in heartbeat: SYSTEM_EVENT / PLATFORM_STATUS. Same
@@ -1056,8 +1516,9 @@ class AppState extends ChangeNotifier {
     final wasWifi = wifiVisionEnabled;
     stop();
     settings = s;
-    unawaited(_saveZmetaSettings());
+    unawaited(_saveSettings());
     _configureZmetaTimers();
+    unawaited(_configureCot());
     _tripwire = Tripwire(config: s.tripwireConfig);
     _tracker.reset();
     _clearTrackState();
@@ -1491,6 +1952,9 @@ class AppState extends ChangeNotifier {
       _consistencyMonitor.observe(t.timestamp, t.x, t.y);
       trackConsistency = _consistencyMonitor.snapshot;
       trackConfidence = _mergeTrackConfidence(now, t);
+      // CoT output: the track is finalized here; the service drops it
+      // when emit is off, unanchored, or below the publish floor.
+      _publishCotTrack(t);
     } else {
       _consistencyMonitor.noteGap(now);
       trackConsistency = null;
@@ -1546,6 +2010,9 @@ class AppState extends ChangeNotifier {
     // Passive Doppler: velocity-consistency evidence; disagreement
     // contributes exactly 0 and never touches C_RF.
     gated.addAll(_dopplerCorroborations(now, t));
+    // CoT emitter coincidences: upgrade-only, freshness-weighted,
+    // never subtractive (predator_integration_spec.md).
+    gated.addAll(_emitterCoincidences(now, t));
     // WPP-IDP: upgrade-only existence evidence; moving-node events
     // contribute exactly 0 (ego-motion gate).
     gated.addAll(_wppIdpCorroborations(now));
@@ -2259,7 +2726,9 @@ class AppState extends ChangeNotifier {
     } catch (_) {}
   }
 
-  // ---- ZMeta settings (persisted) ----
+  // ---- Persisted settings (ZMeta block + CoT block) ----
+  // NOTE: the storage key keeps its historical 'zmeta' name — renaming
+  // it would orphan every existing install's saved settings.
 
   static const _zmetaSettingsKey = 'rf_sentry_zmeta_v1';
 
@@ -2272,10 +2741,11 @@ class AppState extends ChangeNotifier {
     } catch (_) {
       // Corrupt prefs: keep defaults.
     }
+    unawaited(_configureCot());
     notifyListeners();
   }
 
-  Future<void> _saveZmetaSettings() async {
+  Future<void> _saveSettings() async {
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString(
@@ -2675,6 +3145,10 @@ class AppState extends ChangeNotifier {
     _watchdog = null;
     _zmeta?.close();
     _zmeta = null;
+    _cotPublisher?.dispose();
+    _cotPublisher = null;
+    unawaited(_cotListener?.stop());
+    _cotListener = null;
     for (final p in _pollers) {
       p.timer?.cancel();
       try {
