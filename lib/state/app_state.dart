@@ -38,6 +38,7 @@ import '../utils/node_ids.dart';
 import '../services/wifi_aware.dart';
 import '../services/wifi_rtt.dart';
 import '../services/wifi_sense.dart';
+import '../services/device_autoconnect.dart';
 
 /// Short display ID: strips the driver namespace (`silvus:90550` → `90550`).
 /// (Moved to utils/node_ids.dart; re-exported here for existing callers.)
@@ -80,6 +81,7 @@ class AppSettings {
     this.confirmPolls = 2,
     this.baselineWindow = 120,
     this.simulatedMode = true,
+    this.autoConnectSilvusUsb = true,
     this.wifiDipThresholdDb = 6.0,
     this.zmetaEnabled = false,
     this.zmetaHost = '127.0.0.1',
@@ -118,6 +120,11 @@ class AppSettings {
   int confirmPolls;
   int baselineWindow;
   bool simulatedMode;
+
+  /// Auto-connect: when a Silvus radio appears on USB (172.17.97.x
+  /// interface), validate it and add it as a radio config automatically.
+  /// Never removes configs — unplug only marks the driver offline.
+  bool autoConnectSilvusUsb;
 
   /// WiFi dip depth (dB below rolling median) that counts as a disturbance.
   double wifiDipThresholdDb;
@@ -213,6 +220,7 @@ class AppSettings {
   /// settings block currently stored — radio configs, node layout and
   /// the GPS origin have their own keys). Missing keys keep defaults.
   Map<String, dynamic> toJson() => {
+        'autoConnectSilvusUsb': autoConnectSilvusUsb,
         'zmetaEnabled': zmetaEnabled,
         'zmetaHost': zmetaHost,
         'zmetaPort': zmetaPort,
@@ -244,6 +252,8 @@ class AppSettings {
       };
 
   void applyJson(Map<String, dynamic> j) {
+    final ac = j['autoConnectSilvusUsb'];
+    if (ac is bool) autoConnectSilvusUsb = ac;
     final e = j['zmetaEnabled'];
     if (e is bool) zmetaEnabled = e;
     final h = j['zmetaHost'];
@@ -580,6 +590,10 @@ class AppState extends ChangeNotifier {
   /// enabled.
   CotListener? _cotListener;
 
+  /// Device auto-connect coordinator (Silvus USB today; more families
+  /// as their drivers land). Null when disabled or simulated.
+  DeviceAutoConnect? _autoConnect;
+
   /// Stable CoT track identity: the deterministic tracker follows a
   /// single mover, so one uid per mesh (SHEPHERD-mover-1 via the
   /// callsign contract in cot_publisher.dart).
@@ -633,6 +647,13 @@ class AppState extends ChangeNotifier {
     if (oldPub == null || !_samePublisherConfig(oldPub.config, pubCfg)) {
       oldPub?.dispose();
       _cotPublisher = CotPublisher(config: pubCfg);
+    }
+    // Eager TAK connect: the link state should be known at configure
+    // time (cold start, toggle-on), not only on first track publish.
+    // Fire-and-forget — a dead server must never break settings apply;
+    // the backoff inside connectNow paces the retries.
+    if (settings.cotEmitEnabled) {
+      unawaited(_cotPublisher?.connectNow());
     }
     final listener = _cotListener;
     if (settings.cotListenEnabled) {
@@ -1639,6 +1660,9 @@ class AppState extends ChangeNotifier {
       const Duration(seconds: 1),
       (_) => _watchdogTick(),
     );
+    // Device auto-connect: plugged-in radios validate themselves in.
+    // Idempotent — stop() tore the old coordinator down on re-entry.
+    _startAutoConnect();
   }
 
   DateTime? _cotListenRetryAt;
@@ -1776,6 +1800,8 @@ class AppState extends ChangeNotifier {
 
   void stop() {
     _startPending = false;
+    _autoConnect?.stop();
+    _autoConnect = null;
     for (final p in _pollers) {
       p.timer?.cancel();
       try {
@@ -2807,6 +2833,67 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// (Re)start the device auto-connect coordinator. Called at the end
+  /// of start() and when the auto-connect setting changes. Never
+  /// removes configs — a watcher only ADDS validated devices.
+  void _startAutoConnect() {
+    _autoConnect?.stop();
+    _autoConnect = null;
+    if (!settings.autoConnectSilvusUsb || settings.simulatedMode) return;
+    _autoConnect = DeviceAutoConnect(
+      watchers: [
+        SilvusUsbWatcher(
+          // Skip the handshake for radios we already poll — the
+          // closure reads the live config list each tick.
+          knownAddresses: () => {
+            for (final c in radioConfigs)
+              if (c.driverId == 'silvus') c.address,
+          },
+        ),
+      ],
+      onCandidate: _onAutoConnectCandidate,
+      isKnown: (familyId, address) => radioConfigs.any(
+        (c) => c.driverId == familyId && c.address == address,
+      ),
+    );
+    _autoConnect!.start();
+  }
+
+  /// A validated device appeared. Dedupe by driverId+address (an
+  /// interface flap must not clone the config), then add it — addRadio
+  /// restarts polling so the new driver starts immediately.
+  Future<void> _onAutoConnectCandidate(AutoConnectCandidate c) async {
+    final known = radioConfigs.any(
+      (r) => r.driverId == c.familyId && r.address == c.address,
+    );
+    if (known) return;
+    await addRadio(RadioConfig(
+      driverId: c.familyId,
+      address: c.address,
+      label: c.label,
+      pollInterval: settings.pollInterval,
+    ));
+  }
+
+  /// Auto-connect toggle for Silvus USB. Takes effect immediately.
+  Future<void> setAutoConnectSilvusUsb(bool v) async {
+    settings.autoConnectSilvusUsb = v;
+    await _saveSettings();
+    if (polling && !settings.simulatedMode) _startAutoConnect();
+    notifyListeners();
+  }
+
+  /// Dashboard radios card: TAK/CoT emit link state. Multicast is
+  /// connectionless by design, so it reports the mode, not a link.
+  String get cotLinkStatus {
+    if (!settings.cotEmitEnabled) return 'OFF';
+    if (settings.cotEmitUseMulticast) return 'MULTICAST';
+    final p = _cotPublisher;
+    if (p == null) return 'OFF';
+    if (p.takConnected) return 'LINKED';
+    return 'RETRYING';
+  }
+
   Future<void> removeRadioAt(int i) async {
     if (i < 0 || i >= radioConfigs.length) return;
     radioConfigs.removeAt(i);
@@ -3188,6 +3275,8 @@ class AppState extends ChangeNotifier {
     _disposed = true;
     _watchdog?.cancel();
     _watchdog = null;
+    _autoConnect?.stop();
+    _autoConnect = null;
     _zmeta?.close();
     _zmeta = null;
     _cotPublisher?.dispose();

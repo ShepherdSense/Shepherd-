@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.19.0 — 2026-10-19 — Device auto-connect
+
+Plug-and-play radios, and an eagerly-connected TAK link:
+
+- **Device auto-connect framework** (`lib/services/device_autoconnect.dart`,
+  spec `docs/device_autoconnect_spec.md`): one watcher per device family,
+  one 5 s coordinator. A Silvus plugged in over USB-C (172.17.97.x
+  interface) gets a real `streamscape_data` handshake and is added as a
+  radio config automatically — no SCAN button, no IP entry. Rules:
+  validate-before-add (no ghosts), dedupe by driverId+address (interface
+  flaps can't clone configs), never auto-delete (unplug marks the driver
+  offline; replug resumes). No subnet is ever scanned automatically.
+  Per-family toggle in Settings → Radios → Auto-connect (default ON).
+  MPU5 has no watcher yet — its driver is still a stub awaiting the SNMP
+  walk data, and nothing claims otherwise.
+- **TAK/CoT eager connect**: `CotPublisher.connectNow()` runs at
+  configure time (cold start, toggle-on) so the link state is known
+  before the first track publish; the existing backoff still paces
+  retries against a dead server. Dashboard radios card gains a TAK LINK
+  row: LINKED / RETRYING / MULTICAST / OFF.
+- Independent review: 0 blocking, 3 should-fix (auto-connect timer now
+  stopped in dispose(); handshake skipped for already-known radios;
+  positive-path connectNow tests with a loopback server). 268/268 Dart
+  tests, analyze clean.
+
 ## v0.18.0 — 2026-10-18 — Predator-RF CoT integration
 
 Bilateral integration with Predator RF (see `docs/predator_integration_spec.md`):

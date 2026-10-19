@@ -327,6 +327,50 @@ class DashboardScreen extends StatelessWidget {
                   ],
                 ),
               ),
+          if (state.polling) _takLinkRow(),
+        ],
+      ),
+    );
+  }
+
+  /// TAK/CoT emit link state, same card as the radios. Only shown
+  /// while polling; OFF is dimmed, LINKED/MULTICAST are neutral,
+  /// RETRYING is amber.
+  Widget _takLinkRow() {
+    final link = state.cotLinkStatus;
+    final color = link == 'LINKED' || link == 'MULTICAST'
+        ? SentryColors.muted
+        : link == 'RETRYING'
+            ? SentryColors.orange
+            : SentryColors.muted.withValues(alpha: 0.5);
+    return Padding(
+      padding: const EdgeInsets.only(top: 6),
+      child: Row(
+        children: [
+          Container(
+            width: 9,
+            height: 9,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: link == 'LINKED'
+                  ? SentryColors.green
+                  : link == 'RETRYING'
+                      ? SentryColors.orange
+                      : SentryColors.muted.withValues(alpha: 0.5),
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              'TAK LINK',
+              style: SentryType.rowValue(SentryColors.onDark)
+                  .copyWith(fontSize: 12),
+            ),
+          ),
+          Text(
+            link,
+            style: SentryType.section(10).copyWith(color: color),
+          ),
         ],
       ),
     );

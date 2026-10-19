@@ -62,6 +62,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late bool _cotEmitUseMulticast;
   late bool _cotListenEnabled;
   late bool _camera;
+  late bool _autoConnectSilvusUsb;
   late bool _calibDegraded;
   String _newDriverId = 'silvus';
 
@@ -132,6 +133,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _cotEmitEnabled = s.cotEmitEnabled;
     _cotEmitUseMulticast = s.cotEmitUseMulticast;
     _cotListenEnabled = s.cotListenEnabled;
+    _autoConnectSilvusUsb = s.autoConnectSilvusUsb;
     _cotTakHost = TextEditingController(text: s.cotTakHost);
     _cotTakPort = TextEditingController(text: s.cotTakPort.toString());
     _cotStaleSeconds =
@@ -288,6 +290,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       baselineWindow:
           int.tryParse(_window.text.trim()) ?? widget.state.settings.baselineWindow,
       simulatedMode: _simulated,
+      autoConnectSilvusUsb: _autoConnectSilvusUsb,
       zmetaEnabled: _zmetaEnabled,
       zmetaHost: _zmetaHost.text.trim().isEmpty
           ? '127.0.0.1'
@@ -792,6 +795,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
               'NO SCAN YET. RADIOS MUST BE ON THIS SUBNET AND REACHABLE OVER HTTP.',
               style: SentryType.section(10).copyWith(height: 1.6),
             ),
+        ]),
+        _section('Auto-connect', [
+          SwitchListTile(
+            title: Text('AUTO-CONNECT SILVUS USB',
+                style: SentryType.rowValue(SentryColors.onDark)),
+            subtitle: Text(
+              'WHEN A SILVUS RADIO APPEARS ON USB (172.17.97.X), '
+              'VALIDATE IT AND ADD IT AUTOMATICALLY. UNPLUGGING NEVER '
+              'REMOVES THE CONFIG — IT RECONNECTS ON REPLUG.',
+              style: SentryType.section(10).copyWith(height: 1.6),
+            ),
+            value: _autoConnectSilvusUsb,
+            onChanged: (v) {
+              setState(() => _autoConnectSilvusUsb = v);
+              unawaited(
+                  widget.state.setAutoConnectSilvusUsb(v));
+            },
+          ),
         ]),
         const SizedBox(height: 8),
         ElevatedButton(onPressed: _save, child: const Text('Save settings')),

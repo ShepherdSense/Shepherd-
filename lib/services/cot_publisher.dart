@@ -385,6 +385,26 @@ class CotPublisher {
         lastSentAt: _lastSendAt,
       );
 
+  /// True while the TAK TCP socket is up (multicast mode: always false,
+  /// connectionless by design).
+  bool get takConnected => _tak != null;
+
+  /// Eager TAK connect for auto-connect: called at configure time when
+  /// emit is enabled so the link state is known before the first track
+  /// publish. No-op for multicast (connectionless), disabled configs,
+  /// empty host, and the injected test sender. Failures reuse the
+  /// existing backoff — a dead server just reads "RETRYING" until it
+  /// answers. Never throws.
+  Future<void> connectNow() async {
+    if (!config.enabled || config.useMulticast) return;
+    if (_sender != null) return;
+    if (config.takHost.isEmpty) return;
+    if (_disposed) return;
+    try {
+      await _ensureTakSocket();
+    } catch (_) {}
+  }
+
   /// Number of datagrams successfully sent this session (diagnostic).
   int get publishedCount => _publishedCount;
 
