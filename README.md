@@ -89,6 +89,19 @@ Download the kit (ZIP): [Shepherd Field Kit v1](https://drive.google.com/file/d/
 
 Sources live in `field_kit/` — firmware, installer scripts, and [update notes](field_kit/UPDATE_NOTES.md). Full in-app auto-detection of these nodes lights up when the ESP32 driver lands (mesh-mode Phase 1).
 
+## Radio integration kit
+
+Bringing a new radio family into Shepherd starts with a probe: a small receive-only script that surveys the hardware and hands back a capture file the driver is built from. All of them live in [`field_kit/radio_integration/`](field_kit/radio_integration/) — each folder is double-click simple (run the `.bat`, send the output file back):
+
+- **MPU5** — read-only SNMP survey. Send back the walk file → the MPU5 driver gets built.
+- **BEAST+ (MRSI)** — subscribe-only probe (bearings, spectrum, IQ — never EA/transmit commands). Send back the JSONL → the ingest driver gets built.
+- **BEAST+ (CoT)** — captures the BEAST+'s ATAK/Reaper CoT output.
+- **Kraken** — bench capture. STAGED until the CACI-vs-KrakenSDR question is settled.
+- **L3Harris (CoT)** — CoT listener (the live AN/PRC-163 position path).
+- **L3Harris (SNMP)** — RETIRED, do not use. SNMP was never documented on the 163; the CoT path is the real one.
+
+Nothing here transmits. Probes are survey-only by design.
+
 ## Screenshots
 
 See [`docs/screenshots/`](docs/screenshots/) — captured from the live app.
