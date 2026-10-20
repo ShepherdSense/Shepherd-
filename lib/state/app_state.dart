@@ -34,6 +34,9 @@ import '../services/replay_driver.dart';
 import '../services/ai_classifier.dart';
 import '../services/track_stitcher.dart';
 import '../services/zmeta_adapter.dart';
+import '../services/zmeta_https_ingest.dart';
+import '../services/zmeta_ingest_store.dart';
+import '../services/zmeta_pairing.dart' show zmetaIsUsableIngestUrl;
 import '../utils/node_ids.dart';
 import '../services/wifi_aware.dart';
 import '../services/wifi_rtt.dart';
@@ -87,6 +90,10 @@ class AppSettings {
     this.zmetaHost = '127.0.0.1',
     this.zmetaPort = 5555,
     this.zmetaPlatformId = 'shepherd-mesh-1',
+    this.zmetaTransport = 'udp',
+    this.zmetaIngestUrl = '',
+    this.zmetaIngestFp = '',
+    this.zmetaJoinedPlatformId = '',
     this.zmetaSecured = false,
     this.zmetaHeartbeatEnabled = false,
     this.zmetaHeartbeatIntervalSec = 60,
@@ -111,6 +118,7 @@ class AppSettings {
     this.sdrEnbLat,
     this.sdrEnbLon,
     this.sdrEnbCenterMhz,
+    this.sdrAutoStation = false,
   });
 
   String radioIp;
@@ -136,6 +144,28 @@ class AppSettings {
   String zmetaHost;
   int zmetaPort;
   String zmetaPlatformId;
+
+  /// Transport for ZMeta export: 'udp' (manual host/port, default),
+  /// 'https' (hub-issued ingest URL + bearer token — the no-WireGuard
+  /// path for forward-deployed operators), or 'wireguard' (joined via
+  /// invite code; still UDP underneath, to the tunnel address).
+  String zmetaTransport;
+
+  /// HTTPS ingest endpoint for [zmetaTransport] == 'https', set by the
+  /// join flow. The bearer token lives in secure storage (see
+  /// zmeta_ingest_store.dart), never here.
+  String zmetaIngestUrl;
+
+  /// TLS mode for the HTTPS ingest endpoint, captured from the invite
+  /// code's certfp at join time: '-' (Cloudflare / public-CA mode) or
+  /// 64-hex (pinned self-signed). The emitter builds its HttpClient
+  /// accordingly — a pin-mode hub must not silently drop events.
+  String zmetaIngestFp;
+
+  /// Platform ID the mesh joined under (set by the join flow). If the
+  /// operator later edits [zmetaPlatformId] to something else, the stored
+  /// token / hub peer no longer matches — see [zmetaPlatformMismatch].
+  String zmetaJoinedPlatformId;
 
   /// Operator's acknowledgment that the ZMeta link is secured (WireGuard
   /// tunnel). The app can't verify the tunnel itself — this is the
@@ -210,6 +240,13 @@ class AppSettings {
   /// carry their own tuned center.
   double? sdrEnbCenterMhz;
 
+  /// AUTO station: when true, the SDR station position is taken from
+  /// the device's own GPS fix (the SDR host is the device in the field
+  /// setup) instead of the hand-entered station coordinates, which are
+  /// kept untouched underneath. The eNB position has no honest auto
+  /// source (no tower database on-device) and always stays manual.
+  bool sdrAutoStation;
+
   TripwireConfig get tripwireConfig => TripwireConfig(
         baselineWindow: baselineWindow,
         dipThreshold: dipThreshold,
@@ -225,6 +262,10 @@ class AppSettings {
         'zmetaHost': zmetaHost,
         'zmetaPort': zmetaPort,
         'zmetaPlatformId': zmetaPlatformId,
+        'zmetaTransport': zmetaTransport,
+        'zmetaIngestUrl': zmetaIngestUrl,
+        'zmetaIngestFp': zmetaIngestFp,
+        'zmetaJoinedPlatformId': zmetaJoinedPlatformId,
         'zmetaSecured': zmetaSecured,
         'zmetaHeartbeatEnabled': zmetaHeartbeatEnabled,
         'zmetaHeartbeatIntervalSec': zmetaHeartbeatIntervalSec,
@@ -249,11 +290,14 @@ class AppSettings {
         'sdrEnbLat': sdrEnbLat,
         'sdrEnbLon': sdrEnbLon,
         'sdrEnbCenterMhz': sdrEnbCenterMhz,
+        'sdrAutoStation': sdrAutoStation,
       };
 
   void applyJson(Map<String, dynamic> j) {
     final ac = j['autoConnectSilvusUsb'];
     if (ac is bool) autoConnectSilvusUsb = ac;
+    final sa = j['sdrAutoStation'];
+    if (sa is bool) sdrAutoStation = sa;
     final e = j['zmetaEnabled'];
     if (e is bool) zmetaEnabled = e;
     final h = j['zmetaHost'];
@@ -262,6 +306,23 @@ class AppSettings {
     if (p is int && p > 0 && p < 65536) zmetaPort = p;
     final id = j['zmetaPlatformId'];
     if (id is String && id.isNotEmpty) zmetaPlatformId = id;
+    final tr = j['zmetaTransport'];
+    if (tr is String && (tr == 'udp' || tr == 'https' || tr == 'wireguard')) {
+      zmetaTransport = tr;
+    }
+    final iu = j['zmetaIngestUrl'];
+    if (iu is String) zmetaIngestUrl = iu;
+    final fp = j['zmetaIngestFp'];
+    if (fp is String && (fp == '-' || RegExp(r'^[0-9a-f]{64}$').hasMatch(fp))) {
+      zmetaIngestFp = fp;
+    }
+    final jid = j['zmetaJoinedPlatformId'];
+    if (jid is String) zmetaJoinedPlatformId = jid;
+    // Migration: meshes joined via the WireGuard flow before the
+    // transport field existed target the hub's tunnel subnet.
+    if (zmetaTransport == 'udp' && zmetaHost.startsWith('10.99.')) {
+      zmetaTransport = 'wireguard';
+    }
     final s = j['zmetaSecured'];
     if (s is bool) zmetaSecured = s;
     final hb = j['zmetaHeartbeatEnabled'];
@@ -337,22 +398,18 @@ class AppSettings {
     final slon = lat('sdrStationLon');
     final elat = lat('sdrEnbLat');
     final elon = lat('sdrEnbLon');
-    // All-or-nothing: a partial saved geometry is unconfigured, not a
-    // half-applied one. Range-checked like the settings UI.
-    if (slat != null &&
-        slon != null &&
-        elat != null &&
-        elon != null &&
-        slat >= -90 &&
-        slat <= 90 &&
-        elat >= -90 &&
-        elat <= 90 &&
-        slon >= -180 &&
-        slon <= 180 &&
-        elon >= -180 &&
-        elon <= 180) {
+    // Per-pair all-or-nothing: a partial pair is unconfigured, not a
+    // half-applied one. The pairs are independent because AUTO station
+    // mode legitimately persists an eNB with no manual station (the
+    // station then comes from the phone GPS fix at apply time).
+    // Range-checked like the settings UI.
+    bool latOk(double? v) => v != null && v >= -90 && v <= 90;
+    bool lonOk(double? v) => v != null && v >= -180 && v <= 180;
+    if (latOk(slat) && lonOk(slon)) {
       sdrStationLat = slat;
       sdrStationLon = slon;
+    }
+    if (latOk(elat) && lonOk(elon)) {
       sdrEnbLat = elat;
       sdrEnbLon = elon;
       final mhz = lat('sdrEnbCenterMhz');
@@ -463,6 +520,71 @@ class AppState extends ChangeNotifier {
     return next;
   }
 
+  /// HTTPS ingest emitter (no-WireGuard path). Created lazily like the
+  /// UDP one. Holds no token itself — the provider reads secure storage
+  /// per send, so a revoked-then-rejoined token takes effect without an
+  /// app restart.
+  ZMetaHttpsEmitter? _zmetaHttps;
+
+  ZMetaHttpsEmitter _zmetaHttpsEmitter() {
+    final cur = _zmetaHttps;
+    if (cur != null &&
+        cur.ingestUrl == settings.zmetaIngestUrl &&
+        cur.fpMode == settings.zmetaIngestFp) return cur;
+    cur?.close();
+    final next = ZMetaHttpsEmitter(
+      ingestUrl: settings.zmetaIngestUrl,
+      fpMode: settings.zmetaIngestFp,
+      tokenProvider: () {
+        final platform = settings.zmetaPlatformId.trim().isEmpty
+            ? 'shepherd-mesh-1'
+            : settings.zmetaPlatformId.trim();
+        return ZmetaIngestStore.readToken(platform);
+      },
+    );
+    _zmetaHttps = next;
+    return next;
+  }
+
+  /// S3: true once the hub has rejected the ingest token 5 times running.
+  /// The settings screen turns this into a re-join prompt.
+  bool get zmetaIngestTokenRejected => _zmetaHttps?.tokenRejected ?? false;
+
+  /// S4: the operator changed the platform ID after joining (the stored
+  /// token / hub peer is bound to the OLD id). Emission must stop until
+  /// they re-join under the new id.
+  bool get zmetaPlatformMismatch {
+    final t = settings.zmetaTransport;
+    if (t != 'https' && t != 'wireguard') return false;
+    final joined = settings.zmetaJoinedPlatformId.trim();
+    if (joined.isEmpty) return false;
+    return joined != settings.zmetaPlatformId.trim();
+  }
+
+  /// Fail-closed emit gate, transport-aware. UDP keeps the existing
+  /// rule (loopback always OK; a remote host needs the operator's
+  /// secured-link attestation). HTTPS is gated on a usable ingest URL —
+  /// TLS plus the bearer token IS the secured link there. A platform ID
+  /// changed after joining (S4) stops all joined transports cold.
+  bool _zmetaEmitAllowed() {
+    if (zmetaPlatformMismatch) return false;
+    if (settings.zmetaTransport == 'https') {
+      return zmetaIsUsableIngestUrl(settings.zmetaIngestUrl);
+    }
+    return zmetaIsLocalHost(settings.zmetaHost) || settings.zmetaSecured;
+  }
+
+  /// Send closure for the active transport. Both emitters share the
+  /// `send(Map)` shape and swallow their own failures, so call sites
+  /// don't care which transport is active.
+  ZmetaSend _zmetaSendFn() {
+    if (settings.zmetaTransport == 'https' &&
+        settings.zmetaIngestUrl.isNotEmpty) {
+      return _zmetaHttpsEmitter().send;
+    }
+    return _zmetaEmitter().send;
+  }
+
   /// Last known phone position (best-effort cache). Refreshed whenever
   /// the operator captures a node position and periodically while ZMeta
   /// export is on, so per-observation geo and the heartbeat move with a
@@ -482,6 +604,11 @@ class AppState extends ChangeNotifier {
         accuracyM: fix.accuracyM,
         at: DateTime.now(),
       );
+      // AUTO station rides the phone fix: a fresh fix (re)arms the
+      // Doppler geometry, and the 25 m gate inside decides whether
+      // the device has moved enough to matter. allowKick:false —
+      // this IS the refresh, it must not kick another one.
+      if (settings.sdrAutoStation) _applySdrStation(allowKick: false);
     } catch (_) {}
   }
 
@@ -938,17 +1065,15 @@ class AppState extends ChangeNotifier {
   /// never during replay.
   Future<void> _emitZmetaHeartbeat() async {
     if (replaying) return;
-    if (!zmetaIsLocalHost(settings.zmetaHost) && !settings.zmetaSecured) {
-      return;
-    }
+    if (!_zmetaEmitAllowed()) return;
     try {
       await refreshPhoneFix();
       final platform = settings.zmetaPlatformId.trim().isEmpty
           ? 'shepherd-mesh-1'
           : settings.zmetaPlatformId.trim();
       final geo = _platformGeo();
-      final emitter = _zmetaEmitter();
-      await emitter.send(zmetaPlatformStatus(
+      final send = _zmetaSendFn();
+      await send(zmetaPlatformStatus(
         platformId: platform,
         ts: DateTime.now(),
         state: 'NOMINAL',
@@ -1467,18 +1592,16 @@ class AppState extends ChangeNotifier {
   Future<void> _emitZmetaSensorObs(List<SensorObservation> obs) async {
     if (replaying) return;
     if (!settings.zmetaEnabled) return;
-    if (!zmetaIsLocalHost(settings.zmetaHost) && !settings.zmetaSecured) {
-      return;
-    }
+    if (!_zmetaEmitAllowed()) return;
     try {
-      final emitter = _zmetaEmitter();
+      final send = _zmetaSendFn();
       final platform = settings.zmetaPlatformId.trim().isEmpty
           ? 'shepherd-mesh-1'
           : settings.zmetaPlatformId.trim();
       for (final o in obs) {
         final evt = zmetaSensorObservation(platformId: platform, obs: o);
         if (evt == null) continue; // no honest modality — stays local
-        await emitter.send(evt);
+        await send(evt);
       }
     } catch (_) {}
   }
@@ -1576,6 +1699,10 @@ class AppState extends ChangeNotifier {
       wifi.dipThresholdDb = settings.wifiDipThresholdDb;
       wifi.start(simulate: settings.simulatedMode);
     }
+    // Re-arm the Doppler geometry against the new settings right away
+    // (start() also does this when polling resumes). In AUTO station
+    // mode this is what kicks the first GPS fix.
+    applySdrStationFromSettings();
     notifyListeners();
     if (wasPolling) start();
   }
@@ -2542,24 +2669,115 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Last phone GPS fix, exposed for status readouts (SDR AUTO
+  /// station, Settings). Null until the first successful fix.
+  ({double lat, double lon, double altM, double accuracyM, DateTime at})?
+      get lastPhoneFix => _lastPhoneFix;
+
+  /// The auto-station position currently applied to the drivers, so a
+  /// fresh phone fix only re-arms the geometry when the device has
+  /// actually moved (> 25 m) — not on every fix refresh.
+  ({double lat, double lon})? _appliedAutoStation;
+  bool _autoStationRefreshInFlight = false;
+
+  /// Human status for the Doppler geometry, shown in Settings.
+  String get sdrGeometryStatus {
+    final s = settings;
+    final elat = s.sdrEnbLat, elon = s.sdrEnbLon;
+    if (elat == null || elon == null) {
+      return 'NOT CONFIGURED — THE DOPPLER CORRELATOR ABSTAINS UNTIL '
+          'THE eNB IS SET (eNB POSITION IS ALWAYS MANUAL)';
+    }
+    if (s.sdrAutoStation) {
+      final applied = _appliedAutoStation;
+      if (applied == null) {
+        return 'AUTO STATION — WAITING FOR A PHONE GPS FIX; '
+            'CORRELATOR ABSTAINS UNTIL IT LANDS';
+      }
+      final fix = _lastPhoneFix;
+      final acc = fix == null
+          ? ''
+          : ' (±${fix.accuracyM.toStringAsFixed(0)} M)';
+      // Armed on a fix that has since gone stale: say so — the
+      // geometry on the drivers is last-known, not current.
+      if (fix != null && DateTime.now().difference(fix.at).inMinutes >= 30) {
+        return 'AUTO STATION FROM PHONE GPS$acc — FIX STALE '
+            '(${DateTime.now().difference(fix.at).inMinutes} MIN OLD); '
+            'GEOMETRY IS LAST-KNOWN UNTIL A FRESH FIX LANDS';
+      }
+      final coarse = fix != null && fix.accuracyM > 100
+          ? ' — COARSE FIX, GEOMETRY IS ROUGH'
+          : '';
+      return 'AUTO STATION FROM PHONE GPS$acc — CORRELATOR ARMED; '
+          'eNB MANUAL$coarse';
+    }
+    if (s.sdrStationLat == null || s.sdrStationLon == null) {
+      return 'NOT CONFIGURED — SET THE STATION OR TURN ON AUTO STATION';
+    }
+    return 'MANUAL GEOMETRY — CORRELATOR ARMED';
+  }
+
   /// Push the persisted SDR station / LTE eNB geometry (Settings → SDR
   /// station) to the SDR drivers for the Doppler correlator.
   ///
   /// Lat/lon → field-local meters via the GPS field origin when one is
   /// set; otherwise the station itself is the local origin (0,0) and
-  /// the eNB is placed relative to it. No-op until all four
-  /// coordinates are configured — the correlator abstains without
-  /// them (silence, never a guess). Called on start() so a restart
-  /// re-arms the persisted geometry, and after settings are saved.
-  void applySdrStationFromSettings() {
+  /// the eNB is placed relative to it. No-op until the station and the
+  /// eNB are both known — the correlator abstains without them
+  /// (silence, never a guess). Called on start() so a restart re-arms
+  /// the persisted geometry, and after settings are saved.
+  ///
+  /// AUTO station (settings.sdrAutoStation): the station is the
+  /// device's own GPS fix instead of the hand-entered coordinates
+  /// (kept untouched underneath). A fix older than 30 min does not
+  /// arm the correlator; a missing/stale fix kicks a refresh and the
+  /// apply retries when it lands.
+  void applySdrStationFromSettings() =>
+      _applySdrStation(allowKick: true);
+
+  void _applySdrStation({required bool allowKick}) {
     final s = settings;
-    final slat = s.sdrStationLat;
-    final slon = s.sdrStationLon;
+    var slat = s.sdrStationLat;
+    var slon = s.sdrStationLon;
     final elat = s.sdrEnbLat;
     final elon = s.sdrEnbLon;
-    if (slat == null || slon == null || elat == null || elon == null) {
-      return;
+    if (elat == null || elon == null) return;
+    if (s.sdrAutoStation) {
+      final fix = _lastPhoneFix;
+      final fresh = fix != null &&
+          DateTime.now().difference(fix.at).inMinutes < 30 &&
+          fix.lat.isFinite &&
+          fix.lon.isFinite;
+      if (!fresh) {
+        // One kick per apply chain: the refresh completion re-applies
+        // with allowKick=false, so a failed fix can't loop forever.
+        if (allowKick) _kickAutoStationRefresh();
+        return;
+      }
+      final applied = _appliedAutoStation;
+      if (applied != null) {
+        final moved =
+            latLonToMeters(fix.lat, fix.lon, applied.lat, applied.lon);
+        final distM = math.sqrt(moved.x * moved.x + moved.y * moved.y);
+        if (distM < 25) {
+          // Already armed at (nearly) this spot — keep the applied
+          // position so the geometry doesn't jitter with GPS noise.
+          slat = applied.lat;
+          slon = applied.lon;
+        } else {
+          slat = fix.lat;
+          slon = fix.lon;
+          _appliedAutoStation = (lat: fix.lat, lon: fix.lon);
+        }
+      } else {
+        slat = fix.lat;
+        slon = fix.lon;
+        _appliedAutoStation = (lat: fix.lat, lon: fix.lon);
+      }
+    } else {
+      _appliedAutoStation = null;
     }
+    if (slat == null || slon == null) return;
     final origin = gpsOrigin;
     final refLat = origin?.lat ?? slat;
     final refLon = origin?.lon ?? slon;
@@ -2571,6 +2789,17 @@ class AppState extends ChangeNotifier {
       enbX: en.x,
       enbY: en.y,
     );
+  }
+
+  /// Refresh the phone fix for AUTO station mode, then re-apply.
+  /// In-flight guarded; failures leave the correlator abstaining.
+  void _kickAutoStationRefresh() {
+    if (_autoStationRefreshInFlight) return;
+    _autoStationRefreshInFlight = true;
+    unawaited(refreshPhoneFix().whenComplete(() {
+      _autoStationRefreshInFlight = false;
+      if (settings.sdrAutoStation) _applySdrStation(allowKick: false);
+    }));
   }
 
   DateTime? _lastFuse;
@@ -2663,9 +2892,7 @@ class AppState extends ChangeNotifier {
   ///   site — belt and suspenders).
   Future<void> _emitZmeta(List<CrossingEvent> evts) async {
     if (replaying) return;
-    if (!zmetaIsLocalHost(settings.zmetaHost) && !settings.zmetaSecured) {
-      return;
-    }
+    if (!_zmetaEmitAllowed()) return;
     _zmetaQueue.addAll(evts);
     if (_emitting) return; // the in-flight drain picks these up
     _emitting = true;
@@ -2683,7 +2910,7 @@ class AppState extends ChangeNotifier {
   /// One serialized batch of ZMeta events over UDP. Never throws.
   Future<void> _sendZmetaBatch(List<CrossingEvent> evts) async {
     try {
-      final emitter = _zmetaEmitter();
+      final send = _zmetaSendFn();
       final platform = settings.zmetaPlatformId.trim().isEmpty
           ? 'shepherd-mesh-1'
           : settings.zmetaPlatformId.trim();
@@ -2707,10 +2934,10 @@ class AppState extends ChangeNotifier {
           doaArrayRelativeDeg: rf.doaDeg,
           sensorGeo: bestKnownGeoFor(e.linkKey),
         );
-        await emitter.send(obs);
+        await send(obs);
         if (e.aiLabel != null && e.aiConfidence != null) {
           final obsId = (obs['event'] as Map)['event_id'] as String;
-          await emitter.send(zmetaInference(
+          await send(zmetaInference(
             platformId: platform,
             observationId: obsId,
             ts: e.timestamp,
