@@ -13,12 +13,12 @@ Built by **Draco**.
 - **Alert-first dashboard** — big DETECTED / CLEAR banner, per-radio status cards, live link telemetry.
 - **Tracking map** — draggable field map with per-node GPS positions, radio-tomographic shadow heatmap, and deterministic cross-network track solving (grid-search position solver; altitude when nodes are at different heights).
 - **Beam 3D** — orbit-able antenna lobe visualization with first Fresnel zone ellipsoids.
-- **WiFi Vision** — ambient disturbance sensing via the device's own Wi-Fi adapter (coarse RSSI tripwire, per-AP baselines, disturbance attribution by elimination).
+- **WiFi Vision** — ambient disturbance sensing via the device's own Wi-Fi adapter (coarse RSSI tripwire, per-AP baselines, disturbance attribution by elimination). Real adapter feed on Windows (netsh) and Android (system Wi-Fi stack, v0.20.0+); other platforms simulate.
 - **Air Threats (defensive)** — rogue AP / evil-twin suspicion and disconnect-burst (deauth-pattern) recognition. Detect-only: Shepherd never transmits.
 - **Nearby wireless** — passive BLE advertisement scanning with vendor decoding, plus LAN device sweep.
 - **Embedded tiny AI (offline)** — pure-Dart neural nets running fully on-device: a crossing-event classifier and a track-stitching specialist, both trained on synthetic scenarios. No cloud, no LLM.
 - **GPS positioning** — walk to each node and capture its position; defended-point marker with INBOUND / OUTBOUND / TRANSITING readouts.
-- **ZMeta export (tactical → operational)** — emit-only ZMeta event adapter: detections ship as `OBSERVATION_EVENT`/`INFERENCE_EVENT` over UDP to a ZMeta gateway, which fuses across Shepherd meshes. The tactical→operational link is secured with WireGuard (`field_kit/zmeta_secure/`).
+- **ZMeta export (tactical → operational)** — emit-only ZMeta event adapter: detections ship as `OBSERVATION_EVENT`/`INFERENCE_EVENT` over UDP to a ZMeta gateway, which fuses across Shepherd meshes. The tactical→operational link is secured with WireGuard (`field_kit/zmeta_secure/`). Joining a mesh takes an invite code — paste it, or scan the hub's QR with the in-app camera scanner (v0.21.0).
 - **Fade-aware tripwire + VRTI** — per-link fade levels judge disturbances against their expected direction (dip vs. rise); a variance channel catches slow movers the mean misses.
 - **SDR FHSS signature detector** — band-plan presets (`--plan fpv/dji/longrange/lora`) and rolling sub-band occupancy hints (`fhss-2g4`, `ofdm-5g`, …): signatures, never identity.
 - **ELRS Gemini signature detection** — RX-only DSP in the SDR bridge finds LoRa chirp trains (ELRS's LoRa modes) and scores the Gemini dual-emission signature: time-correlated trains on two frequencies (~40 MHz apart @ 2.4 GHz) or two bands at once (2.4 GHz + 900 MHz, GemX). Surfaced as upgrade-only corroboration in the evidence view. The first public ELRS-specific detector; see `docs/elrs_detection_spec.md`.
@@ -27,7 +27,7 @@ Built by **Draco**.
 - **Adaptive baseline + dial-it-in calibration** — per-link reference levels that follow slow environmental drift instead of re-tripping the tripwire; the operator captures a known-clean baseline profile before an event. Calibrates the *reference* — never claims targets, identity, or range.
 - **Direction-split RTI imaging** — the shadow heatmap weights disturbances with fade-signed, direction-split, area-normalized weights, so blobs land where the link geometry says they should.
 - **ESP32 CSI motion channel** — outdoor-usable Wi-Fi CSI motion sensing on the field-kit nodes: phase-cancellation averaging, a wind gate, and link-budget gates that zero-weight the channel on weak links. Meters-class tripwire — existence evidence, never identity.
-- **Doppler-only track refinement** — the SDR bridge measures radial velocity off ambient LTE downlink (~0.16 m/s resolution at 1.86 GHz) as a second opinion on a track's motion. Upgrade-only: agreement can raise confidence, disagreement never deletes a track.
+- **Doppler-only track refinement** — the SDR bridge measures radial velocity off ambient LTE downlink (~0.16 m/s resolution at 1.86 GHz) as a second opinion on a track's motion. Upgrade-only: agreement can raise confidence, disagreement never deletes a track. Station geometry can be hand-entered or AUTO (v0.21.0): the station follows the device GPS fix with a 25 m re-arm gate and a 30 min staleness limit; the eNB position stays manual — there is no honest on-device auto source for it.
 - **WPP-IDP passive radar** — no-clean-reference passive radar on signals of opportunity: per-packet energy → DC removal → STFT chain, with a waveform rule scoring candidate illuminators. Micro-Doppler corroborates *motion*, never *identity*. Meters-to-tens-of-meters.
 - **Validation benches** — AERPAW flight-test replay through the fusion machinery (validates the fusion, not the sensing) and an ESP32 500 fps CSI frame-rate go/no-go bench.
 - **Operator tools** — event timeline scrubber, alert triage (ACK / false-alarm with tuning stats), spectrum-band panel, node health map, record/replay with "why did it alert" evidence view.
@@ -104,7 +104,17 @@ Nothing here transmits. Probes are survey-only by design.
 
 ## Screenshots
 
-See [`docs/screenshots/`](docs/screenshots/) — captured from the live app.
+Captured from the live app on Android (2026-10-20). Network identifiers
+(home SSID/BSSID) are redacted in the WiFi Vision shots.
+
+<p>
+<img src="docs/screenshots/dashboard.jpg" width="260" alt="Dashboard — alerts, radios, mesh links, event timeline">
+<img src="docs/screenshots/tracking.jpg" width="260" alt="Tracking — GPS node positioning">
+<img src="docs/screenshots/wifi_vision_detected.jpg" width="260" alt="WiFi Vision — disturbance DETECTED with Air Threats panel">
+<img src="docs/screenshots/wifi_vision_clear.jpg" width="260" alt="WiFi Vision — field CLEAR, monitoring 134 APs">
+</p>
+
+More in [`docs/screenshots/`](docs/screenshots/).
 
 ## Honest scope
 
