@@ -1,5 +1,68 @@
 # Changelog
 
+## v0.21.0 — 2026-10-20 — Field fixes: tracking header, QR join, Doppler AUTO
+
+Three operator asks from the first full EUD day, in one build:
+
+- **Tracking header overflow fixed** (field report: "the buttons at the
+  top aren't aligned properly"). The FIELD MAP header put the title,
+  fullscreen button, four layer toggles and the mode label in one row —
+  on phone widths HEALTH clipped mid-word and SENSORS fell off-screen.
+  Now: title row + a wrapping toggle row. The same bug class was hiding
+  in the GPS card (SET ORIGIN / SET DEFENDED shared rows with long
+  labels) — restructured the same way. New widget regression tests
+  render the Tracking tab at 360 px in simulated and live modes and
+  fail on any overflow.
+- **QR scan for ZMeta invite codes** (field ask). The join dialog gains
+  a SCAN QR CODE button (Android/iOS): camera → the field is filled
+  only with a code that passes the full strict invite parse; any other
+  QR is rejected with a plain message. Hub side: `zmeta_invite.py` now
+  also prints the invite as an ASCII QR (optional `qrcode` pip package;
+  degrades to a hint, never an error). CAMERA permission added
+  (camera feature not required, so camera-less devices still install).
+- **Doppler AUTO station** (field ask). Settings → SDR station gains
+  AUTO STATION (GPS): the station position comes from the device's own
+  GPS fix instead of hand-typed coordinates, re-arms on a >25 m move,
+  and a fix older than 30 min never arms — the status line reports
+  armed / waiting / stale / coarse honestly. The eNB position stays
+  manual (no tower database on-device; the UI says so). Manual station
+  values are preserved under AUTO, including across saves with the
+  fields left blank. Saved geometry now loads per-pair (station pair,
+  eNB pair) so an AUTO config with no manual station still loads its
+  eNB.
+- Independent review: 0 blocking, 4 should-fix — all fixed (staleness
+  disclosure + re-arm on fresh fixes, AUTO save preserving the manual
+  fallback, hub QR crash-proofing on legacy consoles, true-distance
+  25 m gate). 322/322 Dart tests, hub pairing tests 60/60, analyze
+  clean. The QR scanner's native camera path is Kotlin/SDK-side and
+  compiles on the operator's PC build, same caveat as the v0.20.0
+  Android WiFi channel.
+
+## v0.20.0 — 2026-10-20 — WiFi Vision goes real on Android
+
+The phone in your pocket is now an actual WiFi sensor, not a demo:
+
+- **Android WiFi source** (`AndroidWifiSource` in `lib/services/wifi_sense.dart`
+  + the `shepherd/wifi_sense` channel in `MainActivity.kt`): WiFi Vision
+  previously fell back to simulated data on Android. It now reads the real
+  adapter — the connected AP's RSSI polled every second (the live tripwire)
+  plus the system scan-results cache for the neighbor survey, with per-AP
+  security labels parsed from scan capabilities feeding rogue-AP detection.
+- **Honest platform limits, handled in code**: Android throttles scans, so a
+  survey whose cache timestamp hasn't advanced is dropped instead of being
+  re-ingested as fresh samples; scan results need the Location permission
+  (one prompt, then a plain-language error, never silent nothing); the
+  connected-AP poll needs *full* Location — Nearby Wi-Fi alone leaves the
+  connection info redacted, and the app now says exactly that; transition
+  RSSI garbage (-127) is rejected before it can fake a disturbance.
+- Manifest gains `ACCESS_WIFI_STATE` / `CHANGE_WIFI_STATE` (install-time).
+- Independent review: 0 blocking, 5 should-fix — all fixed (stale-cache
+  guard, NEARBY-only redaction error, unknown-vs-Open security label,
+  RSSI_INVALID rejection, service-level regression test). 308/308 Dart
+  tests, analyze clean. Kotlin reviewed by inspection; the on-device
+  build + a handset check of the fast poll remain the field test, same
+  as every Android-side change.
+
 ## v0.19.0 — 2026-10-19 — Device auto-connect
 
 Plug-and-play radios, and an eagerly-connected TAK link:
