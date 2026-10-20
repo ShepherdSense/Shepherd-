@@ -1,8 +1,11 @@
 package com.example.rf_sentry
 
+import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.net.wifi.WifiManager
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import android.net.wifi.aware.AttachCallback
 import android.net.wifi.aware.DiscoverySession
 import android.net.wifi.aware.DiscoverySessionCallback
@@ -39,9 +42,12 @@ class MainActivity : FlutterActivity() {
         private const val AWARE_METHOD = "rf_sentry/wifi_aware"
         private const val AWARE_EVENTS = "rf_sentry/wifi_aware_events"
         private const val MCAST_METHOD = "shepherd/multicast_lock"
+        private const val WIFI_METHOD = "shepherd/wifi_sense"
+        private const val WIFI_PERM_REQUEST = 9917
     }
 
     private var multicastLock: WifiManager.MulticastLock? = null
+    private var wifiPermRequested = false
 
     private var eventSink: EventChannel.EventSink? = null
     private var discoverySession: DiscoverySession? = null
@@ -58,6 +64,47 @@ class MainActivity : FlutterActivity() {
                     "release" -> {
                         releaseMulticastLock()
                         result.success(null)
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+        // WiFi Vision ambient sensing source (wifi_sense.dart
+        // AndroidWifiSource). Passive reads only: the connected AP's
+        // RSSI and the system scan-results cache. startScan is
+        // best-effort — Android throttles it (foreground ~4 per 2 min),
+        // so a throttled survey simply returns the latest cached
+        // results instead of failing.
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, WIFI_METHOD)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "connected" -> {
+                        // Scan results accept FINE *or* NEARBY (33+),
+                        // but WifiInfo SSID/BSSID only un-redact with
+                        // FINE — a NEARBY-only grant gets its own error
+                        // so the app can explain the dead fast poll
+                        // instead of silently showing nothing.
+                        when {
+                            !hasWifiScanPermission() -> result.error(
+                                "NO_PERMISSION",
+                                "WiFi sensing needs Location permission", null)
+                            !hasFineLocation() -> result.error(
+                                "NO_FINE_LOCATION",
+                                "Connected-AP sensing needs full Location " +
+                                    "permission", null)
+                            else -> result.success(connectedAp())
+                        }
+                    }
+                    "survey" -> {
+                        if (!hasWifiScanPermission()) {
+                            result.error("NO_PERMISSION",
+                                "WiFi sensing needs Location permission", null)
+                        } else {
+                            result.success(wifiSurvey())
+                        }
+                    }
+                    "requestPermission" -> {
+                        requestWifiPermissions()
+                        result.success(true)
                     }
                     else -> result.notImplemented()
                 }
@@ -116,6 +163,106 @@ class MainActivity : FlutterActivity() {
     override fun onDestroy() {
         releaseMulticastLock()
         super.onDestroy()
+    }
+
+    // --- WiFi Vision source helpers ---
+
+    private fun wifiManager(): WifiManager? =
+        applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+
+    private fun hasFineLocation(): Boolean =
+        ContextCompat.checkSelfPermission(
+            this, Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+
+    /// Scan results are location-derived data: Android gates them
+    /// behind ACCESS_FINE_LOCATION, or (API 33+) NEARBY_WIFI_DEVICES.
+    private fun hasWifiScanPermission(): Boolean {
+        if (hasFineLocation()) return true
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            return ContextCompat.checkSelfPermission(
+                this, Manifest.permission.NEARBY_WIFI_DEVICES
+            ) == PackageManager.PERMISSION_GRANTED
+        }
+        return false
+    }
+
+    /// Prompt once per process; the Dart side also gates its calls, so
+    /// a denied permission doesn't re-prompt on every 1 s poll.
+    private fun requestWifiPermissions() {
+        if (wifiPermRequested || hasWifiScanPermission()) return
+        wifiPermRequested = true
+        val perms = mutableListOf(Manifest.permission.ACCESS_FINE_LOCATION)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            perms.add(Manifest.permission.NEARBY_WIFI_DEVICES)
+        }
+        try {
+            ActivityCompat.requestPermissions(this, perms.toTypedArray(),
+                WIFI_PERM_REQUEST)
+        } catch (_: Exception) {
+        }
+    }
+
+    /// The connected AP, or null when not associated. connectionInfo is
+    /// deprecated on API 31+ in favor of NetworkCallback TransportInfo,
+    /// but with the scan permission held it still returns real values
+    /// and needs no callback lifecycle — deliberate simplicity.
+    @Suppress("DEPRECATION")
+    private fun connectedAp(): Map<String, Any>? {
+        return try {
+            val info = wifiManager()?.connectionInfo ?: return null
+            if (info.networkId == -1) return null
+            // RSSI_INVALID (-127) shows up during association/roam
+            // transitions with a valid networkId; fed to the baseline
+            // it would fake a ~70 dB dip and a false disturbance.
+            // A non-negative reading is likewise not a real RSSI.
+            if (info.rssi <= -127 || info.rssi >= 0) return null
+            val bssid = info.bssid?.lowercase() ?: return null
+            // Redacted placeholder Android returns without permission.
+            if (bssid == "02:00:00:00:00:00") return null
+            mapOf(
+                "ssid" to (info.ssid?.removeSurrounding("\"") ?: ""),
+                "bssid" to bssid,
+                "rssi" to info.rssi,
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun wifiSurvey(): List<Map<String, Any>> {
+        val wifi = wifiManager() ?: return emptyList()
+        try {
+            // Best-effort fresh scan; false just means throttled, and
+            // the cached results below are still the latest known field.
+            wifi.startScan()
+        } catch (_: Exception) {
+        }
+        val connectedBssid = try {
+            wifi.connectionInfo?.bssid?.lowercase()
+        } catch (_: Exception) {
+            null
+        }
+        return try {
+            wifi.scanResults.map { r ->
+                mapOf<String, Any>(
+                    "ssid" to (r.SSID ?: ""),
+                    "bssid" to (r.BSSID?.lowercase() ?: ""),
+                    "rssi" to r.level,
+                    "capabilities" to (r.capabilities ?: ""),
+                    "connected" to (r.BSSID?.lowercase() == connectedBssid),
+                    // ScanResult.timestamp is µs since boot — the Dart
+                    // side uses it to tell a fresh scan from a throttled
+                    // re-read of this same cache.
+                    "tsMs" to (r.timestamp / 1000),
+                )
+            }
+        } catch (_: SecurityException) {
+            emptyList()
+        } catch (_: Exception) {
+            emptyList()
+        }
     }
 
     private fun awareManager(): WifiAwareManager? {

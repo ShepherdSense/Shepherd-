@@ -1,9 +1,19 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Camera: QR scan of ZMeta invite codes only (join dialog).
+         Nothing is recorded or uploaded; frames are decoded on-device. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- CoT multicast ingest: without a MulticastLock most Android Wi-Fi
          stacks drop inbound multicast (cot_listener.dart). -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- WiFi Vision ambient sensing (AndroidWifiSource): read the
+         connected AP's RSSI and the scan-results cache, and request
+         (throttled) scans. Both are install-time permissions; the scan
+         RESULTS additionally need the location permission above. -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
     <!-- GPS capture for node positioning: walk to a node, tap capture. -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />

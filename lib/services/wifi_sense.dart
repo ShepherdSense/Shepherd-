@@ -6,6 +6,8 @@ import 'dart:collection';
 import 'dart:io';
 import 'dart:math' as math;
 
+import 'package:flutter/services.dart';
+
 import 'ble_scan.dart';
 import 'lan_scan.dart';
 import 'wifi_threats.dart';
@@ -143,9 +145,9 @@ class WifiCrossingEvent {
   }
 }
 
-/// Source of ambient WiFi readings. Windows uses netsh; Android is not
-/// yet implemented (needs a scan plugin + platform channel for
-/// connected-AP RSSI); anything else falls back to simulation.
+/// Source of ambient WiFi readings. Windows uses netsh, Android uses
+/// the `shepherd/wifi_sense` platform channel (connected-AP RSSI +
+/// scan-results cache); anything else falls back to simulation.
 abstract class WifiRssiSource {
   /// Fast poll: connected AP RSSI (cheap).
   Future<List<WifiApReading>> pollFast();
@@ -273,6 +275,178 @@ class NetshWifiSource extends WifiRssiSource {
   }
 }
 
+/// Android implementation over the `shepherd/wifi_sense` platform
+/// channel (MainActivity.kt): connected-AP RSSI for the fast poll, the
+/// system scan-results cache for the survey.
+///
+/// Honest limits, mirrored in the UI's expectations: Android throttles
+/// startScan (foreground apps ~4 per 2 minutes), so surveys ride the
+/// scan-results cache — a survey whose cache timestamp hasn't advanced
+/// is dropped here rather than re-ingested as fresh samples. Scan
+/// results are location-gated: without the Location (or Nearby Wi-Fi)
+/// permission the channel answers NO_PERMISSION and this source
+/// surfaces one clear error instead of silently returning nothing.
+/// The connected-AP fast poll needs full Location specifically —
+/// Nearby Wi-Fi alone leaves WifiInfo redacted (NO_FINE_LOCATION).
+/// Below API 33 the system Location toggle must also be ON, or
+/// surveys come back empty.
+class AndroidWifiSource extends WifiRssiSource {
+  AndroidWifiSource({MethodChannel? channel})
+      : _channel = channel ?? const MethodChannel('shepherd/wifi_sense');
+
+  final MethodChannel _channel;
+
+  /// Prompt latch: per source instance (the service builds a fresh
+  /// source per start) and per process on the Kotlin side — worst
+  /// case is one extra prompt per app run, never one per poll.
+  bool _permissionRequested = false;
+
+  /// Newest scan-cache timestamp (ms since boot) seen so far.
+  int? _lastSurveyTsMs;
+
+  /// Runs [call], mapping the channel's permission errors to single
+  /// user-actionable StateErrors (and firing the system permission
+  /// prompt once). Any other channel failure degrades to [fallback] —
+  /// a transient radio hiccup must not kill the service.
+  Future<T> _guarded<T>(Future<T> Function() call, T fallback) async {
+    try {
+      return await call();
+    } on PlatformException catch (e) {
+      if (e.code == 'NO_PERMISSION' || e.code == 'NO_FINE_LOCATION') {
+        if (!_permissionRequested) {
+          _permissionRequested = true;
+          try {
+            await _channel.invokeMethod<bool>('requestPermission');
+          } catch (_) {
+            // Prompt is best-effort; the error below still explains.
+          }
+        }
+        throw StateError(e.code == 'NO_FINE_LOCATION'
+            ? 'Connected-AP sensing needs full Location permission — '
+                'Nearby Wi-Fi alone leaves the connection info hidden. '
+                'Allow Location in Android Settings, Apps, Shepherd, '
+                'Permissions.'
+            : 'WiFi sensing needs the Location permission — '
+                'allow it when prompted, or in Android Settings, Apps, '
+                'Shepherd, Permissions.');
+      }
+      return fallback;
+    } on MissingPluginException {
+      return fallback;
+    }
+  }
+
+  @override
+  Future<List<WifiApReading>> pollFast() {
+    return _guarded(() async {
+      final raw =
+          await _channel.invokeMapMethod<String, dynamic>('connected');
+      final r = raw == null ? null : readingFromMap(raw, connected: true);
+      return r == null ? <WifiApReading>[] : [r];
+    }, <WifiApReading>[]);
+  }
+
+  @override
+  Future<List<WifiApReading>> pollSurvey() {
+    return _guarded(() async {
+      final raw = await _channel.invokeListMethod<dynamic>('survey');
+      if (raw == null) return <WifiApReading>[];
+      final maps = <Map<String, dynamic>>[
+        for (final e in raw)
+          if (e is Map) e.map((k, v) => MapEntry(k.toString(), v)),
+      ];
+      // Stale-cache guard: when Android throttles the scan, the same
+      // cache comes back with the same timestamps. Re-ingesting it
+      // would refresh AP last-seen times from old data and feed the
+      // baselines (and the threat detector's consecutive-survey gate)
+      // duplicated samples — so a batch whose newest timestamp hasn't
+      // advanced counts as "no new data". Entries without a timestamp
+      // (older native side) opt the whole batch out of the guard.
+      var newestTs = -1;
+      var allStamped = maps.isNotEmpty;
+      for (final m in maps) {
+        final ts = m['tsMs'];
+        if (ts is num) {
+          if (ts.toInt() > newestTs) newestTs = ts.toInt();
+        } else {
+          allStamped = false;
+        }
+      }
+      if (allStamped) {
+        final last = _lastSurveyTsMs;
+        if (last != null && newestTs <= last) return <WifiApReading>[];
+        _lastSurveyTsMs = newestTs;
+      }
+      final out = <WifiApReading>[];
+      for (final m in maps) {
+        final r = readingFromMap(m, connected: m['connected'] == true);
+        if (r != null) out.add(r);
+      }
+      return out;
+    }, <WifiApReading>[]);
+  }
+
+  /// Parses one channel map into a reading; null when the essentials
+  /// (BSSID, numeric RSSI) are missing or malformed.
+  static WifiApReading? readingFromMap(Map<String, dynamic> m,
+      {required bool connected}) {
+    final bssid = (m['bssid'] as String?)?.trim().toLowerCase() ?? '';
+    final rssiRaw = m['rssi'];
+    if (bssid.isEmpty || rssiRaw is! num) return null;
+    final ssidRaw = (m['ssid'] as String?)?.trim() ?? '';
+    final ssid = (ssidRaw.isEmpty || ssidRaw == '<unknown ssid>')
+        ? (connected ? '(unknown)' : '(hidden)')
+        : ssidRaw;
+    // Absent capabilities (the connected fast poll carries none) means
+    // UNKNOWN security, not Open — labeling it Open would make the AP
+    // list flicker the connected AP's real security off every second.
+    // A present-but-tokenless string is a genuinely open network.
+    final capsRaw = m['capabilities'];
+    final (auth, cipher) = capsRaw is String
+        ? authCipherFromCapabilities(capsRaw)
+        : ('', '');
+    return WifiApReading(
+      ssid: ssid,
+      bssid: bssid,
+      rssiDbm: rssiRaw.toDouble(),
+      isConnected: connected,
+      auth: auth,
+      cipher: cipher,
+    );
+  }
+
+  /// Maps an Android ScanResult capabilities string (e.g.
+  /// `[WPA2-PSK-CCMP][WPA3-SAE-CCMP][ESS]`) to the auth/cipher label
+  /// style the netsh source produces. Only self-consistency matters:
+  /// rogue-AP detection compares labels per SSID across time.
+  static (String, String) authCipherFromCapabilities(String caps) {
+    final c = caps.toUpperCase();
+    var cipher = '';
+    if (c.contains('CCMP')) {
+      cipher = 'CCMP';
+    } else if (c.contains('GCMP')) {
+      cipher = 'GCMP';
+    } else if (c.contains('TKIP')) {
+      cipher = 'TKIP';
+    }
+    final String auth;
+    if (c.contains('SAE') || c.contains('WPA3')) {
+      auth = c.contains('EAP') ? 'WPA3-Enterprise' : 'WPA3-Personal';
+      if (cipher.isEmpty) cipher = 'CCMP';
+    } else if (c.contains('WPA2')) {
+      auth = c.contains('EAP') ? 'WPA2-Enterprise' : 'WPA2-Personal';
+    } else if (c.contains('WPA')) {
+      auth = c.contains('EAP') ? 'WPA-Enterprise' : 'WPA-Personal';
+    } else if (c.contains('WEP')) {
+      auth = 'WEP';
+      if (cipher.isEmpty) cipher = 'WEP';
+    } else {
+      auth = 'Open';
+    }
+    return (auth, cipher);
+  }
+}
+
 /// Simulated ambient field: one "connected" AP plus neighbors, with
 /// occasional wandering disturbance dips. Used when no real adapter
 /// source exists, and for demos.
@@ -337,8 +511,9 @@ class WifiVisionService {
   WifiRssiSource _sourceFor(bool simulate) {
     if (simulate) return SimulatedWifiSource();
     if (Platform.isWindows) return NetshWifiSource();
-    // Android/iOS/macOS/Linux: no verified source yet — simulate
-    // rather than silently returning nothing.
+    if (Platform.isAndroid) return AndroidWifiSource();
+    // iOS/macOS/Linux: no verified source yet — simulate rather than
+    // silently returning nothing.
     return SimulatedWifiSource();
   }
 
