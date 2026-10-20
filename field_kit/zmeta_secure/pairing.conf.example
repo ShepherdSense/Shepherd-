@@ -1,0 +1,32 @@
+# ZMeta pairing hub config — copy to pairing.conf and fill in.
+# Generated in part by SETUP_PAIRING.bat (certfp is written by setup).
+
+# Gateway WireGuard PUBLIC key (base64, 44 chars). From: wg pubkey < gateway.key
+hub_pubkey=
+
+# UDP port the hub's WireGuard listens on (open in firewall).
+wg_port=51820
+
+# Public endpoint meshes put in their [Peer] Endpoint line.
+# Format host:port — must be reachable from the meshes' networks.
+wg_endpoint=
+
+# WireGuard interface name on the hub (Linux: wg0).
+wg_interface=wg0
+
+# TCP port for the pairing HTTPS server (open in firewall).
+pair_port=8443
+
+# Where Shepherd sends ZMeta events INSIDE the tunnel.
+zmeta_target=10.99.0.1:5555
+
+# Public HTTPS ingest URL for meshes WITHOUT WireGuard
+# (e.g. https://pair.example.com/zmeta/ingest, ideally behind Cloudflare).
+# Returned to the mesh at redeem time alongside a long-lived ingest token.
+# The token is the credential — the mesh POSTs ZMeta events straight here.
+ingest_url=
+
+# SHA256 hex fingerprint of pairing.crt (DER). Written by SETUP_PAIRING.bat.
+# The Shepherd app pins this — if you regenerate the cert, re-run setup
+# and hand out fresh invites (old invite codes stop working).
+certfp=
