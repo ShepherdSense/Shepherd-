@@ -56,6 +56,14 @@ class _TrackingScreenState extends State<TrackingScreen> {
   /// Fullscreen field map: the map fills the whole tab area.
   bool _mapFullscreen = false;
 
+  /// Compact layer-toggle buttons for the field-map header: tight
+  /// padding so all four fit across a phone-width card when wrapped.
+  static final _toggleStyle = TextButton.styleFrom(
+    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+    minimumSize: const Size(0, 32),
+    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+  );
+
   void _bumpMapZoom(double f) => setState(() {
         _mapZoom = (_mapZoom * f).clamp(0.5, 4.0);
       });
@@ -113,6 +121,12 @@ class _TrackingScreenState extends State<TrackingScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          // Header: title + mode label + fullscreen on the first row;
+          // the four layer toggles get their own wrapping row below.
+          // They used to share the title row, which overflowed the
+          // card on phone widths — HEALTH clipped mid-word and
+          // SENSORS fell off the screen entirely (field report
+          // 2026-10-20).
           Row(
             children: [
               Text('FIELD MAP', style: SentryType.section()),
@@ -124,32 +138,49 @@ class _TrackingScreenState extends State<TrackingScreen> {
                 onPressed: () =>
                     setState(() => _mapFullscreen = true),
               ),
+            ],
+          ),
+          Wrap(
+            spacing: 4,
+            runSpacing: 0,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
               TextButton(
+                style: _toggleStyle,
                 onPressed: () =>
                     setState(() => _showShadow = !_showShadow),
                 child: Text(
                     _showShadow ? 'SHADOW ON' : 'SHADOW OFF'),
               ),
               TextButton(
+                style: _toggleStyle,
                 onPressed: () => setState(() => _showRti = !_showRti),
                 child: Text(_showRti ? 'RTI ON' : 'RTI OFF'),
               ),
               TextButton(
+                style: _toggleStyle,
                 onPressed: () =>
                     setState(() => _showHealth = !_showHealth),
                 child: Text(
                     _showHealth ? 'HEALTH ON' : 'HEALTH OFF'),
               ),
               TextButton(
+                style: _toggleStyle,
                 onPressed: () =>
                     setState(() => _showSensors = !_showSensors),
                 child: Text(
                     _showSensors ? 'SENSORS ON' : 'SENSORS OFF'),
               ),
-              Text(
-                live ? 'LIVE LAYOUT' : 'SIMULATED LAYOUT',
-                style: SentryType.section(10).copyWith(
-                  color: live ? SentryColors.green : SentryColors.orange,
+              // Mode label rides the toggle wrap: in the title row it
+              // still overflowed narrow cards under fallback fonts.
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                child: Text(
+                  live ? 'LIVE LAYOUT' : 'SIMULATED LAYOUT',
+                  style: SentryType.section(10).copyWith(
+                    color:
+                        live ? SentryColors.green : SentryColors.orange,
+                  ),
                 ),
               ),
             ],
@@ -629,17 +660,10 @@ class _TrackingScreenState extends State<TrackingScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            children: [
-              Text('GPS POSITIONING', style: SentryType.section()),
-              const Spacer(),
-              TextButton(
-                onPressed:
-                    state.gpsBusy ? null : state.setGpsOriginHere,
-                child: const Text('SET ORIGIN HERE'),
-              ),
-            ],
-          ),
+          // Title alone on its row: title + button shared a row and
+          // overflowed phone-width cards (same class as the FIELD
+          // MAP header). Both capture buttons live in one wrap below.
+          Text('GPS POSITIONING', style: SentryType.section()),
           const SizedBox(height: 6),
           Text(
             'WALK TO EACH NODE WITH THIS DEVICE AND TAP THE TARGET BUTTON ON ITS ROW — ITS MAP POSITION IS SET FROM THE GPS FIX. '
@@ -658,7 +682,20 @@ class _TrackingScreenState extends State<TrackingScreen> {
                       : SentryColors.green),
                 ),
               ),
+            ],
+          ),
+          Wrap(
+            spacing: 4,
+            runSpacing: 0,
+            children: [
               TextButton(
+                style: _toggleStyle,
+                onPressed:
+                    state.gpsBusy ? null : state.setGpsOriginHere,
+                child: const Text('SET ORIGIN HERE'),
+              ),
+              TextButton(
+                style: _toggleStyle,
                 onPressed:
                     state.gpsBusy ? null : state.captureDefendedGps,
                 child: const Text('SET DEFENDED HERE'),
