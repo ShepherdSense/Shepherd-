@@ -9,6 +9,7 @@ import '../services/radio_driver.dart';
 import '../services/recorder.dart';
 import '../state/app_state.dart';
 import '../theme.dart';
+import 'zmeta_join_dialog.dart';
 
 /// Settings: radio manager (multi-driver), detector tuning, Wi-Fi
 /// sensing, mode toggles, and LAN radio discovery. Dark mode only.
@@ -58,11 +59,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late bool _zmetaEnabled;
   late bool _zmetaSecured;
   late bool _zmetaHeartbeatEnabled;
+  late String _zmetaTransport;
+  late String _zmetaIngestUrl;
+  late String _zmetaIngestFp;
+  late String _zmetaJoinedPlatformId;
   late bool _cotEmitEnabled;
   late bool _cotEmitUseMulticast;
   late bool _cotListenEnabled;
   late bool _camera;
   late bool _autoConnectSilvusUsb;
+  late bool _sdrAutoStation;
   late bool _calibDegraded;
   String _newDriverId = 'silvus';
 
@@ -71,6 +77,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   /// changes.
   CalibrationState? _seenCalibState;
   String? _seenCalibNote;
+  bool _seenTokenRejected = false;
 
   void _onAppStateChanged() {
     final st = widget.state;
@@ -78,6 +85,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
         st.calibrationNote != _seenCalibNote) {
       _seenCalibState = st.calibrationState;
       _seenCalibNote = st.calibrationNote;
+      if (mounted) setState(() {});
+    }
+    // S3: the hub started rejecting the ingest token — surface the
+    // re-join prompt without waiting for the operator to tap anything.
+    if (st.zmetaIngestTokenRejected != _seenTokenRejected) {
+      _seenTokenRejected = st.zmetaIngestTokenRejected;
       if (mounted) setState(() {});
     }
   }
@@ -124,6 +137,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _zmetaHost = TextEditingController(text: s.zmetaHost);
     _zmetaPort = TextEditingController(text: s.zmetaPort.toString());
     _zmetaPlatform = TextEditingController(text: s.zmetaPlatformId);
+    _zmetaTransport = s.zmetaTransport;
+    _zmetaIngestUrl = s.zmetaIngestUrl;
+    _zmetaIngestFp = s.zmetaIngestFp;
+    _zmetaJoinedPlatformId = s.zmetaJoinedPlatformId;
     _zmetaHeartbeatInterval = TextEditingController(
         text: s.zmetaHeartbeatIntervalSec.toString());
     _simulated = s.simulatedMode;
@@ -134,6 +151,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _cotEmitUseMulticast = s.cotEmitUseMulticast;
     _cotListenEnabled = s.cotListenEnabled;
     _autoConnectSilvusUsb = s.autoConnectSilvusUsb;
+    _sdrAutoStation = s.sdrAutoStation;
     _cotTakHost = TextEditingController(text: s.cotTakHost);
     _cotTakPort = TextEditingController(text: s.cotTakPort.toString());
     _cotStaleSeconds =
@@ -214,9 +232,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   /// Parse the SDR station / eNB fields. All four coordinates blank =
-  /// unconfigured (fine); otherwise all four must parse and be in
-  /// range. Returns null when the fields are invalid.
-  ({double slat, double slon, double elat, double elon, double? mhz})?
+  /// unconfigured (fine). The eNB pair is always required together.
+  /// The station pair is required together in manual mode, but may be
+  /// blank under AUTO STATION (it then comes from the phone GPS fix at
+  /// apply time; any values present are still parsed and kept as the
+  /// manual fallback record). Returns null when the fields are invalid.
+  ({double? slat, double? slon, double elat, double elon, double? mhz})?
       _parseSdrStation() {
     final raw = [
       _sdrStationLat.text.trim(),
@@ -229,24 +250,39 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (mhzRaw.isNotEmpty) return null; // MHz without geometry: invalid
       return null; // unconfigured — not an error
     }
-    if (raw.any((v) => v.isEmpty)) return null;
-    final slat = double.tryParse(raw[0]);
-    final slon = double.tryParse(raw[1]);
+    // eNB pair: both or neither (neither = unconfigured, caught by the
+    // all-blank case above unless the station pair is filled).
+    final enbBlank = raw[2].isEmpty && raw[3].isEmpty;
+    final enbPartial = raw[2].isEmpty != raw[3].isEmpty;
+    if (enbPartial) return null;
+    if (enbBlank) return null; // geometry needs an eNB, auto or not
+    // Station pair: both or neither; neither only valid under AUTO.
+    final stBlank = raw[0].isEmpty && raw[1].isEmpty;
+    final stPartial = raw[0].isEmpty != raw[1].isEmpty;
+    if (stPartial) return null;
+    if (stBlank && !_sdrAutoStation) return null;
     final elat = double.tryParse(raw[2]);
     final elon = double.tryParse(raw[3]);
-    if (slat == null ||
-        slon == null ||
-        elat == null ||
+    if (elat == null ||
         elon == null ||
-        slat < -90 ||
-        slat > 90 ||
         elat < -90 ||
         elat > 90 ||
-        slon < -180 ||
-        slon > 180 ||
         elon < -180 ||
         elon > 180) {
       return null;
+    }
+    double? slat, slon;
+    if (!stBlank) {
+      slat = double.tryParse(raw[0]);
+      slon = double.tryParse(raw[1]);
+      if (slat == null ||
+          slon == null ||
+          slat < -90 ||
+          slat > 90 ||
+          slon < -180 ||
+          slon > 180) {
+        return null;
+      }
     }
     double? mhz;
     final mhzRaw = _sdrEnbMhz.text.trim();
@@ -268,9 +304,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final station = _parseSdrStation();
     if (station == null && _sdrStationFieldsTouched()) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-            content: Text('STATION / eNB COORDINATES INCOMPLETE OR INVALID '
-                '— FILL ALL FOUR (LAT −90..90, LON −180..180) OR LEAVE BLANK')),
+        SnackBar(
+            content: Text(_sdrAutoStation
+                ? 'eNB COORDINATES INCOMPLETE OR INVALID — THE eNB PAIR '
+                    'IS ALWAYS REQUIRED (LAT −90..90, LON −180..180); '
+                    'THE STATION PAIR MAY STAY BLANK UNDER AUTO'
+                : 'STATION / eNB COORDINATES INCOMPLETE OR INVALID '
+                    '— FILL ALL FOUR (LAT −90..90, LON −180..180) OR LEAVE BLANK')),
       );
       return;
     }
@@ -300,6 +340,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
       zmetaPlatformId: _zmetaPlatform.text.trim().isEmpty
           ? 'shepherd-mesh-1'
           : _zmetaPlatform.text.trim(),
+      zmetaTransport: _zmetaTransport,
+      zmetaIngestUrl: _zmetaIngestUrl,
+      zmetaIngestFp: _zmetaIngestFp,
+      zmetaJoinedPlatformId: _zmetaJoinedPlatformId,
       zmetaSecured: _zmetaSecured,
       zmetaHeartbeatEnabled: _zmetaHeartbeatEnabled,
       zmetaHeartbeatIntervalSec:
@@ -341,11 +385,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   _cotCoincidenceRadius.text.trim()) ??
               50.0)
           .clamp(5.0, 500.0),
-      sdrStationLat: station?.slat,
-      sdrStationLon: station?.slon,
+      // Under AUTO, a blank station pair means "no manual values
+      // typed", NOT "delete the fallback" — the AUTO copy promises
+      // the manual values are kept. Preserve the saved pair whenever
+      // this save carries a real geometry (station != null); a fully
+      // blank save (station == null) still clears everything.
+      sdrStationLat: station == null
+          ? null
+          : (station.slat ??
+              (_sdrAutoStation ? widget.state.settings.sdrStationLat : null)),
+      sdrStationLon: station == null
+          ? null
+          : (station.slon ??
+              (_sdrAutoStation ? widget.state.settings.sdrStationLon : null)),
       sdrEnbLat: station?.elat,
       sdrEnbLon: station?.elon,
       sdrEnbCenterMhz: station?.mhz,
+      sdrAutoStation: _sdrAutoStation,
     );
     widget.state.applySettings(s);
     final cam = widget.state.cameraSettings;
@@ -357,6 +413,49 @@ class _SettingsScreenState extends State<SettingsScreen> {
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('Settings applied')),
     );
+  }
+
+  /// Runs the ZMeta invite-code join flow. On success the transport is
+  /// stored (HTTPS ingest URL or WireGuard UDP target), but export is
+  /// NOT enabled — the operator still toggles it on explicitly.
+  Future<void> _joinNetwork() async {
+    final current = _zmetaPlatform.text.trim();
+    final result = await showDialog<ZmetaJoinResult>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => ZmetaJoinDialog(
+        initialPlatformId: current.isEmpty ? 'shepherd-mesh-1' : current,
+      ),
+    );
+    if (result == null || !mounted) return;
+    setState(() {
+      _zmetaPlatform.text = result.platformId;
+      _zmetaJoinedPlatformId = result.platformId;
+      _zmetaTransport = result.linkMode;
+      if (result.linkMode == 'https') {
+        // HTTPS ingest: the URL + secure-storage token are the link.
+        // Leave the manual UDP host/port fields untouched.
+        _zmetaIngestUrl = result.ingestUrl;
+        _zmetaIngestFp = result.ingestFp;
+      } else {
+        _zmetaHost.text = result.zmetaHost;
+        _zmetaPort.text = result.zmetaPort.toString();
+        _zmetaIngestUrl = '';
+        _zmetaIngestFp = '';
+      }
+    });
+    _save();
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(result.linkMode == 'https'
+              ? 'JOINED OVER HTTPS — NO OTHER APP NEEDED. EXPORT STAYS OFF '
+                  'UNTIL YOU ENABLE IT.'
+              : 'JOINED — GATEWAY TARGET SET. EXPORT STAYS OFF '
+                  'UNTIL YOU ENABLE IT.'),
+        ),
+      );
+    }
   }
 
   Future<void> _addRadio() async {
@@ -689,12 +788,68 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ],
         ]),
         _section('ZMeta export', [
+          OutlinedButton.icon(
+            icon: const Icon(Icons.link, color: SentryColors.purple),
+            label: Text('JOIN NETWORK…',
+                style: SentryType.rowValue(SentryColors.onDark)),
+            onPressed: _joinNetwork,
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'HAVE AN INVITE CODE FROM A HUB OPERATOR? JOINING REGISTERS '
+            'THIS MESH — OVER ENCRYPTED HTTPS WHEN THE HUB SUPPORTS IT '
+            '(NO OTHER APP NEEDED), OR VIA WIREGUARD. EXPORT STAYS OFF '
+            'UNTIL YOU ENABLE IT BELOW.',
+            style: SentryType.section(10).copyWith(height: 1.6),
+          ),
+          if (_zmetaTransport == 'https' || _zmetaTransport == 'wireguard')
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(
+                _zmetaTransport == 'https'
+                    ? 'LINK: HTTPS — EVENTS POST ENCRYPTED STRAIGHT TO THE HUB.'
+                    : 'LINK: WIREGUARD — ACTIVATE THE TUNNEL IN THE WIREGUARD APP.',
+                style: SentryType.section(10)
+                    .copyWith(height: 1.6, color: SentryColors.green),
+              ),
+            ),
+          // S3: the hub has rejected the ingest token repeatedly — the
+          // mesh is almost certainly revoked. Tell the operator to re-join.
+          if (_zmetaTransport == 'https' &&
+              widget.state.zmetaIngestTokenRejected)
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(
+                'HUB REJECTED THE TOKEN — RE-JOIN OR CONTACT THE HUB OPERATOR.',
+                style: SentryType.section(10)
+                    .copyWith(height: 1.6, color: SentryColors.red),
+              ),
+            ),
+          // S4: platform ID edited after a join — the hub's token/peer is
+          // bound to the old ID, so this mesh must re-join.
+          if (_zmetaJoinedPlatformId.isNotEmpty &&
+              _zmetaJoinedPlatformId != _zmetaPlatform.text.trim())
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(
+                'PLATFORM ID CHANGED — RE-JOIN THE NETWORK.',
+                style: SentryType.section(10)
+                    .copyWith(height: 1.6, color: SentryColors.amber),
+              ),
+            ),
+          const SizedBox(height: 10),
           SwitchListTile(
             title: Text('EMIT ZMETA EVENTS',
                 style: SentryType.rowValue(SentryColors.onDark)),
             subtitle: Text(
-              'SEND EACH DETECTION TO A ZMETA GATEWAY AS OBSERVATION / INFERENCE EVENTS (UDP, EMIT-ONLY). '
-              'ONE MESH = ONE PLATFORM ID — THE GATEWAY FUSES ACROSS MESHES.',
+              _zmetaTransport == 'https'
+                  ? 'SEND EACH DETECTION TO THE HUB AS OBSERVATION / INFERENCE EVENTS (HTTPS, EMIT-ONLY). '
+                      'ONE MESH = ONE PLATFORM ID — THE GATEWAY FUSES ACROSS MESHES.'
+                  : _zmetaTransport == 'wireguard'
+                      ? 'SEND EACH DETECTION TO A ZMETA GATEWAY AS OBSERVATION / INFERENCE EVENTS (WIREGUARD, EMIT-ONLY). '
+                          'ONE MESH = ONE PLATFORM ID — THE GATEWAY FUSES ACROSS MESHES.'
+                      : 'SEND EACH DETECTION TO A ZMETA GATEWAY AS OBSERVATION / INFERENCE EVENTS (UDP, EMIT-ONLY). '
+                          'ONE MESH = ONE PLATFORM ID — THE GATEWAY FUSES ACROSS MESHES.',
               style: SentryType.section(10).copyWith(height: 1.6),
             ),
             value: _zmetaEnabled,
@@ -709,7 +864,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 numeric: true, onChanged: (_) => setState(() {})),
             const SizedBox(height: 10),
             _field(_zmetaPlatform, 'Platform ID (this mesh)',
-                'e.g. shepherd-mesh-1'),
+                'e.g. shepherd-mesh-1', onChanged: (_) {
+              // S4: changing the platform ID after a join voids the join
+              // (the hub's token/peer is bound to the OLD id). Clear the
+              // transport back to unset until they re-join.
+              if (_zmetaJoinedPlatformId.isNotEmpty &&
+                  _zmetaPlatform.text.trim() != _zmetaJoinedPlatformId &&
+                  (_zmetaTransport == 'https' ||
+                      _zmetaTransport == 'wireguard')) {
+                _zmetaTransport = 'udp';
+                _zmetaIngestUrl = '';
+                _zmetaIngestFp = '';
+                _save();
+              }
+              setState(() {});
+            }),
             const SizedBox(height: 10),
             SwitchListTile(
               title: Text('LINK SECURED (WIREGUARD)',
@@ -741,7 +910,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ],
             if (_zmetaHost.text.trim().isNotEmpty &&
                 !_isLocalHost(_zmetaHost.text.trim()) &&
-                !_zmetaSecured)
+                !_zmetaSecured &&
+                _zmetaTransport != 'https')
               Padding(
                 padding: const EdgeInsets.only(top: 10),
                 child: Text(
@@ -966,12 +1136,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
   List<Widget> _sdrStationBody() {
     final station = _parseSdrStation();
     final touched = _sdrStationFieldsTouched();
-    final status = station != null
-        ? 'STATUS: CONFIGURED — DOPPLER CORRELATOR ARMED ON SAVE / START'
-        : touched
-            ? 'STATUS: INVALID — FILL ALL FOUR COORDINATES OR LEAVE BLANK'
-            : 'STATUS: NOT CONFIGURED — THE DOPPLER CORRELATOR ABSTAINS '
-                'UNTIL STATION + eNB ARE SET';
+    final status = _sdrAutoStation
+        ? (station != null
+            ? 'STATUS: AUTO STATION — ${widget.state.sdrGeometryStatus}'
+            : touched
+                ? 'STATUS: INVALID — THE eNB PAIR IS ALWAYS REQUIRED, '
+                    'EVEN UNDER AUTO STATION'
+                : 'STATUS: AUTO STATION ON — SET THE eNB TO ARM THE '
+                    'CORRELATOR')
+        : station != null
+            ? 'STATUS: CONFIGURED — DOPPLER CORRELATOR ARMED ON SAVE / START'
+            : touched
+                ? 'STATUS: INVALID — FILL ALL FOUR COORDINATES OR LEAVE BLANK'
+                : 'STATUS: NOT CONFIGURED — THE DOPPLER CORRELATOR ABSTAINS '
+                    'UNTIL STATION + eNB ARE SET';
     final statusColor = station != null
         ? SentryColors.green
         : touched
@@ -983,6 +1161,22 @@ class _SettingsScreenState extends State<SettingsScreen> {
         'APPLY TIME (GPS FIELD ORIGIN WHEN SET, ELSE RELATIVE TO THE '
         'STATION). PERSISTED WITH THE OTHER SETTINGS.',
         style: SentryType.section(10).copyWith(height: 1.6),
+      ),
+      const SizedBox(height: 10),
+      SwitchListTile(
+        title: Text('AUTO STATION (GPS)',
+            style: SentryType.rowValue(SentryColors.onDark)),
+        subtitle: Text(
+          'TAKE THE STATION POSITION FROM THIS DEVICE\'S GPS FIX — THE '
+          'SDR HOST IN THE FIELD SETUP. RE-ARMS WHEN THE DEVICE MOVES '
+          '>25 M; A FIX OLDER THAN 30 MIN DOES NOT ARM. THE eNB '
+          'POSITION HAS NO AUTO SOURCE AND STAYS MANUAL. MANUAL '
+          'STATION VALUES BELOW ARE KEPT, JUST NOT USED WHILE AUTO '
+          'IS ON.',
+          style: SentryType.section(10).copyWith(height: 1.6),
+        ),
+        value: _sdrAutoStation,
+        onChanged: (v) => setState(() => _sdrAutoStation = v),
       ),
       const SizedBox(height: 10),
       Row(
