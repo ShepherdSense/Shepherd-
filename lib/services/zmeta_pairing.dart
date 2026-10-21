@@ -193,6 +193,26 @@ String zmetaBuildWgConf({
         'Hub returned a bad tunnel address "$tunnelIp". Ask the hub '
         'operator to check the pairing service.');
   }
+  // Every value is hub-supplied text going into a config file: reject
+  // anything that is not exactly a key / host:port, or a newline in
+  // the endpoint could add a [Peer] (AllowedIPs = 0.0.0.0/0) or a
+  // PostUp script.
+  if (!zmetaIsValidWgKey(privateKeyB64)) {
+    throw ZmetaPairingException('Local WireGuard key is malformed.');
+  }
+  if (!zmetaIsValidWgKey(hubPubkey)) {
+    throw ZmetaPairingException(
+        'Hub returned a malformed WireGuard public key. Ask the hub '
+        'operator to check the pairing service.');
+  }
+  if (!zmetaIsValidWgEndpoint(hubEndpoint)) {
+    throw ZmetaPairingException(
+        'Hub returned a malformed WireGuard endpoint. Ask the hub '
+        'operator to check the pairing service.');
+  }
+  // The tunnel subnet is the /24 of the address the hub assigned (the
+  // old fixed 10.99.0.0/24 silently black-holed any other hub subnet).
+  final subnet = '${octets[0]}.${octets[1]}.${octets[2]}.0/24';
   return '[Interface]\n'
       'PrivateKey = $privateKeyB64\n'
       'Address = $tunnelIp/32\n'
@@ -200,8 +220,52 @@ String zmetaBuildWgConf({
       '[Peer]\n'
       'PublicKey = $hubPubkey\n'
       'Endpoint = $hubEndpoint\n'
-      'AllowedIPs = 10.99.0.0/24\n'
+      'AllowedIPs = $subnet\n'
       'PersistentKeepalive = 25\n';
+}
+
+/// A WireGuard key: standard base64 of exactly 32 bytes (44 chars).
+bool zmetaIsValidWgKey(String s) {
+  if (!RegExp(r'^[A-Za-z0-9+/]{43}=$').hasMatch(s)) return false;
+  try {
+    return base64.decode(s).length == 32;
+  } catch (_) {
+    return false;
+  }
+}
+
+/// A WireGuard endpoint: `host:port` / `[ipv6]:port` with no whitespace
+/// or control characters.
+bool zmetaIsValidWgEndpoint(String s) {
+  final m = RegExp(
+          r'^(?:[A-Za-z0-9](?:[A-Za-z0-9.\-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\]):(\d{1,5})$')
+      .firstMatch(s);
+  if (m == null) return false;
+  final port = int.tryParse(m.group(1)!);
+  return port != null && port >= 1 && port <= 65535;
+}
+
+/// Whether a hub-supplied ingest host may receive the bearer token.
+///
+/// Pin mode: the pinned certificate authenticates whatever host answers,
+/// so any host is fine. Public-CA ("-") mode: any host with a valid
+/// certificate would be accepted, so the token could be steered to an
+/// attacker-chosen domain; require the ingest host to be the invite's
+/// hub, a subdomain of it, or a sibling under the same parent domain.
+/// Loopback is always allowed (cloudflared-on-localhost deployments).
+bool zmetaIngestHostAllowed(
+    String ingestHost, String inviteHost, {required bool pinMode}) {
+  if (pinMode || zmetaIsLocalHost(ingestHost)) return true;
+  final a = ingestHost.toLowerCase();
+  final b = inviteHost.toLowerCase();
+  if (a == b || a.endsWith('.$b')) return true;
+  final bl = b.split('.');
+  final al = a.split('.');
+  if (bl.length >= 3 && al.length >= 3) {
+    final parentB = bl.skip(1).join('.');
+    return a.endsWith('.$parentB');
+  }
+  return false;
 }
 
 /// Splits a "host:port" zmeta_target into parts. Null when unparseable.
@@ -437,8 +501,16 @@ Future<ZmetaRedeemResult> zmetaRedeemInvite({
     }
     // S5: bound the body read too — a stalled server must not hang the
     // join forever.
-    final body =
-        await resp.transform(utf8.decoder).join().timeout(const Duration(seconds: 10));
+    // Also size-bound: a hostile server must not be able to stream an
+    // unbounded body into memory inside the timeout.
+    final bodyBytes = await resp.fold<List<int>>(<int>[], (acc, chunk) {
+      if (acc.length + chunk.length > 65536) {
+        throw ZmetaPairingException('The hub\'s reply was unreasonably large.');
+      }
+      acc.addAll(chunk);
+      return acc;
+    }).timeout(const Duration(seconds: 10));
+    final body = utf8.decode(bodyBytes, allowMalformed: true);
     Map<String, dynamic>? doc;
     try {
       final d = jsonDecode(body);
@@ -483,6 +555,24 @@ Future<ZmetaRedeemResult> zmetaRedeemInvite({
     if (rawUrl.isNotEmpty && rawToken.isNotEmpty) {
       ingestUrl = zmetaValidateIngestUrl(rawUrl);
       ingestToken = zmetaValidateIngestToken(rawToken);
+      final host = Uri.parse(ingestUrl).host;
+      if (!zmetaIngestHostAllowed(host, invite.hubHost, pinMode: pinMode)) {
+        throw ZmetaPairingException(
+            'The hub asked to send events to "$host", which is not the '
+            'hub in the invite code (${invite.hubHost}). STOPPED — '
+            'contact the hub operator out-of-band.');
+      }
+    }
+    // The WireGuard conf is only built when an endpoint exists; reject
+    // malformed peer data here so the failure is clear and nothing is
+    // stored.
+    if (hubEndpoint.isNotEmpty) {
+      if (!zmetaIsValidWgKey(hubPubkey) ||
+          !zmetaIsValidWgEndpoint(hubEndpoint)) {
+        throw ZmetaPairingException(
+            'Hub returned malformed WireGuard details. Ask the hub '
+            'operator to check the pairing service.');
+      }
     }
     // An HTTPS-only hub (no public WireGuard endpoint) is valid as long
     // as it handed out an ingest credential; the WireGuard fallback is
