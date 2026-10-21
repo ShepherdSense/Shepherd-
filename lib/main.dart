@@ -1,14 +1,22 @@
 import 'package:flutter/material.dart';
+import 'package:media_kit/media_kit.dart';
 
 import 'screens/beam.dart';
 import 'screens/dashboard.dart';
+import 'screens/drone_tab.dart';
 import 'screens/wifi_vision.dart';
 import 'screens/settings.dart';
 import 'screens/tracking.dart';
 import 'state/app_state.dart';
 import 'theme.dart';
 
-void main() => runApp(const RfSentryApp());
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  // Drone tab video (media_kit/libmpv). Required before any Player
+  // is constructed; a no-op cost when the tab is never opened.
+  MediaKit.ensureInitialized();
+  runApp(const RfSentryApp());
+}
 
 /// Shepherd — dark-mode-only companion app for a Silvus StreamCaster
 /// mesh-radio tripwire.
@@ -62,8 +70,13 @@ class _RfSentryAppState extends State<RfSentryApp> {
                     ? BeamScreen(state: _state)
                     : _tab == 3
                         ? WifiVisionScreen(state: _state)
-                        : SettingsScreen(state: _state),
+                        : _tab == 4
+                            ? DroneTab(state: _state)
+                            : SettingsScreen(state: _state),
         bottomNavigationBar: BottomNavigationBar(
+          // Six destinations: fixed type keeps every label visible
+          // (the shifting default would hide unselected labels).
+          type: BottomNavigationBarType.fixed,
           currentIndex: _tab,
           onTap: (i) => setState(() => _tab = i),
           items: const [
@@ -75,6 +88,8 @@ class _RfSentryAppState extends State<RfSentryApp> {
                 icon: Icon(Icons.view_in_ar), label: 'Beam'),
             BottomNavigationBarItem(
                 icon: Icon(Icons.wifi), label: 'WiFi'),
+            BottomNavigationBarItem(
+                icon: Icon(Icons.flight), label: 'Drone'),
             BottomNavigationBarItem(
                 icon: Icon(Icons.settings), label: 'Settings'),
           ],
