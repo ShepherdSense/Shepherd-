@@ -13,7 +13,7 @@ Built by **Draco**.
 - **Alert-first dashboard** — big DETECTED / CLEAR banner, per-radio status cards, live link telemetry.
 - **Tracking map** — draggable field map with per-node GPS positions, radio-tomographic shadow heatmap, and deterministic cross-network track solving (grid-search position solver; altitude when nodes are at different heights).
 - **Beam 3D** — orbit-able antenna lobe visualization with first Fresnel zone ellipsoids.
-- **WiFi Vision** — ambient disturbance sensing via the device's own Wi-Fi adapter (coarse RSSI tripwire, per-AP baselines, disturbance attribution by elimination). Real adapter feed on Windows (netsh) and Android (system Wi-Fi stack, v0.20.0+); other platforms simulate.
+- **WiFi Vision** — ambient disturbance sensing via the device's own Wi-Fi adapter (coarse RSSI tripwire, per-AP baselines, disturbance attribution by elimination). Real adapter feed on Windows (netsh) and Android (system Wi-Fi stack, v0.20.0+); other platforms simulate. Android also ranges responder APs by 802.11mc RTT — true round-trip distance, not an RSSI guess (scan-first fix v0.21.3).
 - **Air Threats (defensive)** — rogue AP / evil-twin suspicion and disconnect-burst (deauth-pattern) recognition. Detect-only: Shepherd never transmits.
 - **Nearby wireless** — passive BLE advertisement scanning with vendor decoding, plus LAN device sweep.
 - **Embedded tiny AI (offline)** — pure-Dart neural nets running fully on-device: a crossing-event classifier and a track-stitching specialist, both trained on synthetic scenarios. No cloud, no LLM.
