@@ -19,7 +19,14 @@
 ///
 /// Absence is honest: this layer draws only what a feed reported.
 /// Nothing here implies an empty sky.
+///
+/// Ground tracks (v0.23.0) render in the same layer system via
+/// [groundLayer]: a PERSON glyph — never the air diamond — so a
+/// dismount (a PRC-163 carrier's PLI) can never be misread as an
+/// aircraft at a glance.
 library;
+
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
@@ -99,6 +106,128 @@ List<Widget> airframeLayer({
     }
   }
   return out;
+}
+
+/// Map markers for friendly GROUND tracks (PRC-163 PLI via the
+/// TAK feed). Person glyph + callsign label; a short tick shows
+/// course over ground when the feed reports one. Green by the
+/// same affiliation contract as the air layer (a ground record is
+/// FRIENDLY or FRIENDLY (FEED) — there is no broadcast-claim
+/// tier on the ground path).
+List<Widget> groundLayer({
+  required List<GroundTrackRecord> records,
+  required Offset Function(double lat, double lon) project,
+}) {
+  final out = <Widget>[];
+  for (final r in records) {
+    final lat = r.lat;
+    final lon = r.lon;
+    if (lat == null || lon == null) continue;
+    out.add(_GroundMarker(
+      pos: project(lat, lon),
+      color: airframeAffiliationColor(r.affiliationLabel),
+      courseDeg: r.courseDeg,
+      label: '${r.displayName} · GND',
+    ));
+  }
+  return out;
+}
+
+class _GroundMarker extends StatelessWidget {
+  const _GroundMarker({
+    required this.pos,
+    required this.color,
+    required this.courseDeg,
+    required this.label,
+  });
+
+  final Offset pos;
+  final Color color;
+  final double? courseDeg;
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    const glyph = 17.0;
+    return Positioned(
+      left: pos.dx - 40,
+      top: pos.dy - glyph / 2,
+      child: IgnorePointer(
+        child: SizedBox(
+          width: 80,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              CustomPaint(
+                size: const Size(glyph, glyph),
+                painter: _PersonPainter(color: color, courseDeg: courseDeg),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                label,
+                textAlign: TextAlign.center,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 8.5,
+                  fontWeight: FontWeight.w600,
+                  color: color,
+                  shadows: const [
+                    Shadow(color: Colors.black, blurRadius: 3),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Person glyph for a dismount: head + shoulders dome, with a
+/// course tick under it when the feed reports a course (compass
+/// degrees → screen vector, 0° = up/north).
+class _PersonPainter extends CustomPainter {
+  _PersonPainter({required this.color, required this.courseDeg});
+  final Color color;
+  final double? courseDeg;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final cx = size.width / 2;
+    final cy = size.height / 2;
+    final course = courseDeg;
+    if (course != null) {
+      final rad = course * math.pi / 180.0;
+      canvas.drawLine(
+        Offset(cx, cy),
+        Offset(cx + math.sin(rad) * size.width * 0.95,
+            cy - math.cos(rad) * size.height * 0.95),
+        Paint()
+          ..color = color
+          ..strokeWidth = 1.6,
+      );
+    }
+    final fill = Paint()
+      ..color = color.withValues(alpha: 0.9)
+      ..style = PaintingStyle.fill;
+    // Head.
+    canvas.drawCircle(Offset(cx, size.height * 0.28), size.width * 0.16, fill);
+    // Shoulders: a squat dome under the head.
+    final body = Path()
+      ..moveTo(cx - size.width * 0.34, size.height * 0.94)
+      ..quadraticBezierTo(
+          cx - size.width * 0.34, size.height * 0.52, cx, size.height * 0.52)
+      ..quadraticBezierTo(
+          cx + size.width * 0.34, size.height * 0.52, cx, size.height * 0.94)
+      ..close();
+    canvas.drawPath(body, fill);
+  }
+
+  @override
+  bool shouldRepaint(_PersonPainter old) =>
+      old.color != color || old.courseDeg != courseDeg;
 }
 
 class _AirMarker extends StatelessWidget {
