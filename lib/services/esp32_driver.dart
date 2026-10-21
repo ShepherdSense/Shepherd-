@@ -40,6 +40,12 @@ class Esp32Driver extends RadioDriver {
   /// Node id → last beacon position.
   final Map<String, ({double lat, double lon})> _positions = {};
 
+  /// Node/sensor identifiers: no ':' or whitespace, bounded length.
+  static final RegExp _idOk = RegExp(r'^[A-Za-z0-9_.\-]{1,32}$');
+  static const int maxNodes = 64;
+  static const int maxSensorsPerNode = 8;
+  static const int maxActive = 256;
+
   /// Node id → callsign broadcast in its beacon (status-page set).
   final Map<String, String> _callsigns = {};
 
@@ -74,8 +80,9 @@ class Esp32Driver extends RadioDriver {
   bool get isImplemented => true;
 
   @override
-  String get emptyHint =>
-      'Listening on UDP 49160 — no node beacons heard yet. Join the '
+  String get emptyHint => NodeUdpHub.lastError != null
+      ? 'Cannot listen for nodes: ${NodeUdpHub.lastError}'
+      : 'Listening on UDP 49160 — no node beacons heard yet. Join the '
       'node AP (Shepherd-XXXX / Shepherd-LoRa-XXXX) on this device.';
 
   /// Beacons are slow (30 s); event evidence stays live briefly longer
@@ -97,6 +104,7 @@ class Esp32Driver extends RadioDriver {
     // Prune nodes silent > 5 min: node-LOSS, not phantom links.
     _seenAt.removeWhere((_, t) => now.difference(t) > const Duration(minutes: 5));
     _positions.removeWhere((k, _) => !_seenAt.containsKey(k));
+    _callsigns.removeWhere((k, _) => !_seenAt.containsKey(k));
     _sensors.removeWhere((k, _) => !_seenAt.containsKey(k));
     calibNodes.removeWhere((k) => !_seenAt.containsKey(k));
     final out = <LinkSample>[];
@@ -140,24 +148,48 @@ class Esp32Driver extends RadioDriver {
   }
 
   void _onDatagramInner(String text) {
-    final j = jsonDecode(text) as Map<String, dynamic>;
+    final decoded = jsonDecode(text);
+    if (decoded is! Map<String, dynamic>) return;
+    final j = decoded;
     final type = '${j['type'] ?? ''}';
     final node = '${j['node'] ?? ''}';
-    if (node.isEmpty) return;
+    // IDs end up in ':'-joined link keys and as map keys: constrain
+    // them (no ':' to split on, bounded length) so a hostile or buggy
+    // sender cannot corrupt keys or grow state without limit.
+    if (!_idOk.hasMatch(node)) return;
     if (type == 'beacon') {
-      final lat = (j['lat'] as num?)?.toDouble();
-      final lon = (j['lon'] as num?)?.toDouble();
-      if (lat != null && lon != null && lat != 0 && lon != 0) {
+      if (!_seenAt.containsKey(node) && _seenAt.length >= maxNodes) return;
+      final latV = j['lat'];
+      final lonV = j['lon'];
+      final lat = latV is num ? latV.toDouble() : null;
+      final lon = lonV is num ? lonV.toDouble() : null;
+      // 0 is a valid coordinate; only the (0,0) "no fix" pair, NaN and
+      // out-of-range values are rejected.
+      if (lat != null &&
+          lon != null &&
+          lat.isFinite &&
+          lon.isFinite &&
+          lat >= -90 &&
+          lat <= 90 &&
+          lon >= -180 &&
+          lon <= 180 &&
+          !(lat == 0 && lon == 0)) {
         _positions[node] = (lat: lat, lon: lon);
       }
       final sens = j['sensors'];
-      if (sens is List && sens.isNotEmpty) {
-        _sensors[node] =
-            sens.map((e) => '$e').where((e) => e.isNotEmpty).toList();
+      final sensList = sens is List
+          ? [
+              for (final e in sens)
+                if (_idOk.hasMatch('$e')) '$e'
+            ].take(maxSensorsPerNode).toList()
+          : <String>[];
+      if (sensList.isNotEmpty) {
+        _sensors[node] = sensList;
       } else {
         _sensors.putIfAbsent(node, () => ['wifi']);
       }
-      final cs = '${j['callsign'] ?? ''}'.trim();
+      var cs = '${j['callsign'] ?? ''}'.trim();
+      if (cs.length > 32) cs = cs.substring(0, 32);
       if (cs.isNotEmpty) {
         _callsigns[node] = cs;
       } else {
@@ -166,7 +198,10 @@ class Esp32Driver extends RadioDriver {
       // Vacant-window calibration flag (adaptive_baseline_spec.md):
       // only nodes explicitly flagging `calib: true` count toward
       // the guided routine's fit.
-      if (NodeUdpHub.beaconCalibFlag(text) == true) {
+      // The firmware sends calib as an integer (%d → 0/1 in the
+      // beacon JSON), not a JSON bool — accept both, or the flag
+      // never reads true from real nodes (reviewer catch, 2026-10-21).
+      if (j['calib'] == true || j['calib'] == 1) {
         calibNodes.add(node);
       } else {
         calibNodes.remove(node);
@@ -175,6 +210,11 @@ class Esp32Driver extends RadioDriver {
       _seenAt[node] = _lastBeaconAt;
     } else if (type == 'event') {
       final sensor = '${j['sensor'] ?? 'unknown'}';
+      if (!_idOk.hasMatch(sensor)) return;
+      if (!_active.containsKey('$node:$sensor') &&
+          _active.length >= maxActive) {
+        return;
+      }
       final depth = (j['depth_db'] as num?)?.toDouble() ?? 0.0;
       final dur = (j['dur_s'] as num?)?.toDouble() ?? 5.0;
       if (!depth.isFinite || depth <= 0) return;
@@ -193,9 +233,10 @@ class Esp32Driver extends RadioDriver {
 
   @override
   Future<bool> probe() async {
-    // Passive listener: nothing to reach out to. Binding is the test,
-    // and poll() surfaces "no beacons" via emptyHint.
-    return true;
+    // Passive listener: binding IS the test. A failed bind (port in
+    // use, no permission) must read as unhealthy, not "listening".
+    await NodeUdpHub.ensureListening(_onDatagram);
+    return NodeUdpHub.isBound;
   }
 
   @override
