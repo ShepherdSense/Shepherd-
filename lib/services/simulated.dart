@@ -2,6 +2,7 @@ import 'dart:math' as math;
 
 import '../models/link_sample.dart';
 import '../models/tracking.dart';
+import 'geo_projection.dart';
 
 /// Synthetic 4-node mesh for hardware-free testing of the tracking engine.
 ///
@@ -89,5 +90,108 @@ class SimulatedSource {
     final cy = a.y + aby * t - py;
     final cz = a.height + abz * t - pz;
     return math.sqrt(cx * cx + cy * cy + cz * cz);
+  }
+}
+
+/// One simulated dismount for [SimGroundFeed]: a parametric patrol
+/// path in field-local meters (x east, y north) over sim time.
+class _SimWalker {
+  const _SimWalker({
+    required this.uid,
+    required this.callsign,
+    required this.batteryStart,
+    required this.path,
+  });
+
+  final String uid;
+  final String callsign;
+
+  /// Battery percent at sim start; drains slowly from here.
+  final double batteryStart;
+
+  /// Position (field meters) at sim-time [t] seconds.
+  final ({double x, double y}) Function(double t) path;
+}
+
+/// Simulated friendly-ground PLI feed (v0.23.0): two dismounts
+/// walking patrol paths at dismount pace (~1.4 m/s peak), emitting
+/// ATAK-shaped CoT `a-f-G-U-C` events.
+///
+/// The point of the shape: AppState runs these datagrams through a
+/// real CotListener, so the demo exercises the PRODUCTION parse →
+/// platform → ground-classifier path end to end. Only the radio
+/// is fake — and in simulated mode everything is labeled sim
+/// anyway (callsigns carry the SIM- prefix, like the sim nodes).
+class SimGroundFeed {
+  SimGroundFeed();
+
+  /// Demo anchor used ONLY when simulated mode has no GPS origin:
+  /// an arbitrary point (Fort Liberty area) so sim lat/lon exist
+  /// at all. Display-only — never persisted as the field origin,
+  /// never a claim about anywhere real.
+  static const double demoOriginLat = 35.05;
+  static const double demoOriginLon = -78.97;
+
+  double _t = 0;
+
+  /// Patrol amplitudes/periods are sized for walking pace: peak
+  /// speed of a sinusoid is amplitude × 2π / period ≈ 1.4 m/s.
+  static final List<_SimWalker> _walkers = [
+    _SimWalker(
+      uid: 'SIM-163-A',
+      callsign: 'SIM-163-A',
+      batteryStart: 94,
+      path: (t) => (
+        x: 20 * math.sin(2 * math.pi * t / 90),
+        y: 16 * math.sin(2 * math.pi * t / 127 + 1.3),
+      ),
+    ),
+    _SimWalker(
+      uid: 'SIM-163-B',
+      callsign: 'SIM-163-B',
+      batteryStart: 87,
+      path: (t) => (
+        x: 24 * math.sin(2 * math.pi * t / 111 + 2.0),
+        y: 20 * math.cos(2 * math.pi * t / 97 + 0.4),
+      ),
+    ),
+  ];
+
+  /// Advance the feed by [dt] sim-seconds and return one CoT
+  /// datagram per walker, timestamped [now] (real clock — the
+  /// listener's pruning runs on it, exactly like the real feed).
+  List<String> tick({
+    required double dt,
+    required double originLat,
+    required double originLon,
+    required DateTime now,
+  }) {
+    _t += dt;
+    final geo = GeoProjection(originLat: originLat, originLon: originLon);
+    final ts = now.toUtc().toIso8601String();
+    final out = <String>[];
+    for (final w in _walkers) {
+      final p = w.path(_t);
+      // Course/speed from a 1 s lookback difference — the same
+      // finite difference a real PLI stream implies.
+      final prev = w.path(_t - 1.0);
+      final dx = p.x - prev.x;
+      final dy = p.y - prev.y;
+      final speed = math.sqrt(dx * dx + dy * dy); // meters per 1 s
+      var course = math.atan2(dx, dy) * 180 / math.pi; // 0=N, 90=E
+      if (course < 0) course += 360;
+      final ll = geo.metersToLatLon(p.x, p.y);
+      // Battery: ~1% per 4 minutes of sim time, floored at 5%.
+      final batt = (w.batteryStart - _t / 240).clamp(5, 100).round();
+      out.add('<event version="2.0" uid="${w.uid}" type="a-f-G-U-C" '
+          'time="$ts" start="$ts" stale="$ts" how="m-g">'
+          '<point lat="${ll.lat}" lon="${ll.lon}" hae="999999.0" '
+          'ce="5.0" le="5.0"/>'
+          '<detail><contact callsign="${w.callsign}"/>'
+          '<track course="${course.toStringAsFixed(1)}" '
+          'speed="${speed.toStringAsFixed(2)}"/>'
+          '<status battery="$batt"/></detail></event>');
+    }
+    return out;
   }
 }
