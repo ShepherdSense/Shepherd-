@@ -52,3 +52,12 @@ windows/flutter/ephemeral/
 
 # Widget Preview related
 .widget_preview/
+
+# Local / generated / secrets
+android/local.properties
+android/key.properties
+*.jks
+*.keystore
+**/__pycache__/
+windows/flutter/ephemeral/
+android/app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.java
