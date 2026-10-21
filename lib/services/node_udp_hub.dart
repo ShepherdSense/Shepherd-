@@ -10,6 +10,7 @@
 /// socket, every listener gets every datagram.
 library;
 
+import 'dart:convert';
 import 'dart:io';
 
 class NodeUdpHub {
@@ -18,9 +19,50 @@ class NodeUdpHub {
   /// The Shepherd node broadcast port (beacons, events, sensor_obs).
   static const int port = 49160;
 
+  /// Datagrams larger than this are dropped unparsed (real node
+  /// traffic is a few hundred bytes of JSON).
+  static const int maxDatagramBytes = 16384;
+
+  /// Flood guard: at most this many datagrams are processed per second.
+  static const int maxPerSecond = 2000;
+
+  /// Optional source allowlist (IP strings). Null/empty = accept any
+  /// sender on the segment. Node traffic is otherwise unauthenticated,
+  /// so on a shared network set this to the nodes' addresses.
+  static Set<String>? allowedSources;
+
+  /// Parse a comma/space separated list into [allowedSources].
+  static void setAllowedSourcesFromText(String text) {
+    final set = text
+        .split(RegExp(r'[,\s;]+'))
+        .map((e) => e.trim())
+        .where((e) => e.isNotEmpty)
+        .toSet();
+    allowedSources = set.isEmpty ? null : set;
+  }
+
+  /// Last bind/socket failure (null when healthy), so callers can say
+  /// "cannot listen" instead of claiming to listen.
+  static String? lastError;
+
+  /// True while the socket is bound.
+  static bool get isBound => _sock != null;
+
   static RawDatagramSocket? _sock;
   static final Set<void Function(String)> _listeners = {};
   static Future<void>? _starting;
+
+  static DateTime _winStart = DateTime.fromMillisecondsSinceEpoch(0);
+  static int _winCount = 0;
+
+  static bool _rateOk() {
+    final now = DateTime.now();
+    if (now.difference(_winStart) >= const Duration(seconds: 1)) {
+      _winStart = now;
+      _winCount = 0;
+    }
+    return ++_winCount <= maxPerSecond;
+  }
 
   /// Register [onDatagram] (text of each received datagram). Safe to
   /// call repeatedly; safe to call from dispose-paired drivers.
@@ -34,25 +76,58 @@ class NodeUdpHub {
 
   static Future<void> _bind() async {
     try {
-      _sock = await RawDatagramSocket.bind(InternetAddress.anyIPv4, port);
-      _sock!.broadcastEnabled = true;
-      _sock!.listen((event) {
-        if (event != RawSocketEvent.read) return;
-        Datagram? dg;
-        while ((dg = _sock?.receive()) != null) {
-          final text = String.fromCharCodes(dg!.data);
-          for (final l in _listeners.toList()) {
-            try {
-              l(text);
-            } catch (_) {}
-          }
-        }
-      });
-    } catch (_) {
+      final sock =
+          await RawDatagramSocket.bind(InternetAddress.anyIPv4, port);
+      sock.broadcastEnabled = true;
+      _sock = sock;
+      lastError = null;
+      sock.listen(
+        (event) => _onEvent(sock, event),
+        onError: (Object e) => _died(sock, '$e'),
+        onDone: () => _died(sock, 'socket closed'),
+        cancelOnError: true,
+      );
+      // Every listener released while we were still binding: don't leave
+      // an orphan socket holding the port.
+      if (_listeners.isEmpty) {
+        _sock = null;
+        sock.close();
+      }
+    } catch (e) {
       _sock = null;
+      lastError = 'cannot bind UDP $port: $e';
     } finally {
       _starting = null;
     }
+  }
+
+  static void _onEvent(RawDatagramSocket sock, RawSocketEvent event) {
+    if (event != RawSocketEvent.read) return;
+    for (var dg = sock.receive(); dg != null; dg = sock.receive()) {
+      if (dg.data.length > maxDatagramBytes) continue;
+      if (!_rateOk()) continue;
+      final allow = allowedSources;
+      if (allow != null && !allow.contains(dg.address.address)) continue;
+      // UTF-8, not fromCharCodes (which maps each byte to one code unit
+      // and garbles every non-ASCII name).
+      final text = utf8.decode(dg.data, allowMalformed: true);
+      for (final l in _listeners.toList()) {
+        try {
+          l(text);
+        } catch (_) {}
+      }
+    }
+  }
+
+  /// The socket ended without [release]: record why and clear it so the
+  /// next [ensureListening] rebinds.
+  static void _died(RawDatagramSocket sock, String why) {
+    if (!identical(_sock, sock)) return;
+    _sock = null;
+    lastError = 'node socket lost: $why';
+    try {
+      sock.close();
+    } catch (_) {}
   }
 
   /// Unregister [onDatagram]; closes the socket when no listeners
