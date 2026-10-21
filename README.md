@@ -6,6 +6,8 @@ Shepherd turns the RF links of a mesh radio network into a sensing field. When a
 
 Built by **Draco**.
 
+**Try it in your browser:** [Shepherd web sim](https://thedracospark-prog.github.io/Shepherd-/sim/) — the real app running on simulated radios. No install, no hardware; place as many nodes as you like.
+
 > **Status note — v0.17.0:** the v0.17.0 features (adaptive baseline, RTI imaging weights, ESP32 CSI pipeline, Doppler refinement, WPP-IDP passive radar, validation benches) are implemented and tested in CI, but **field validation is still pending** — they have not yet been proven against live targets. Treat v0.17.0 capabilities as experimental until field-tested.
 
 ## What it does
