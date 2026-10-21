@@ -69,6 +69,11 @@ abstract class BleScanSource {
 /// Real BLE scan via the universal_ble plugin. Passive scan only —
 /// never connects to anything.
 class UniversalBleScanSource extends BleScanSource {
+  UniversalBleScanSource({this.onAdvertisement});
+
+  /// Optional raw-result tap (see BleScanService.advertisementHook).
+  final void Function(BleDevice device)? onAdvertisement;
+
   @override
   Future<List<BleNearbyDevice>> scan(
       {Duration timeout = const Duration(seconds: 10)}) async {
@@ -85,6 +90,11 @@ class UniversalBleScanSource extends BleScanSource {
 
     final found = <String, BleNearbyDevice>{};
     final sub = UniversalBle.scanStream.listen((d) {
+      try {
+        onAdvertisement?.call(d);
+      } catch (_) {
+        // The tap must never break the scan path.
+      }
       final name = (d.name?.trim().isNotEmpty ?? false)
           ? d.name!.trim()
           : '(unnamed)';
@@ -248,6 +258,16 @@ class BleScanService {
   /// Injected in tests; otherwise chosen from [simulate].
   BleScanSource? testSource;
 
+  /// Passive tap on raw advertisements, invoked for every scan
+  /// result that carries service data: (deviceId, {serviceUuid:
+  /// bytes}). The Remote ID service uses this to decode drone
+  /// broadcasts off the SAME scan this service already runs — no
+  /// second radio session, no transmit of any kind. Set by AppState;
+  /// null = tap off. Invocations are wrapped so a tap failure can
+  /// never break the scan path.
+  void Function(String deviceId, Map<String, Uint8List> serviceData)?
+      advertisementHook;
+
   final List<BleNearbyDevice> devices = [];
   bool scanning = false;
   String? error;
@@ -259,6 +279,19 @@ class BleScanService {
 
   void Function()? onUpdate;
 
+  /// Fire the advertisement tap for one raw scan result, if set.
+  void _fireAdvertisementHook(BleDevice device) {
+    final hook = advertisementHook;
+    if (hook == null) return;
+    final sd = device.serviceData;
+    if (sd.isEmpty) return;
+    try {
+      hook(device.deviceId, sd);
+    } catch (e) {
+      debugPrint('advertisement hook failed: $e');
+    }
+  }
+
   Future<void> scan({required bool simulate}) async {
     if (scanning) return;
     scanning = true;
@@ -269,7 +302,7 @@ class BleScanService {
       final src = testSource ??
           (simulate
               ? SimulatedBleScanSource()
-              : UniversalBleScanSource());
+              : UniversalBleScanSource(onAdvertisement: _fireAdvertisementHook));
       final found = await src.scan();
       devices
         ..clear()
@@ -367,13 +400,16 @@ class BleScanService {
       }
       monitoring = true;
       _monitorSub = UniversalBle.scanStream.listen(
-        (d) => _onAdvertisement(
-          d.deviceId,
-          (d.name?.trim().isNotEmpty ?? false)
-              ? d.name!.trim()
-              : '(unnamed)',
-          (d.rssi ?? -100).toDouble(),
-        ),
+        (d) {
+          _fireAdvertisementHook(d);
+          _onAdvertisement(
+            d.deviceId,
+            (d.name?.trim().isNotEmpty ?? false)
+                ? d.name!.trim()
+                : '(unnamed)',
+            (d.rssi ?? -100).toDouble(),
+          );
+        },
         onError: (_) {},
       );
       await UniversalBle.startScan();
