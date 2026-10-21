@@ -42,6 +42,9 @@ import '../utils/node_ids.dart';
 import '../services/wifi_aware.dart';
 import '../services/wifi_rtt.dart';
 import '../services/wifi_sense.dart';
+import '../services/airframe_identity.dart';
+import '../services/remote_id.dart';
+import '../services/remote_id_service.dart';
 import '../services/device_autoconnect.dart';
 
 /// Short display ID: strips the driver namespace (`silvus:90550` → `90550`).
@@ -113,6 +116,13 @@ class AppSettings {
     this.cotListenMulticastPort = 6969,
     this.cotListenWindowSeconds = 60,
     this.cotEmitterPrefix = 'PREDATOR-',
+    this.friendlySerials = '',
+    this.remoteIdEnabled = false,
+    this.droneEoUrl = 'rtsp://192.168.42.10:5554/subject',
+    this.droneIrUrl = 'rtsp://192.168.42.10:6554/infrared',
+    this.droneCloudEoUrl = '',
+    this.droneCloudIrUrl = '',
+    this.droneStreamSource = 'local',
     this.trustedSources = '',
     this.cotCoincidenceRadiusM = 50.0,
     this.sdrStationLat,
@@ -226,6 +236,36 @@ class AppSettings {
   String cotEmitterPrefix;
   double cotCoincidenceRadiusM;
 
+  /// Friendly airframe registry text (Skydio P1): one airframe per
+  /// line, `SERIAL[, CALLSIGN[, A|B]]` — battery-tray ANSI serials,
+  /// typed in by the operator. Parsed by FriendlyRegistry. A match
+  /// changes rendering/correlation ONLY — it never suppresses a
+  /// track or an alert. Empty = no friendly registry.
+  String friendlySerials;
+
+  /// Remote ID receiver (Skydio P2): decode ASTM F3411 broadcasts
+  /// from BLE advertisements (rides the existing BLE scan) and, on
+  /// Android, Wi-Fi beacons in the existing survey. Receive-only.
+  /// Off by default (a new sensor stays opt-in).
+  bool remoteIdEnabled;
+
+  /// Drone tab stream endpoints (Skydio P3). Vehicle-direct RTSP on
+  /// the local link (the Skydio documented fit): EO is the subject
+  /// stream, IR the thermal — separate simultaneous streams; the
+  /// viewer switches between them, no control channel is used. The
+  /// EO stream shows the pilot's selected focal view (wide/tele is
+  /// chosen by the pilot, in the single EO stream).
+  String droneEoUrl;
+  String droneIrUrl;
+
+  /// Cloud-announced stream URLs (Skydio Cloud webhook variant).
+  /// Empty = local-link streams only.
+  String droneCloudEoUrl;
+  String droneCloudIrUrl;
+
+  /// Which endpoint set the Drone tab uses: 'local' or 'cloud'.
+  String droneStreamSource;
+
   /// Comma-separated sender IPs accepted on the unauthenticated UDP
   /// inputs (node beacons/events on 49160 and the CoT multicast
   /// listener). Empty = accept any sender on the segment.
@@ -291,6 +331,13 @@ class AppSettings {
         'cotListenMulticastPort': cotListenMulticastPort,
         'cotListenWindowSeconds': cotListenWindowSeconds,
         'cotEmitterPrefix': cotEmitterPrefix,
+        'friendlySerials': friendlySerials,
+        'remoteIdEnabled': remoteIdEnabled,
+        'droneEoUrl': droneEoUrl,
+        'droneIrUrl': droneIrUrl,
+        'droneCloudEoUrl': droneCloudEoUrl,
+        'droneCloudIrUrl': droneCloudIrUrl,
+        'droneStreamSource': droneStreamSource,
         'trustedSources': trustedSources,
         'cotCoincidenceRadiusM': cotCoincidenceRadiusM,
         'sdrStationLat': sdrStationLat,
@@ -387,6 +434,22 @@ class AppSettings {
     }
     final ts = j['trustedSources'];
     if (ts is String) trustedSources = ts;
+    final fs = j['friendlySerials'];
+    if (fs is String) friendlySerials = fs;
+    final ridOn = j['remoteIdEnabled'];
+    if (ridOn is bool) remoteIdEnabled = ridOn;
+    final dEo = j['droneEoUrl'];
+    if (dEo is String && dEo.isNotEmpty) droneEoUrl = dEo;
+    final dIr = j['droneIrUrl'];
+    if (dIr is String && dIr.isNotEmpty) droneIrUrl = dIr;
+    final dCe = j['droneCloudEoUrl'];
+    if (dCe is String) droneCloudEoUrl = dCe;
+    final dCi = j['droneCloudIrUrl'];
+    if (dCi is String) droneCloudIrUrl = dCi;
+    final dSrc = j['droneStreamSource'];
+    if (dSrc is String && (dSrc == 'local' || dSrc == 'cloud')) {
+      droneStreamSource = dSrc;
+    }
     final cotPrefix = j['cotEmitterPrefix'];
     if (cotPrefix is String && cotPrefix.isNotEmpty) {
       cotEmitterPrefix = cotPrefix;
@@ -478,6 +541,7 @@ class AppState extends ChangeNotifier {
     _loadGpsOrigin();
     _loadZmetaSettings();
     _initCameraDriver();
+    _wireSkydio();
     _radiosReady = _loadRadios();
     // Fire-and-forget: events simply carry no AI label until it lands.
     DisturbanceClassifier.load().then((c) => _classifier = c);
@@ -822,6 +886,14 @@ class AppState extends ChangeNotifier {
             allowedSources:
                 CotListenerConfig.parseSources(settings.trustedSources),
           ),
+          // Skydio P1: friendly-platform ingest rides the SAME
+          // socket. The matcher reads the live friendly registry, so
+          // registry edits apply without a listener rebuild.
+          platformMatcher: (callsign, uid, type) =>
+              airframes.registry.match(
+                  callsign: callsign.isEmpty ? null : callsign,
+                  uid: uid.isEmpty ? null : uid) !=
+              null,
         );
       }
       if (gen != _cotConfigureGen) return;
@@ -864,6 +936,132 @@ class AppState extends ChangeNotifier {
     await _saveSettings();
     await _configureCot();
     notifyListeners();
+  }
+
+  // ---- Skydio integration (P1–P3) --------------------------------
+
+  /// One-time wiring: BLE advertisements tap into the Remote ID
+  /// receiver, and fresh RID data refreshes the UI. Called from the
+  /// constructor; assignments are idempotent.
+  void _wireSkydio() {
+    wifi.ble.advertisementHook = remoteId.onBleAdvertisement;
+    remoteId.onUpdate = () {
+      _foldAirframeEvidence();
+      notifyListeners();
+    };
+  }
+
+  /// Push the persisted Skydio settings into the live services:
+  /// parse the friendly registry (records re-match immediately) and
+  /// arm/disarm the Remote ID receiver. Called at boot (after the
+  /// persisted settings land) and on every settings save.
+  void _applySkydioSettings() {
+    airframes.registry = FriendlyRegistry.parse(settings.friendlySerials);
+    airframes.rematchAll();
+    // The Wi-Fi poll rides the shepherd/wifi_sense channel, which
+    // only exists on Android; elsewhere the poll is a caught no-op
+    // (MissingPluginException) and BLE remains the receive path.
+    remoteId.setEnabled(settings.remoteIdEnabled, wifiCapable: true);
+  }
+
+  /// Remote ID toggle (Settings switch applies immediately, like the
+  /// CoT listen toggle).
+  Future<void> setRemoteIdEnabled(bool v) async {
+    settings.remoteIdEnabled = v;
+    await _saveSettings();
+    _applySkydioSettings();
+    notifyListeners();
+  }
+
+  /// Live airframe records, freshest first (Tracking overlay +
+  /// Drone tab).
+  List<AirframeRecord> get airframeRecords => airframes.records;
+
+  /// Live Remote ID contacts, freshest first.
+  List<RidContact> get ridContacts => remoteId.contacts;
+
+  /// Fold the latest platform/RID/mesh evidence into the airframe
+  /// classifier. Runs on the 1 Hz watchdog and on RID updates.
+  /// Display-only: nothing here touches detection state.
+  void _foldAirframeEvidence() {
+    final listener = _cotListener;
+    if (listener != null) {
+      for (final p in listener.platformObservations) {
+        airframes.observeCotPlatform(CotPlatformEvidence(
+          uid: p.uid,
+          callsign: p.callsign,
+          cotType: p.type,
+          lat: p.lat,
+          lon: p.lon,
+          time: p.time,
+          haeM: p.haeM,
+          courseDeg: p.courseDeg,
+          speedMps: p.speedMps,
+          batteryPct: p.batteryPct,
+        ));
+      }
+    }
+    if (remoteId.enabled) {
+      for (final c in remoteId.contacts) {
+        final serial = c.serial;
+        if (serial == null || serial.isEmpty) continue;
+        airframes.observeRid(RidEvidence(
+          serial: serial,
+          time: c.lastSeen ?? DateTime.now(),
+          lat: c.lat,
+          lon: c.lon,
+          altM: c.altGeoM,
+          operatorLat: c.operatorLat,
+          operatorLon: c.operatorLon,
+          operatorLocationType: c.operatorLocationType,
+          courseDeg: c.directionDeg,
+          speedMps: c.speedHorizontalMps,
+        ));
+      }
+    }
+    // Class A evidence: a registry-matched mesh node carrying fresh
+    // link samples. Motion = field-local position change since the
+    // last fold (the trail updates only here, so a parked node
+    // settles to not-moving instead of re-reporting its last jump).
+    if (airframes.registry.isNotEmpty) {
+      final health = nodeHealthMap;
+      final origin = gpsOrigin;
+      for (final n in effectiveNodes.values) {
+        final cs = n.callsign;
+        if (cs == null || cs.isEmpty) continue;
+        if (airframes.registry.entryForCallsign(cs) == null) continue;
+        final h = health[n.nodeId] ?? NodeHealthStatus.unknown;
+        final hasLinks = h == NodeHealthStatus.ok ||
+            h == NodeHealthStatus.degraded;
+        final prev = _nodePosTrail[n.nodeId];
+        var moved = false;
+        if (prev != null) {
+          final dx = n.x - prev.x;
+          final dy = n.y - prev.y;
+          moved = dx * dx + dy * dy > 15 * 15 ||
+              (n.height - prev.h).abs() > 2;
+        }
+        _nodePosTrail[n.nodeId] = (x: n.x, y: n.y, h: n.height);
+        double? lat = n.lat;
+        double? lon = n.lon;
+        if ((lat == null || lon == null) && origin != null) {
+          final geo =
+              GeoProjection(originLat: origin.lat, originLon: origin.lon)
+                  .metersToLatLon(n.x, n.y);
+          lat = geo.lat;
+          lon = geo.lon;
+        }
+        airframes.observeMeshNode(
+          nodeCallsign: cs,
+          hasLinkMetrics: hasLinks && !settings.simulatedMode,
+          moving3d: moved,
+          time: DateTime.now(),
+          lat: lat,
+          lon: lon,
+        );
+      }
+    }
+    airframes.prune(DateTime.now());
   }
 
   /// Emit-destination selector: true = UDP multicast, false = TAK
@@ -1586,6 +1784,22 @@ class AppState extends ChangeNotifier {
   // PIR, …) land here for the map overlay and evidence views. The RF
   // tripwire stays the detection authority; these are corroboration.
   final List<SensorObservation> sensorObservations = [];
+
+  /// Friendly-airframe classification (Skydio P1): folds CoT
+  /// platform observations, Remote ID contacts and mesh-node
+  /// evidence into capability-class records. Display and
+  /// correlation-priority only — records never feed detection, the
+  /// tracker, or the confidence merger, and a registry match never
+  /// suppresses anything.
+  final AirframeClassifier airframes = AirframeClassifier();
+
+  /// Remote ID receiver (Skydio P2). Receive-only; rides the BLE
+  /// scan via its advertisement hook plus the Android Wi-Fi survey.
+  final RemoteIdService remoteId = RemoteIdService();
+
+  /// Last field-local position per mesh node id — Class A motion
+  /// evidence (a registry-matched node whose position moves in 3D).
+  final Map<String, ({double x, double y, double h})> _nodePosTrail = {};
   DateTime _lastSensorPull = DateTime.fromMillisecondsSinceEpoch(0);
 
   void _collectSensorObservations(_DriverPoller p) {
@@ -1705,6 +1919,7 @@ class AppState extends ChangeNotifier {
     // the ingest emitter's cached token so the freshly stored token
     // takes effect on the next send, not after the cache TTL.
     _zmetaHttps?.invalidateToken();
+    _applySkydioSettings();
     _configureZmetaTimers();
     unawaited(_configureCot());
     // Via _newTripwire() so the ARTI layer is re-attached (a bare
@@ -1838,6 +2053,7 @@ class AppState extends ChangeNotifier {
 
   void _watchdogTick() {
     _retryCotListener();
+    _foldAirframeEvidence();
     if (!polling) return;
     final level = health.level;
     final prev = _lastCoverage;
@@ -3091,6 +3307,10 @@ class AppState extends ChangeNotifier {
     // needs its own call or the 49160 allowlist silently reverts to
     // accept-any on every restart (reviewer catch, 2026-10-21).
     NodeUdpHub.setAllowedSourcesFromText(settings.trustedSources);
+    // Same boot rule for the Skydio surfaces: the persisted friendly
+    // registry and Remote ID toggle must be live from boot, not only
+    // after the next settings save.
+    _applySkydioSettings();
     unawaited(_configureCot());
     notifyListeners();
   }
