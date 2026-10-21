@@ -1,5 +1,85 @@
 # Changelog
 
+## v0.22.0 — 2026-10-21 — Skydio integration P1–P3 (published)
+
+Friendly-airframe support per `docs/skydio_integration_spec.md`:
+Shepherd now knows his own drones, classifies every airframe by the
+evidence that actually arrives, and can watch their video — while
+staying ingest-only (no new transmit/control surface of any kind).
+
+- **P1 — Friendly identity via CoT.** The existing CoT listener
+  gains a separate platform path: friendly-air events (`a-f-A*`) and
+  registry-matched callsigns land as platform observations (point
+  hae, `<track>` course/speed, `<status>` battery) in their own
+  collection — the Predator emitter path is byte-for-byte unchanged.
+  New `airframe_identity.dart`: the friendly registry (battery-tray
+  serials typed in Settings → Drones, `SERIAL[, CALLSIGN[, A|B]]`)
+  and the capability classifier — Class A sensing node / Class B
+  position node / Class C broadcast contact; Class D (RF cue) never
+  enters the registry. Promotion is evidence-only and monotonic:
+  never demote on silence. A whitelist match changes rendering and
+  correlation priority ONLY — it cannot suppress a track or alert.
+- **P2 — Remote ID decoder.** Pure-Dart ASTM F3411 decoder
+  (`remote_id.dart`): Basic ID, Location/Vector, System, Operator
+  ID, Self-ID, Authentication (structural only, never verified),
+  message packs, and the counter-prefixed BLE/Wi-Fi transport
+  framing; unknown sentinels decode to null, never zero. Receive
+  paths: BLE advertisements ride the existing BLE scan via a new
+  passive hook on the FFFA service; Android Wi-Fi beacons are
+  extracted from the existing survey (Kotlin IE-221 scan in
+  MainActivity — native side uncompiled in the build sandbox, as
+  with all prior Kotlin work). Class C contacts render on the
+  Tracking map (diamond = drone, square = operator/takeoff point)
+  with an AIR CONTACTS readout. A registry serial match renders
+  FRIENDLY (claimed) — broadcast identity is unauthenticated and
+  spoofable — until a Class A/B feed corroborates the same airframe.
+  In-app copy states the limits: broadcast-only coverage, and
+  D-model airframes (X10D) may transmit no Remote ID at all.
+- **P3 — Drone tab.** New tab (six destinations now): dual-stream
+  RTSP viewer on media_kit — EO / THERMAL segmented switch is
+  viewer-side stream selection between the aircraft's simultaneous
+  streams; EO is labeled PILOT'S FOCAL VIEW (wide/tele is the
+  pilot's in-stream choice, not viewer-switchable). Per-airframe
+  selector over Class A/B records; telemetry strip comes from the
+  CoT feed, NOT the video stream — MISB 0601 KLV extraction through
+  media_kit is not practical (no demuxed-metadata surface), so no
+  KLV parse is claimed. Stream health is honest (NO SIGNAL /
+  CONNECTING / LIVE / FROZEN from playhead behavior); no latency
+  figure is shown (none is published or measurable). Endpoints are
+  configurable in Settings (local-link defaults per the documented
+  RAS-A fit; cloud URL fields for the webhook variant). No flight,
+  gimbal, or focal controls exist anywhere in the tab.
+- Settings: the whole Skydio block persists (registry text, RID
+  toggle, stream URLs, stream source) with boot-time application.
+- **Post-review fixes** (two independent review passes before
+  publish): the Remote ID decoder's wire layout was corrected
+  against the opendroneid-core-c struct definitions — the Location
+  flag byte's bit allocation (SpeedMult/EW/HeightType were read
+  from mirrored positions, which would have decoded a real
+  broadcast's heading and speed wrong), the System message field
+  offsets, and the Authentication page-0 data offset; the affected
+  test vectors were rebuilt under the corrected layout. The Drone
+  tab's stream health no longer reports LIVE before the first
+  frame actually arrives (a session that connects but never sends
+  frames now reads CONNECTING, then FROZEN at a 10 s deadline
+  instead of LIVE forever), and a latched stream error now
+  auto-retries on a bounded 10 s cadence (plus tap-to-retry)
+  instead of sitting at NO SIGNAL until the operator poked the tab.
+- **New app icon**: the cartoon mark is replaced by a photoreal
+  portrait — the same black tricolor Australian shepherd wearing
+  Comtacs, serious expression, dark background — as the icon
+  master and across the Android launcher set.
+- New tests: Remote ID vectors (hand-built from the F3411 encoding,
+  arithmetic verified — no authoritative public capture exists;
+  the ASTM annex is paywalled), classifier promotion rules,
+  registry parsing, CoT platform ingest incl. emitter-path
+  invariance, stream-health state machine, Drone tab widget
+  (fake player), RID service paths, settings round-trip.
+
+Not in this build (spec P4): Skydio Cloud roster sync, AirMesh
+Class A promotion beyond the registry/motion rule, ISR Command
+detection markers.
+
 ## v0.21.3 — 2026-10-21 — Review-fixes merge (Hermes pass, reviewed + applied)
 
 An externally-authored hardening/correctness pass over the
