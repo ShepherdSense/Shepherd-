@@ -68,6 +68,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late bool _cotEmitUseMulticast;
   late bool _cotListenEnabled;
   late bool _camera;
+  late final TextEditingController _friendlySerials;
+  late final TextEditingController _droneEoUrl;
+  late final TextEditingController _droneIrUrl;
+  late final TextEditingController _droneCloudEoUrl;
+  late final TextEditingController _droneCloudIrUrl;
+  late bool _remoteIdEnabled;
+  late String _droneStreamSource;
   late bool _autoConnectSilvusUsb;
   late bool _sdrAutoStation;
   late bool _calibDegraded;
@@ -165,6 +172,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
         TextEditingController(text: s.cotAirTypeThreshold.toString());
     _cotEmitterPrefix = TextEditingController(text: s.cotEmitterPrefix);
     _trustedSources = TextEditingController(text: s.trustedSources);
+    _friendlySerials = TextEditingController(text: s.friendlySerials);
+    _remoteIdEnabled = s.remoteIdEnabled;
+    _droneEoUrl = TextEditingController(text: s.droneEoUrl);
+    _droneIrUrl = TextEditingController(text: s.droneIrUrl);
+    _droneCloudEoUrl = TextEditingController(text: s.droneCloudEoUrl);
+    _droneCloudIrUrl = TextEditingController(text: s.droneCloudIrUrl);
+    _droneStreamSource = s.droneStreamSource;
     _cotCoincidenceRadius =
         TextEditingController(text: s.cotCoincidenceRadiusM.toString());
     _cotListenMulticastGroup =
@@ -227,6 +241,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _cotEmitterPrefix.dispose();
     _cotCoincidenceRadius.dispose();
     _trustedSources.dispose();
+    _friendlySerials.dispose();
+    _droneEoUrl.dispose();
+    _droneIrUrl.dispose();
+    _droneCloudEoUrl.dispose();
+    _droneCloudIrUrl.dispose();
     _cotListenMulticastGroup.dispose();
     _cotListenMulticastPort.dispose();
     _cotListenWindowSeconds.dispose();
@@ -385,6 +404,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
       cotEmitterPrefix: _cotEmitterPrefix.text.trim().isEmpty
           ? 'PREDATOR-'
           : _cotEmitterPrefix.text.trim(),
+      friendlySerials: _friendlySerials.text,
+      remoteIdEnabled: _remoteIdEnabled,
+      droneEoUrl: _droneEoUrl.text.trim().isEmpty
+          ? 'rtsp://192.168.42.10:5554/subject'
+          : _droneEoUrl.text.trim(),
+      droneIrUrl: _droneIrUrl.text.trim().isEmpty
+          ? 'rtsp://192.168.42.10:6554/infrared'
+          : _droneIrUrl.text.trim(),
+      droneCloudEoUrl: _droneCloudEoUrl.text.trim(),
+      droneCloudIrUrl: _droneCloudIrUrl.text.trim(),
+      droneStreamSource: _droneStreamSource,
       cotCoincidenceRadiusM: (double.tryParse(
                   _cotCoincidenceRadius.text.trim()) ??
               50.0)
@@ -799,6 +829,85 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 'e.g. 50 (5–500)',
                 numeric: true),
           ],
+        ]),
+        _section('Drones — friendly fleet & Remote ID', [
+          Text(
+            'YOUR OWN AIRFRAMES, BY BATTERY-TRAY SERIAL. CONTROLLER COT '
+            '(FRIENDLY AIR EVENTS ON THE LISTENER ABOVE) MAKES THEM CLASS B '
+            'POSITION NODES; A SERIAL HERE LETS SHEPHERD NAME THEM AND '
+            'CORROBORATE OTHER FEEDS. A MATCH CHANGES RENDERING ONLY — '
+            'IT NEVER SUPPRESSES A TRACK OR AN ALERT.',
+            style: SentryType.section(10).copyWith(height: 1.6),
+          ),
+          const SizedBox(height: 10),
+          TextField(
+            controller: _friendlySerials,
+            minLines: 2,
+            maxLines: 5,
+            style: SentryType.rowValue(SentryColors.onDark),
+            decoration: const InputDecoration(
+              labelText: 'FRIENDLY SERIALS — ONE PER LINE',
+              hintText: 'SERIAL[, CALLSIGN[, A|B]] — e.g. '
+                  '1581F5FHJ229R00N3K7P, VIPER-1',
+            ),
+          ),
+          const SizedBox(height: 10),
+          SwitchListTile(
+            title: Text('REMOTE ID RECEIVER',
+                style: SentryType.rowValue(SentryColors.onDark)),
+            subtitle: Text(
+              'DECODE FAA REMOTE ID BROADCASTS (ASTM F3411) FROM BLE '
+              'ADVERTISEMENTS AND WI-FI BEACONS — RECEIVE-ONLY. CIVIL '
+              'DRONES ONLY: MILITARY D-MODEL AIRFRAMES (X10D) MAY '
+              'BROADCAST NOTHING, SO NO CONTACT NEVER MEANS NO DRONE. '
+              'DEFAULT OFF.',
+              style: SentryType.section(10).copyWith(height: 1.6),
+            ),
+            value: _remoteIdEnabled,
+            onChanged: (v) {
+              setState(() => _remoteIdEnabled = v);
+              unawaited(widget.state.setRemoteIdEnabled(v));
+            },
+          ),
+          const SizedBox(height: 10),
+          Text(
+            'DRONE TAB STREAMS — VIEWER-SIDE SELECTION ONLY. EO AND '
+            'THERMAL ARE SEPARATE SIMULTANEOUS STREAMS FROM THE '
+            'AIRCRAFT; THE TAB SWITCHES WHICH ONE YOU WATCH. THE EO '
+            'STREAM IS THE PILOT’S FOCAL VIEW (WIDE/TELE IS THE '
+            'PILOT’S CHOICE). SHEPHERD SENDS NOTHING TO THE AIRCRAFT.',
+            style: SentryType.section(10).copyWith(height: 1.6),
+          ),
+          const SizedBox(height: 10),
+          _field(_droneEoUrl, 'EO stream URL (local link)',
+              'rtsp://192.168.42.10:5554/subject'),
+          const SizedBox(height: 10),
+          _field(_droneIrUrl, 'Thermal stream URL (local link)',
+              'rtsp://192.168.42.10:6554/infrared'),
+          const SizedBox(height: 10),
+          _field(_droneCloudEoUrl, 'EO stream URL (cloud)',
+              'announced by the Skydio Cloud webhook, if used'),
+          const SizedBox(height: 10),
+          _field(_droneCloudIrUrl, 'Thermal stream URL (cloud)',
+              'announced by the Skydio Cloud webhook, if used'),
+          const SizedBox(height: 10),
+          Row(children: [
+            Text('STREAM SOURCE',
+                style: SentryType.section(10).copyWith(height: 1.6)),
+            const SizedBox(width: 12),
+            DropdownButton<String>(
+              value: _droneStreamSource,
+              dropdownColor: SentryColors.surface2,
+              style: SentryType.rowValue(SentryColors.onDark),
+              items: const [
+                DropdownMenuItem(
+                    value: 'local', child: Text('LOCAL LINK')),
+                DropdownMenuItem(value: 'cloud', child: Text('CLOUD')),
+              ],
+              onChanged: (v) =>
+                  setState(() => _droneStreamSource = v ?? 'local'),
+            ),
+          ]),
         ]),
         _section('ZMeta export', [
           OutlinedButton.icon(
