@@ -51,6 +51,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late final TextEditingController _cotAirTypeThreshold;
   late final TextEditingController _cotEmitterPrefix;
   late final TextEditingController _cotCoincidenceRadius;
+  late final TextEditingController _trustedSources;
   late final TextEditingController _cotListenMulticastGroup;
   late final TextEditingController _cotListenMulticastPort;
   late final TextEditingController _cotListenWindowSeconds;
@@ -163,6 +164,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _cotAirTypeThreshold =
         TextEditingController(text: s.cotAirTypeThreshold.toString());
     _cotEmitterPrefix = TextEditingController(text: s.cotEmitterPrefix);
+    _trustedSources = TextEditingController(text: s.trustedSources);
     _cotCoincidenceRadius =
         TextEditingController(text: s.cotCoincidenceRadiusM.toString());
     _cotListenMulticastGroup =
@@ -224,6 +226,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _cotAirTypeThreshold.dispose();
     _cotEmitterPrefix.dispose();
     _cotCoincidenceRadius.dispose();
+    _trustedSources.dispose();
     _cotListenMulticastGroup.dispose();
     _cotListenMulticastPort.dispose();
     _cotListenWindowSeconds.dispose();
@@ -378,6 +381,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       cotListenWindowSeconds:
           (int.tryParse(_cotListenWindowSeconds.text.trim()) ?? 60)
               .clamp(10, 600),
+      trustedSources: _trustedSources.text.trim(),
       cotEmitterPrefix: _cotEmitterPrefix.text.trim().isEmpty
           ? 'PREDATOR-'
           : _cotEmitterPrefix.text.trim(),
@@ -438,8 +442,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
         _zmetaIngestUrl = result.ingestUrl;
         _zmetaIngestFp = result.ingestFp;
       } else {
-        _zmetaHost.text = result.zmetaHost;
-        _zmetaPort.text = result.zmetaPort.toString();
+        if (result.zmetaHost.isNotEmpty && result.zmetaPort > 0) {
+          _zmetaHost.text = result.zmetaHost;
+          _zmetaPort.text = result.zmetaPort.toString();
+        }
         _zmetaIngestUrl = '';
         _zmetaIngestFp = '';
       }
@@ -451,8 +457,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
           content: Text(result.linkMode == 'https'
               ? 'JOINED OVER HTTPS — NO OTHER APP NEEDED. EXPORT STAYS OFF '
                   'UNTIL YOU ENABLE IT.'
-              : 'JOINED — GATEWAY TARGET SET. EXPORT STAYS OFF '
-                  'UNTIL YOU ENABLE IT.'),
+              : (result.zmetaHost.isNotEmpty
+                  ? 'JOINED — GATEWAY TARGET SET. EXPORT STAYS OFF '
+                      'UNTIL YOU ENABLE IT.'
+                  : 'JOINED — NO GATEWAY TARGET RECEIVED; SET HOST/PORT '
+                      'MANUALLY. EXPORT STAYS OFF UNTIL YOU ENABLE IT.')),
         ),
       );
     }
@@ -781,6 +790,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
             const SizedBox(height: 10),
             _field(_cotEmitterPrefix, 'Emitter callsign prefix',
                 'e.g. PREDATOR-'),
+            const SizedBox(height: 10),
+            _field(_trustedSources,
+                'Trusted sender IPs (node UDP + CoT; blank = any)',
+                'e.g. 192.168.4.1, 192.168.4.2'),
             const SizedBox(height: 10),
             _field(_cotCoincidenceRadius, 'Coincidence radius (meters)',
                 'e.g. 50 (5–500)',
