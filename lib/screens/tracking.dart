@@ -9,6 +9,7 @@ import '../services/tracker.dart';
 import '../state/app_state.dart';
 import '../theme.dart';
 import '../utils/hull.dart';
+import 'airframe_overlay.dart';
 import 'sensor_overlay.dart';
 
 /// Tracking tab in the RuView observatory style: dark field map with
@@ -49,6 +50,7 @@ class _TrackingScreenState extends State<TrackingScreen> {
   /// Universal sensor observation overlay (lidar arcs, acoustic
   /// bearings, camera motion…). Needs a GPS origin to project.
   bool _showSensors = true;
+  bool _showAir = true;
 
   /// Map zoom (wheel / buttons). Pinch is reserved for node dragging.
   double _mapZoom = 1.0;
@@ -105,6 +107,12 @@ class _TrackingScreenState extends State<TrackingScreen> {
             ],
             _readoutCard(),
             const SizedBox(height: 12),
+            if (state.airframeRecords.isNotEmpty ||
+                state.ridContacts.isNotEmpty ||
+                state.settings.remoteIdEnabled) ...[
+              _airContactsCard(),
+              const SizedBox(height: 12),
+            ],
             if (live) ...[
               _nodeHeightsCard(nodes),
               const SizedBox(height: 12),
@@ -170,6 +178,11 @@ class _TrackingScreenState extends State<TrackingScreen> {
                     setState(() => _showSensors = !_showSensors),
                 child: Text(
                     _showSensors ? 'SENSORS ON' : 'SENSORS OFF'),
+              ),
+              TextButton(
+                style: _toggleStyle,
+                onPressed: () => setState(() => _showAir = !_showAir),
+                child: Text(_showAir ? 'AIR ON' : 'AIR OFF'),
               ),
               // Mode label rides the toggle wrap: in the title row it
               // still overflowed narrow cards under fallback fonts.
@@ -275,6 +288,18 @@ class _TrackingScreenState extends State<TrackingScreen> {
                   return tr.toScreen(m.x, m.y);
                 },
                 metersToPx: tr.scale,
+              ),
+            // Airframes (Skydio P1/P2): friendly platforms, Remote ID
+            // contacts, operator points. Diamonds = aircraft,
+            // squares = operator/takeoff. Needs the GPS origin.
+            if (_showAir && origin != null)
+              ...airframeLayer(
+                records: state.airframeRecords,
+                ridContacts: state.ridContacts,
+                project: (lat, lon) {
+                  final m = latLonToMeters(lat, lon, origin.lat, origin.lon);
+                  return tr.toScreen(m.x, m.y);
+                },
               ),
             Positioned(
               right: 4,
@@ -428,6 +453,66 @@ class _TrackingScreenState extends State<TrackingScreen> {
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  /// Air contacts readout (Skydio P1/P2): what the cooperative
+  /// feeds report — friendly platforms and Remote ID broadcasts.
+  /// Copy is the honesty contract: RID identity is a CLAIM, coverage
+  /// is broadcast-only, and an empty card never means an empty sky.
+  Widget _airContactsCard() {
+    final records = state.airframeRecords;
+    final contacts = state.ridContacts;
+    String ageText(DateTime? seen) {
+      if (seen == null) return '—';
+      final s = DateTime.now().difference(seen).inSeconds;
+      return s < 2 ? 'NOW' : '${s}s AGO';
+    }
+
+    return SentryPanel(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('AIR CONTACTS', style: SentryType.section()),
+          const SizedBox(height: 8),
+          if (records.isEmpty && contacts.isEmpty)
+            Text(
+              'NOTHING HEARD YET. FRIENDLY AIRCRAFT ARRIVE VIA THE '
+              'CONTROLLER COT FEED; CIVIL DRONES VIA REMOTE ID '
+              'BROADCAST WHEN THE RECEIVER IS ON (SETTINGS → DRONES).',
+              style: SentryType.section(10).copyWith(height: 1.6),
+            ),
+          for (final r in records) ...[
+            _row(
+              r.displayName,
+              '${r.affiliationLabel} · ${r.classLabel} · ${ageText(r.lastSeen)}',
+              airframeAffiliationColor(r.affiliationLabel),
+            ),
+            const SizedBox(height: 4),
+          ],
+          for (final c in contacts)
+            if (c.serial == null ||
+                !records.any((r) =>
+                    r.serial?.toUpperCase() == c.serial!.toUpperCase())) ...[
+              _row(
+                c.serial ?? 'RID · NO ID',
+                'UNKNOWN · CLASS C · BROADCAST CONTACT (${c.sourceKind}) '
+                    '· ${ageText(c.lastSeen)}',
+                SentryColors.amber,
+              ),
+              const SizedBox(height: 4),
+            ],
+          const SizedBox(height: 4),
+          Text(
+            'REMOTE ID IS A BROADCAST CLAIM — UNAUTHENTICATED AND '
+            'SPOOFABLE. A WHITELIST MATCH RENDERS "FRIENDLY (CLAIMED)" '
+            'UNTIL A COOPERATIVE FEED CORROBORATES IT. BROADCAST-ONLY '
+            'COVERAGE: MILITARY D-MODEL AIRCRAFT MAY TRANSMIT NO '
+            'REMOTE ID AT ALL — NO CONTACT NEVER MEANS NO DRONE.',
+            style: SentryType.section(10).copyWith(height: 1.6),
+          ),
+        ],
       ),
     );
   }
