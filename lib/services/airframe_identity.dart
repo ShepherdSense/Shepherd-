@@ -23,6 +23,14 @@
 ///  - Remote ID identity is asserted, unauthenticated, spoofable:
 ///    an RID-only friendly renders FRIENDLY (claimed) until a Class
 ///    A/B feed corroborates the same airframe.
+///
+/// Friendly GROUND tracks (v0.23.0, docs/prc163_ground_tracks_spec.md)
+/// live in this module too — "who is friendly" is one question with
+/// one registry — but they are NOT airframes: [GroundTrackRecord]s
+/// carry no capability class, never enter the Drone tab, and exist
+/// only as feed-reported positions (a PRC-163's PLI via TAK/CoT).
+/// The no-suppression rule covers them identically: this file's
+/// only outputs are records for display.
 library;
 
 /// Capability class of an airframe, by evidence. Declaration order is
@@ -297,6 +305,97 @@ class CotPlatformEvidence {
   final double? batteryPct;
 }
 
+/// One friendly GROUND track: a dismount's position as reported
+/// by the cooperative TAK feed (v0.23.0 — the PRC-163 path). A
+/// 163's PLI rides its waveform to an ATAK EUD and comes out as a
+/// CoT `a-f-G*` event; that event is ALL Shepherd ever gets from
+/// the radio — position presence, never link metrics (none exist;
+/// see docs/prc163_ground_tracks_spec.md).
+///
+/// Ground records are deliberately NOT airframes: no capability
+/// class (Classes A–D describe air evidence), no Drone tab
+/// presence, no altitude story. They share the friendly registry
+/// and the classifier's bookkeeping, but live in their own
+/// collection so no air consumer can pick one up by accident.
+class GroundTrackRecord {
+  GroundTrackRecord({required this.key});
+
+  /// Canonical identity key: `uid:<uid>` (CoT uids are stable per
+  /// EUD while the feed runs), else `callsign:<CALLSIGN>`.
+  final String key;
+
+  String uid = '';
+  String? callsign;
+
+  /// CoT type string, e.g. `a-f-G-U-C` (friendly ground unit).
+  String cotType = '';
+
+  double? lat;
+  double? lon;
+
+  /// Course over ground (deg) and speed (m/s) from `<track>`.
+  double? courseDeg;
+  double? speedMps;
+
+  /// Battery percent 0..100 when the feed reports it.
+  double? batteryPct;
+
+  /// Registry entry matched to this track, if any.
+  FriendlyEntry? registryEntry;
+
+  /// How friendliness was established: 'registry' (the operator's
+  /// whitelist names this unit) or 'cot' (the feed asserts the
+  /// friendly affiliation — `a-f-` — and Shepherd did not verify
+  /// it). Mirrors [AirframeRecord.friendlyBasis].
+  String friendlyBasis = 'cot';
+
+  DateTime? lastSeen;
+
+  /// Display affiliation, same honesty contract as the air side:
+  /// registry → `FRIENDLY`; feed-asserted only → `FRIENDLY (FEED)`.
+  /// There is no (claimed) tier on the ground: no unauthenticated
+  /// broadcast path feeds this collection — every ground record
+  /// arrived over the cooperative TAK feed.
+  String get affiliationLabel =>
+      friendlyBasis == 'registry' ? 'FRIENDLY' : 'FRIENDLY (FEED)';
+
+  /// Display name: observed/registry callsign, else uid, else key.
+  String get displayName {
+    final cs = callsign;
+    if (cs != null && cs.isNotEmpty) return cs;
+    return uid.isNotEmpty ? uid : key;
+  }
+}
+
+/// Evidence input: one CoT friendly-ground observation (from the
+/// CoT listener's platform path — see cot_listener.dart). No hae:
+/// ground PLI altitude is not a display input here.
+class CotGroundEvidence {
+  const CotGroundEvidence({
+    required this.uid,
+    required this.callsign,
+    required this.cotType,
+    required this.lat,
+    required this.lon,
+    required this.time,
+    this.courseDeg,
+    this.speedMps,
+    this.batteryPct,
+  });
+
+  final String uid;
+  final String callsign;
+
+  /// CoT type string, e.g. `a-f-G-U-C` (friendly ground unit).
+  final String cotType;
+  final double lat;
+  final double lon;
+  final DateTime time;
+  final double? courseDeg;
+  final double? speedMps;
+  final double? batteryPct;
+}
+
 /// Evidence input: one aggregated Remote ID contact (from
 /// remote_id.dart's tracker).
 class RidEvidence {
@@ -343,9 +442,21 @@ class AirframeClassifier {
 
   final Map<String, AirframeRecord> _records = {};
 
+  /// Friendly ground tracks, keyed separately from airframes so
+  /// no air consumer (Drone tab included) can ever see one.
+  final Map<String, GroundTrackRecord> _ground = {};
+
   /// All live records, freshest first.
   List<AirframeRecord> get records {
     final out = _records.values.toList()
+      ..sort((a, b) =>
+          (b.lastSeen ?? DateTime(0)).compareTo(a.lastSeen ?? DateTime(0)));
+    return List.unmodifiable(out);
+  }
+
+  /// All live ground tracks, freshest first.
+  List<GroundTrackRecord> get groundRecords {
+    final out = _ground.values.toList()
       ..sort((a, b) =>
           (b.lastSeen ?? DateTime(0)).compareTo(a.lastSeen ?? DateTime(0)));
     return List.unmodifiable(out);
@@ -468,6 +579,48 @@ class AirframeClassifier {
     return r;
   }
 
+  void _applyGroundRegistry(GroundTrackRecord r) {
+    final entry = registry.match(
+        callsign: r.callsign, uid: r.uid.isEmpty ? null : r.uid);
+    if (entry != null) {
+      r.registryEntry = entry;
+      // A registry name outranks the feed's bare affiliation claim
+      // — and never the other way: once 'registry', a later
+      // feed-only event cannot demote the basis back to 'cot'.
+      r.friendlyBasis = 'registry';
+      if ((r.callsign == null || r.callsign!.isEmpty) &&
+          entry.callsign.isNotEmpty) {
+        r.callsign = entry.callsign;
+      }
+    }
+  }
+
+  /// Fold one friendly-ground CoT observation in (v0.23.0). Ground
+  /// observations NEVER create airframe records: the record lands
+  /// in [groundRecords] only, so the Drone tab's selector (which
+  /// reads [records]) structurally cannot offer a dismount as a
+  /// streamable airframe.
+  GroundTrackRecord observeCotGround(CotGroundEvidence e) {
+    final key = e.uid.isNotEmpty
+        ? 'uid:${e.uid}'
+        : 'callsign:${e.callsign.toUpperCase()}';
+    final r = _ground.putIfAbsent(key, () => GroundTrackRecord(key: key));
+    r.uid = e.uid;
+    if (e.callsign.isNotEmpty) r.callsign = e.callsign;
+    r.cotType = e.cotType;
+    r.lat = e.lat;
+    r.lon = e.lon;
+    // Absence stays absence: an event without <track>/<status>
+    // must not erase the last reported course/speed/battery
+    // (mirrors the air path's null discipline).
+    if (e.courseDeg != null) r.courseDeg = e.courseDeg;
+    if (e.speedMps != null) r.speedMps = e.speedMps;
+    if (e.batteryPct != null) r.batteryPct = e.batteryPct;
+    r.lastSeen = e.time;
+    _applyGroundRegistry(r);
+    return r;
+  }
+
   /// Fold one Remote ID contact in. RID-only evidence is Class C.
   /// A registry serial match sets the (claimed) flag — and clears
   /// it again only when a cooperative feed has ALSO seen this
@@ -562,11 +715,21 @@ class AirframeClassifier {
         r.ridClaimed = true;
       }
     }
+    for (final g in _ground.values) {
+      _applyGroundRegistry(g);
+    }
   }
 
   /// Display hygiene only: drop Class C stranger records silent for
   /// [stale]. Friendly records and Class A/B records are NEVER
   /// pruned — silence never demotes a friendly classification.
+  ///
+  /// Ground tracks prune on the Class C discipline — they are
+  /// feed positions, not corroborated assets — EXCEPT
+  /// registry-matched ones, which are retained on the same rule
+  /// as air friendlies (the registry is the operator's declared
+  /// roster; a named unit going quiet keeps its record and its
+  /// last reported position, with the age shown in the UI).
   void prune(DateTime now, {Duration stale = const Duration(minutes: 10)}) {
     _records.removeWhere((_, r) {
       if (r.isFriendly || r.ridClaimed) return false;
@@ -574,7 +737,15 @@ class AirframeClassifier {
       final seen = r.lastSeen;
       return seen == null || now.difference(seen) > stale;
     });
+    _ground.removeWhere((_, g) {
+      if (g.registryEntry != null) return false;
+      final seen = g.lastSeen;
+      return seen == null || now.difference(seen) > stale;
+    });
   }
 
-  void clear() => _records.clear();
+  void clear() {
+    _records.clear();
+    _ground.clear();
+  }
 }
