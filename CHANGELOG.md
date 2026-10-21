@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.21.2 — 2026-10-21 — Wi-Fi DETECTED headline size fix
+
+- **Wi-Fi status headline no longer wraps mid-word** (field report:
+  the WI-FI FIELD STATUS banner rendered "DETECTE / D" on a phone).
+  The headline was 40 pt with 5 px letter-spacing beside a 52 px
+  icon — too wide for the card. Now 28 pt, single-line, inside a
+  scale-down FittedBox, so any status word shrinks to fit instead of
+  wrapping, at any screen width.
+- **FIELD ACTIVITY header overflow fixed** (found by the new
+  regression test): the title + level-chip Row overflowed by 12 px
+  at 360 px when the chip read ACTIVE. Title now flexible with
+  ellipsis, same pattern as the other headers on this screen.
+- Regression test forces the DETECTED state at phone width and
+  asserts the headline stays on one line
+  (`test/wifi_vision_header_test.dart`). 324/324 tests. Independent
+  review: SHIP, no blocking or should-fix findings.
+
+## v0.21.1 — 2026-10-20 — BLE header overflow fix + tunnel QR script
+
+- **BLE Monitor/Scan misalignment fixed** (field report, same evening
+  as v0.21.0). Measured at 360 px wide: the NEARBY WIRELESS (BLE)
+  header row pushed MONITOR to x=433 and SCAN to x=521 — entirely
+  off-screen. Header restructured to a title row + Wrap of actions,
+  same pattern as the v0.21.0 tracking fix. The same check found the
+  WI-FI FIELD STATUS header overflowing by 14 px next to its LIVE/SIM
+  chip; title is now flexible with ellipsis. New regression test
+  renders the whole WiFi Vision tab at phone width
+  (`test/wifi_vision_header_test.dart`). 323/323 tests.
+- **Hub: MAKE_TUNNEL_QR.bat** (field ask) — renders a filled
+  `shepherd-mesh.conf` as a QR the EUD scans in the WireGuard app
+  (+ → Scan from QR code) to import the tunnel. Comment-stripped
+  payload (1,153 → 242 bytes) so the QR stays scannable; refuses
+  unfilled templates; prints the tunnel Address for confirmation
+  (a second mesh keeping the template's 10.99.0.11 would import
+  fine and silently never connect); BOM-safe read (Notepad/
+  PowerShell BOMs would otherwise corrupt the payload's first
+  line). The QR carries the private key — labeled as such, with a
+  delete-the-PNG reminder. Independent review: app fix SHIP,
+  script SHIP-AFTER-FIXES with both fixes applied.
+
 ## v0.21.0 — 2026-10-20 — Field fixes: tracking header, QR join, Doppler AUTO
 
 Three operator asks from the first full EUD day, in one build:

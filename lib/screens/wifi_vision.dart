@@ -146,9 +146,16 @@ class _WifiVisionScreenState extends State<WifiVisionScreen> {
         children: [
           Row(
             children: [
-              Text('WI-FI FIELD STATUS',
-                  style: SentryType.section()),
-              const Spacer(),
+              // Expanded: with the LIVE/SIM chip beside it, the plain
+              // title could overflow narrow cards under wider font
+              // metrics (14 px at 360 px in tests) — the chip keeps
+              // its size, the title ellipsizes instead.
+              Expanded(
+                child: Text('WI-FI FIELD STATUS',
+                    style: SentryType.section(),
+                    overflow: TextOverflow.ellipsis),
+              ),
+              const SizedBox(width: 8),
               Container(
                 padding: const EdgeInsets.symmetric(
                     horizontal: 10, vertical: 4),
@@ -190,10 +197,21 @@ class _WifiVisionScreenState extends State<WifiVisionScreen> {
               Icon(icon, color: color, size: 52),
               const SizedBox(width: 16),
               Expanded(
-                child: Text(
-                  title,
-                  style: SentryType.readout(40, color)
-                      .copyWith(letterSpacing: 5),
+                // FittedBox scale-down: the status word must never
+                // wrap mid-word on narrow screens — at 40 pt
+                // 'DETECTED' overflowed the card and broke as
+                // 'DETECTE/D' (field report 2026-10-21). 28 pt fits
+                // at 360 px; the box is the guarantee, not the size.
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    title,
+                    maxLines: 1,
+                    softWrap: false,
+                    style: SentryType.readout(28, color)
+                        .copyWith(letterSpacing: 4),
+                  ),
                 ),
               ),
             ],
@@ -651,8 +669,17 @@ class _WifiVisionScreenState extends State<WifiVisionScreen> {
         children: [
           Row(
             children: [
-              Text('FIELD ACTIVITY', style: SentryType.section()),
-              const Spacer(),
+              // Expanded + ellipsis: with the level chip at ACTIVE
+              // the plain title Row overflowed by 12 px at 360 px
+              // (found by the DETECTED-state regression test,
+              // 2026-10-21) — same fix pattern as the other headers
+              // on this screen.
+              Expanded(
+                child: Text('FIELD ACTIVITY',
+                    style: SentryType.section(),
+                    overflow: TextOverflow.ellipsis),
+              ),
+              const SizedBox(width: 8),
               SentryChip(label: report.level, color: color),
             ],
           ),
@@ -852,6 +879,15 @@ class _WifiVisionScreenState extends State<WifiVisionScreen> {
 
   Future<void> _stopAware() => state.wifiAware.stopDiscovery();
 
+  /// Compact action-button style for the BLE card's Wrap row.
+  static ButtonStyle _bleBtnStyle(Color c) => TextButton.styleFrom(
+        foregroundColor: c,
+        backgroundColor: c.withAlpha(28),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        minimumSize: const Size(0, 32),
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      );
+
   Widget _bleCard(WifiVisionService wifi) {
     final ble = wifi.ble;
     final devices = ble.devices;
@@ -866,19 +902,34 @@ class _WifiVisionScreenState extends State<WifiVisionScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          // Title row alone, actions in a Wrap below: title + MONITOR +
+          // SCAN in one Row overflowed a phone-width card by ~190 px
+          // (field report 2026-10-20 — SCAN landed entirely off-screen).
           Row(
             children: [
-              Text('NEARBY WIRELESS (BLE)',
-                  style: SentryType.section()),
-              const Spacer(),
+              Expanded(
+                child: Text('NEARBY WIRELESS (BLE)',
+                    style: SentryType.section(),
+                    overflow: TextOverflow.ellipsis),
+              ),
+              const SizedBox(width: 8),
+              if (ble.scanning)
+                const SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Wrap(
+            spacing: 8,
+            runSpacing: 4,
+            children: [
               if (ble.monitoring)
                 TextButton(
                   onPressed: () => ble.stopMonitoring(),
-                  style: TextButton.styleFrom(
-                    foregroundColor: SentryColors.red,
-                    backgroundColor:
-                        SentryColors.red.withAlpha(28),
-                  ),
+                  style: _bleBtnStyle(SentryColors.red),
                   child: const Text('STOP'),
                 )
               else
@@ -887,30 +938,14 @@ class _WifiVisionScreenState extends State<WifiVisionScreen> {
                       ? null
                       : () => ble.startMonitoring(
                           simulate: wifi.simulated),
-                  style: TextButton.styleFrom(
-                    foregroundColor: SentryColors.purple,
-                    backgroundColor:
-                        SentryColors.purple.withAlpha(28),
-                  ),
+                  style: _bleBtnStyle(SentryColors.purple),
                   child: const Text('MONITOR'),
                 ),
-              const SizedBox(width: 8),
-              if (ble.scanning)
-                const SizedBox(
-                  width: 14,
-                  height: 14,
-                  child:
-                      CircularProgressIndicator(strokeWidth: 2),
-                )
-              else if (!ble.monitoring)
+              if (!ble.monitoring && !ble.scanning)
                 TextButton(
                   onPressed: () =>
                       ble.scan(simulate: wifi.simulated),
-                  style: TextButton.styleFrom(
-                    foregroundColor: SentryColors.purple,
-                    backgroundColor:
-                        SentryColors.purple.withAlpha(28),
-                  ),
+                  style: _bleBtnStyle(SentryColors.purple),
                   child: const Text('SCAN'),
                 ),
             ],
