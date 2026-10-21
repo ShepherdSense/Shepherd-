@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.23.0 — 2026-10-21 — PRC-163 friendly ground tracks (published)
+
+Friendly GROUND tracks per `docs/prc163_ground_tracks_spec.md`:
+the dismounts join the aircraft on the map — as positions, with
+honest labels, and with no change to what the 163 is (and is not)
+to Shepherd.
+
+- **Ground ingest on the existing CoT path.** Friendly-ground
+  events (`a-f-G*` — a PRC-163 carrier's PLI out of an ATAK EUD)
+  now enter the CoT listener's platform path by type, exactly as
+  `a-f-A*` does; the observation carries its domain off the type
+  string, so a ground event can never be routed as an airframe.
+  Position, `<track>` course/speed, and `<status>` battery parse
+  with the same rules as the air path. The Predator emitter path
+  is untouched.
+- **Ground records, not airframes.** New `GroundTrackRecord` in
+  `airframe_identity.dart`: callsign/uid, position, course/speed,
+  battery, last-seen — sharing the friendly registry and the
+  classifier's bookkeeping, in a separate collection. Ground
+  records get NO capability class (A–D is air evidence) and are
+  structurally absent from the Drone tab's airframe selector.
+  Labels: `FRIENDLY (FEED)` for CoT-sourced tracks, `FRIENDLY`
+  when the callsign/uid also matches the registry. Pruning
+  mirrors the air path: feed-only records prune on the Class C
+  stale window (they are positions, not assets); registry-matched
+  records are retained like air friendlies — silence never
+  demotes a friendly classification.
+- **Rendering.** Ground friendlies draw as person-glyph dismount
+  markers (never the air diamond) with callsign labels and a
+  course tick, in friendly green, plus a GROUND TRACKS section in
+  the contacts readout with battery/speed/age. The map layer
+  toggle is renamed AIR → CONTACTS: it gates the whole
+  cooperative-contacts layer (air + ground + RID), which is what
+  it always actually did minus the ground half.
+- **Sim.** Simulated mode walks two dismounts carrying "163s"
+  (SIM-163-A/B) at dismount pace; their ATAK-shaped CoT datagrams
+  run through a real CotListener, so the demo path is the
+  production path with a fake radio. Sim ground tracks anchor to
+  the GPS origin when one is set, else a documented arbitrary
+  demo anchor (sim only — live mode never invents an origin).
+- **Not a sensing node — stated again because it matters.** The
+  163 contributes PLI presence via TAK/CoT only. No link metrics
+  exist for it, its USB port is the programming interface, and
+  the no-LAN constraint stands; nothing here senses with the
+  radio. The no-suppression invariant is unchanged and
+  re-verified: ground records are classifier/display output only
+  and never feed the merger or the tracker.
+
 ## v0.22.0 — 2026-10-21 — Skydio integration P1–P3 (published)
 
 Friendly-airframe support per `docs/skydio_integration_spec.md`:
