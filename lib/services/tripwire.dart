@@ -133,6 +133,46 @@ class Tripwire {
   /// varWindow would otherwise drain the window on every poll.
   int get _varWindow => math.max(1, config.varWindow);
 
+  /// Confirmation streak actually used: never below 1. With 0 or a
+  /// negative value `count == confirmPolls` could never be true (count
+  /// starts at 1) and no event would ever fire.
+  int get _confirmPolls => math.max(1, config.confirmPolls);
+
+  /// Last sample time per link, for pruning links that have gone away.
+  final Map<String, DateTime> _lastSeen = {};
+  int _sinceSweep = 0;
+
+  /// Links unseen this long are forgotten (all per-link state). Stale
+  /// links otherwise stay in the network-median fade-level reference
+  /// forever and skew every live link's expected sign.
+  static const Duration _linkTtl = Duration(minutes: 10);
+
+  void _sweepStale(DateTime now) {
+    final dead = <String>[
+      for (final e in _lastSeen.entries)
+        if (now.difference(e.value) > _linkTtl) e.key
+    ];
+    for (final k in dead) {
+      // Close any open episode first: a link that vanished mid-crossing
+      // (node powered off) still owes its EpisodeSummary — sweeping the
+      // state without closing would silently drop exactly the episodes
+      // whose true duration matters (reviewer catch, 2026-10-21).
+      _closeEpisode(k, now);
+      _lastSeen.remove(k);
+      _hist.remove(k);
+      _dipCount.remove(k);
+      _dipStart.remove(k);
+      _dipPeak.remove(k);
+      _held.remove(k);
+      _rebaselinedAt.remove(k);
+      _linkMedian.remove(k);
+      _varHist.remove(k);
+      _varBase.remove(k);
+      _varFired.remove(k);
+      _openEpisodes.remove(k);
+    }
+  }
+
   final Map<String, ListQueue<double>> _hist = {};
   final Map<String, int> _dipCount = {};
   final Map<String, DateTime> _dipStart = {};
@@ -198,6 +238,11 @@ class Tripwire {
     }
 
     final key = raw.linkKey;
+    _lastSeen[key] = raw.timestamp;
+    if (++_sinceSweep >= 512) {
+      _sinceSweep = 0;
+      _sweepStale(raw.timestamp);
+    }
     final hist = _hist.putIfAbsent(key, () => ListQueue<double>());
 
     final trusted = hist.length >= _minBaseline;
@@ -304,6 +349,12 @@ class Tripwire {
             ..clear()
             ..addLast(snr);
           _held[key] = 0;
+          // The variance reference belongs to the OLD level. Keeping it
+          // made a lasting noise increase re-alarm after every warmup,
+          // forever (alarm, hold, re-baseline, repeat).
+          _varHist.remove(key);
+          _varBase.remove(key);
+          _closeEpisode(key, raw.timestamp);
           _resetEpisode(key);
           _rebaselines += 1;
           _rebaselinedAt[key] = raw.timestamp;
@@ -327,7 +378,7 @@ class Tripwire {
         if (varDisturbed) _varFired[key] = true;
       }
       count += 1;
-      if (count == config.confirmPolls) {
+      if (count == _confirmPolls) {
         final start = _dipStart[key] ?? raw.timestamp;
         final peak = _dipPeak[key] ?? dev;
         _pending.add(CrossingEvent(
@@ -340,9 +391,19 @@ class Tripwire {
           direction: direction,
           viaVariance: _varFired[key] ?? false,
         ));
+        _openEpisodes[key] = _EpisodeTrack(confirmedAt: raw.timestamp)
+          ..peak = peak
+          ..viaVariance = _varFired[key] ?? false;
+      }
+      final open = _openEpisodes[key];
+      if (open != null) {
+        open.lastAt = raw.timestamp;
+        open.peak = math.max(open.peak, dev);
+        if (varDisturbed) open.viaVariance = true;
       }
       _dipCount[key] = count;
     } else {
+      _closeEpisode(key, raw.timestamp);
       _resetEpisode(key);
     }
 
@@ -360,6 +421,35 @@ class Tripwire {
     final out = List<CrossingEvent>.from(_pending);
     _pending.clear();
     return out;
+  }
+
+  /// Confirmed episodes still in progress (event already emitted).
+  final Map<String, _EpisodeTrack> _openEpisodes = {};
+  final List<EpisodeSummary> _closed = [];
+
+  /// Take and clear summaries of episodes that have ENDED since the
+  /// last call. A [CrossingEvent] is emitted at confirmation (a couple
+  /// of polls in) so its duration/peak only cover the start; the
+  /// summary carries the true episode length and peak so callers can
+  /// finalize the event (and classify it on real, not truncated, data).
+  List<EpisodeSummary> drainClosedEpisodes() {
+    final out = List<EpisodeSummary>.from(_closed);
+    _closed.clear();
+    return out;
+  }
+
+  void _closeEpisode(String key, DateTime now) {
+    final open = _openEpisodes.remove(key);
+    if (open == null) return;
+    final start = _dipStart[key] ?? open.confirmedAt;
+    _closed.add(EpisodeSummary(
+      linkKey: key,
+      confirmedAt: open.confirmedAt,
+      durationSecs: open.lastAt.difference(start).inMilliseconds / 1000.0,
+      peak: open.peak,
+      viaVariance: open.viaVariance,
+    ));
+    if (_closed.length > 200) _closed.removeAt(0);
   }
 
   void _resetEpisode(String key) {
@@ -456,4 +546,31 @@ class Tripwire {
     if (n.isOdd) return xs[n ~/ 2];
     return (xs[n ~/ 2 - 1] + xs[n ~/ 2]) / 2;
   }
+}
+
+class _EpisodeTrack {
+  _EpisodeTrack({required this.confirmedAt}) : lastAt = confirmedAt;
+  final DateTime confirmedAt;
+  DateTime lastAt;
+  double peak = 0.0;
+  bool viaVariance = false;
+}
+
+/// Final measurements of a confirmed disturbance episode, reported when
+/// it ends. [confirmedAt] equals the [CrossingEvent.timestamp] emitted
+/// at confirmation, so a caller can match the two.
+class EpisodeSummary {
+  const EpisodeSummary({
+    required this.linkKey,
+    required this.confirmedAt,
+    required this.durationSecs,
+    required this.peak,
+    required this.viaVariance,
+  });
+
+  final String linkKey;
+  final DateTime confirmedAt;
+  final double durationSecs;
+  final double peak;
+  final bool viaVariance;
 }
