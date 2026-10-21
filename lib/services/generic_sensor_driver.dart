@@ -403,7 +403,10 @@ class GenericSensorDriver extends RadioDriver {
   }
 
   @override
-  Future<bool> probe() async => true; // passive listener
+  Future<bool> probe() async {
+    await NodeUdpHub.ensureListening(_onDatagram);
+    return NodeUdpHub.isBound;
+  }
 
   @override
   void dispose() => NodeUdpHub.release(_onDatagram);
