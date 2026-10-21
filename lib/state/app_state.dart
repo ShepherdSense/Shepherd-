@@ -20,6 +20,7 @@ import '../services/field_activity.dart';
 import '../services/radio_driver.dart';
 import '../services/meshtastic_driver.dart';
 import '../services/esp32_driver.dart';
+import '../services/node_udp_hub.dart';
 import '../services/camera_driver.dart';
 import '../services/confidence_merger.dart';
 import '../services/cot_listener.dart';
@@ -112,6 +113,7 @@ class AppSettings {
     this.cotListenMulticastPort = 6969,
     this.cotListenWindowSeconds = 60,
     this.cotEmitterPrefix = 'PREDATOR-',
+    this.trustedSources = '',
     this.cotCoincidenceRadiusM = 50.0,
     this.sdrStationLat,
     this.sdrStationLon,
@@ -224,6 +226,11 @@ class AppSettings {
   String cotEmitterPrefix;
   double cotCoincidenceRadiusM;
 
+  /// Comma-separated sender IPs accepted on the unauthenticated UDP
+  /// inputs (node beacons/events on 49160 and the CoT multicast
+  /// listener). Empty = accept any sender on the segment.
+  String trustedSources;
+
   /// SDR station geometry for the passive-Doppler correlator (WGS84).
   /// Null until the operator configures it in Settings → SDR station;
   /// without all four coordinates the correlator abstains. Converted
@@ -284,6 +291,7 @@ class AppSettings {
         'cotListenMulticastPort': cotListenMulticastPort,
         'cotListenWindowSeconds': cotListenWindowSeconds,
         'cotEmitterPrefix': cotEmitterPrefix,
+        'trustedSources': trustedSources,
         'cotCoincidenceRadiusM': cotCoincidenceRadiusM,
         'sdrStationLat': sdrStationLat,
         'sdrStationLon': sdrStationLon,
@@ -377,6 +385,8 @@ class AppSettings {
     if (cotListenWindow is int) {
       cotListenWindowSeconds = cotListenWindow.clamp(10, 600);
     }
+    final ts = j['trustedSources'];
+    if (ts is String) trustedSources = ts;
     final cotPrefix = j['cotEmitterPrefix'];
     if (cotPrefix is String && cotPrefix.isNotEmpty) {
       cotEmitterPrefix = cotPrefix;
@@ -521,9 +531,10 @@ class AppState extends ChangeNotifier {
   }
 
   /// HTTPS ingest emitter (no-WireGuard path). Created lazily like the
-  /// UDP one. Holds no token itself — the provider reads secure storage
-  /// per send, so a revoked-then-rejoined token takes effect without an
-  /// app restart.
+  /// UDP one. The token comes from secure storage via the provider;
+  /// the emitter caches it briefly (30 s) and drops the cache on any
+  /// 401/403 and on every settings save, so a revoked-then-rejoined
+  /// token takes effect without an app restart.
   ZMetaHttpsEmitter? _zmetaHttps;
 
   ZMetaHttpsEmitter _zmetaHttpsEmitter() {
@@ -791,7 +802,10 @@ class AppState extends ChangeNotifier {
           listener.config.multicastGroup !=
               settings.cotListenMulticastGroup ||
           listener.config.multicastPort != settings.cotListenMulticastPort ||
-          listener.config.windowSeconds != settings.cotListenWindowSeconds;
+          listener.config.windowSeconds != settings.cotListenWindowSeconds ||
+          listener.config.allowedSources.join(',') !=
+              CotListenerConfig.parseSources(settings.trustedSources)
+                  .join(',');
       if (configChanged) {
         await _cotListener?.stop();
         // A newer configure may have superseded us across the stop
@@ -805,6 +819,8 @@ class AppState extends ChangeNotifier {
             windowSeconds: settings.cotListenWindowSeconds,
             emitterPrefix: settings.cotEmitterPrefix,
             coincidenceRadiusM: settings.cotCoincidenceRadiusM,
+            allowedSources:
+                CotListenerConfig.parseSources(settings.trustedSources),
           ),
         );
       }
@@ -1684,9 +1700,16 @@ class AppState extends ChangeNotifier {
     stop();
     settings = s;
     unawaited(_saveSettings());
+    NodeUdpHub.setAllowedSourcesFromText(s.trustedSources);
+    // A settings save is also how a completed (re-)join lands: drop
+    // the ingest emitter's cached token so the freshly stored token
+    // takes effect on the next send, not after the cache TTL.
+    _zmetaHttps?.invalidateToken();
     _configureZmetaTimers();
     unawaited(_configureCot());
-    _tripwire = Tripwire(config: s.tripwireConfig);
+    // Via _newTripwire() so the ARTI layer is re-attached (a bare
+    // Tripwire() silently lost it until the next full start).
+    _tripwire = _newTripwire();
     _tracker.reset();
     _clearTrackState();
     history.clear();
@@ -2009,6 +2032,13 @@ class AppState extends ChangeNotifier {
       // rehearsing, not watching a live mesh.
       if (classified.isNotEmpty && !replaying) unawaited(_alert(AlertKind.detection));
       events.insertAll(0, classified);
+      // Episodes that ended this poll: the confirm-time event only saw
+      // the first couple of polls, so write back the true duration and
+      // peak and classify again on the real episode (the model was
+      // trained on full-length episodes).
+      for (final s in _tripwire.drainClosedEpisodes()) {
+        _finalizeEpisode(s, p.config.pollInterval);
+      }
       // Replay never exports: replayed detections are stale history,
       // and pushing them to the operational gateway would corrupt
       // fusion. (The fail-closed host/secured gate lives in _emitZmeta.)
@@ -2837,6 +2867,23 @@ class AppState extends ChangeNotifier {
   /// Run the embedded classifier over a freshly closed crossing event.
   /// The tripwire stays the detector — this only attaches a heuristic
   /// label (with confidence) describing the disturbance shape.
+  void _finalizeEpisode(EpisodeSummary s, double pollInterval) {
+    final i = events.indexWhere(
+        (e) => e.linkKey == s.linkKey && e.timestamp == s.confirmedAt);
+    if (i < 0) return;
+    final old = events[i];
+    final peak = s.peak > old.dipDepth ? s.peak : old.dipDepth;
+    final dur =
+        s.durationSecs > old.durationSecs ? s.durationSecs : old.durationSecs;
+    final next = old.copyWith(
+      dipDepth: peak,
+      durationSecs: dur,
+      sizeEstimate: peak < 10 ? 'S' : peak < 20 ? 'M' : 'L',
+      viaVariance: old.viaVariance || s.viaVariance,
+    );
+    events[i] = _classifyEvent(next, pollInterval);
+  }
+
   CrossingEvent _classifyEvent(CrossingEvent e, double pollInterval) {
     final clf = _classifier;
     if (clf == null) return e;
@@ -3039,6 +3086,11 @@ class AppState extends ChangeNotifier {
     } catch (_) {
       // Corrupt prefs: keep defaults.
     }
+    // The persisted trusted-sources list gates BOTH unauthenticated
+    // inputs from boot — _configureCot covers CoT; the node UDP hub
+    // needs its own call or the 49160 allowlist silently reverts to
+    // accept-any on every restart (reviewer catch, 2026-10-21).
+    NodeUdpHub.setAllowedSourcesFromText(settings.trustedSources);
     unawaited(_configureCot());
     notifyListeners();
   }
