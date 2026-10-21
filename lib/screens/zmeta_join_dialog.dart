@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io' show Platform;
 
 import 'package:flutter/foundation.dart' show kIsWeb;
@@ -84,8 +85,11 @@ class _ZmetaJoinDialogState extends State<ZmetaJoinDialog> {
     _platformCtl = TextEditingController(text: widget.initialPlatformId);
   }
 
+  Timer? _clipTimer;
+
   @override
   void dispose() {
+    _clipTimer?.cancel();
     _codeCtl.dispose();
     _platformCtl.dispose();
     super.dispose();
@@ -127,10 +131,10 @@ class _ZmetaJoinDialogState extends State<ZmetaJoinDialog> {
       // here at the storage boundary for defense in depth.)
       var ingestMode = false;
       var ingestUrl = '';
+      String? ingestTokenToStore;
       if (res.ingestUrl.isNotEmpty && res.ingestToken.isNotEmpty) {
         ingestUrl = zmetaValidateIngestUrl(res.ingestUrl);
-        final token = zmetaValidateIngestToken(res.ingestToken);
-        await ZmetaIngestStore.writeToken(platformId, token);
+        ingestTokenToStore = zmetaValidateIngestToken(res.ingestToken);
         ingestMode = true;
       }
       // S1: persist the invite's TLS mode so the emitter pins (or not)
@@ -147,6 +151,12 @@ class _ZmetaJoinDialogState extends State<ZmetaJoinDialog> {
               hubPubkey: res.hubPubkey,
               hubEndpoint: res.hubEndpoint,
             );
+      // Persist the credential only once everything above has passed, so
+      // a failed join never leaves a token behind for a half-finished
+      // pairing.
+      if (ingestTokenToStore != null) {
+        await ZmetaIngestStore.writeToken(platformId, ingestTokenToStore);
+      }
       if (!mounted) return;
       setState(() {
         _conf = conf;
@@ -210,19 +220,25 @@ class _ZmetaJoinDialogState extends State<ZmetaJoinDialog> {
       ));
       return;
     }
-    Navigator.of(context).pop(target == null
-        ? null
-        : ZmetaJoinResult(
-            zmetaHost: target.host,
-            zmetaPort: target.port,
-            platformId: _usedPlatformId,
-            linkMode: linkMode,
-          ));
+    // No usable gateway target from the hub: still record the join (the
+    // platform id and WireGuard link mode); Settings keeps the host and
+    // port the operator already has instead of treating this as a cancel.
+    Navigator.of(context).pop(ZmetaJoinResult(
+      zmetaHost: target?.host ?? '',
+      zmetaPort: target?.port ?? 0,
+      platformId: _usedPlatformId,
+      linkMode: linkMode,
+    ));
   }
 
   @override
   Widget build(BuildContext context) {
-    return AlertDialog(
+    // Back must not dismiss the dialog mid-redeem (the single-use invite
+    // would be burned with the result discarded) or on the success
+    // screen (the WireGuard private key is shown only here).
+    return PopScope(
+      canPop: _step == _Step.input || _step == _Step.error,
+      child: AlertDialog(
       backgroundColor: SentryColors.surface2,
       title: Text('JOIN ZMETA NETWORK',
           style: SentryType.rowValue(SentryColors.onDark)),
@@ -231,7 +247,7 @@ class _ZmetaJoinDialogState extends State<ZmetaJoinDialog> {
         child: SingleChildScrollView(child: _body()),
       ),
       actions: _actions(),
-    );
+    ));
   }
 
   Widget _body() {
@@ -391,8 +407,9 @@ class _ZmetaJoinDialogState extends State<ZmetaJoinDialog> {
         const SizedBox(height: 10),
         Text(
           'SCAN WITH THE WIREGUARD APP TO ACTIVATE THE TUNNEL, THEN '
-          'TURN ON "EMIT ZMETA EVENTS" IN SETTINGS. GATEWAY TARGET '
-          'WAS SET TO $_targetNote — EXPORT STAYS OFF UNTIL YOU ENABLE IT.',
+          'TURN ON "EMIT ZMETA EVENTS" IN SETTINGS. '
+          '${zmetaParseTarget(_targetNote) != null ? 'GATEWAY TARGET WILL BE SET TO $_targetNote' : 'THE HUB SENT NO GATEWAY TARGET — ENTER THE GATEWAY HOST AND PORT IN SETTINGS'}'
+          ' — EXPORT STAYS OFF UNTIL YOU ENABLE IT.',
           style: SentryType.section(10).copyWith(height: 1.6),
           textAlign: TextAlign.center,
         ),
@@ -426,8 +443,15 @@ class _ZmetaJoinDialogState extends State<ZmetaJoinDialog> {
       label: const Text('COPY CONF'),
       onPressed: () {
         Clipboard.setData(ClipboardData(text: _conf));
+        // The conf contains this device's WireGuard PRIVATE key: don't
+        // leave it on the clipboard.
+        _clipTimer?.cancel();
+        _clipTimer = Timer(const Duration(seconds: 60), () {
+          Clipboard.setData(const ClipboardData(text: ''));
+        });
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('WIREGUARD CONF COPIED')),
+          const SnackBar(
+              content: Text('WIREGUARD CONF COPIED — CLIPBOARD CLEARS IN 60 S')),
         );
       },
     );
