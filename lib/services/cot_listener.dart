@@ -37,7 +37,21 @@ class CotListenerConfig {
     this.emitterPrefix = 'PREDATOR-',
     this.windowSeconds = 60,
     this.coincidenceRadiusM = 50.0,
+    this.allowedSources = const <String>[],
   });
+
+  /// Sender IPs accepted (empty = any). CoT multicast is unauthenticated:
+  /// any host on the segment can send events that earn the corroboration
+  /// boost, so deployments on shared networks should list their sources.
+  final List<String> allowedSources;
+
+  /// Parse a comma/space separated IP list.
+  static List<String> parseSources(String text) => text
+      .split(RegExp(r'[,\s;]+'))
+      .map((e) => e.trim())
+      .where((e) => e.isNotEmpty)
+      .toList()
+    ..sort();
 
   final bool enabled;
   final String multicastGroup;
@@ -151,9 +165,10 @@ Map<String, String>? _tagAttrs(String xml, String tag) {
     if (close < 0) return null;
     final head = xml.substring(open, close);
     final attrs = <String, String>{};
-    for (final m in RegExp(r'([A-Za-z0-9_:\-]+)="([^"]*)"')
+    // Double- or single-quoted values (both are valid XML).
+    for (final m in RegExp(r'''([A-Za-z0-9_:\-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')''')
         .allMatches(head)) {
-      attrs[m.group(1)!] = m.group(2)!;
+      attrs[m.group(1)!] = m.group(2) ?? m.group(3) ?? '';
     }
     return attrs;
   } catch (_) {
@@ -168,6 +183,12 @@ class CotListener {
   CotListener({required this.config});
 
   final CotListenerConfig config;
+
+  /// Largest tolerated future-dating of an event vs. local time.
+  static const Duration maxClockSkew = Duration(seconds: 30);
+
+  /// Most distinct emitters held at once.
+  static const int maxObservations = 256;
 
   /// Observations keyed by callsign (upsert on repeat events).
   final Map<String, EmitterObservation> _observations = {};
@@ -220,6 +241,10 @@ class CotListener {
 
     final time = DateTime.tryParse(event['time'] ?? '');
     if (time == null) return;
+    // A far-future timestamp would never be pruned (age stays negative)
+    // and lets a sender pin entries in memory indefinitely: allow only
+    // modest clock skew.
+    if (time.toUtc().isAfter(now.add(maxClockSkew))) return;
 
     final ceRaw = double.tryParse(point['ce'] ?? '');
     // DOCUMENTED default: 25.0 m when ce is absent/unparseable (see
@@ -227,6 +252,12 @@ class CotListener {
     final ce =
         (ceRaw == null || !ceRaw.isFinite || ceRaw < 0) ? 25.0 : ceRaw;
 
+    // Bounded: unique callsigns under the prefix must not grow the map
+    // without limit between prunes.
+    if (!_observations.containsKey(callsign) &&
+        _observations.length >= maxObservations) {
+      return;
+    }
     _observations[callsign] = EmitterObservation(
       callsign: callsign,
       lat: lat,
@@ -370,6 +401,10 @@ class CotListener {
         if (event != RawSocketEvent.read) return;
         // Drain everything queued; one receive per event can lag.
         for (var dg = bound.receive(); dg != null; dg = bound.receive()) {
+          final allow = config.allowedSources;
+          if (allow.isNotEmpty && !allow.contains(dg.address.address)) {
+            continue;
+          }
           handleDatagram(dg.data, DateTime.now().toUtc());
         }
       },
