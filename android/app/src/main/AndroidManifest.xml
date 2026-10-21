@@ -28,9 +28,16 @@
         android:label="Shepherd"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false"
+        android:fullBackupContent="false"
         android:usesCleartextTraffic="true">
         <!-- Cleartext HTTP is required: Silvus radios serve their web/API
-             interface over plain http:// on the LAN. -->
+             interface over plain http:// on the LAN. Android cannot scope
+             cleartext to an IP range (network-security-config matches
+             domains only), so it stays app-wide; every credential-bearing
+             path (ZMeta redeem/ingest) enforces HTTPS in Dart instead.
+             Backup is off: settings, trusted-AP lists and radio configs
+             must not be copied to cloud/adb backups. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
