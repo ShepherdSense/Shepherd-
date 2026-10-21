@@ -270,7 +270,7 @@ class MainActivity : FlutterActivity() {
         }
         return try {
             wifi.scanResults.map { r ->
-                mapOf<String, Any>(
+                val row = mutableMapOf<String, Any>(
                     "ssid" to (r.SSID ?: ""),
                     "bssid" to (r.BSSID?.lowercase() ?: ""),
                     "rssi" to r.level,
@@ -282,11 +282,58 @@ class MainActivity : FlutterActivity() {
                     // re-read of this same cache.
                     "tsMs" to (r.timestamp / 1000),
                 )
+                // Remote ID (Skydio P2): if this beacon carries the
+                // ASTM vendor element, hand the Dart decoder the app
+                // bytes (starting at the ODID message counter).
+                val rid = ridBeaconPayload(r)
+                if (rid != null) row["ridBeacon"] = rid
+                row
             }
         } catch (_: SecurityException) {
             emptyList()
         } catch (_: Exception) {
             emptyList()
+        }
+    }
+
+    /**
+     * ASTM F3411 Wi-Fi Beacon Remote ID extraction.
+     *
+     * The broadcast rides a vendor-specific information element
+     * (element id 221) whose body is: OUI FA:0B:BC, OUI type 0x0D,
+     * then the Open Drone ID app bytes (1-byte message counter, then
+     * a message or message pack). Returns the app bytes as unsigned
+     * ints, or null when the beacon carries no Remote ID element.
+     *
+     * ScanResult.informationElements requires API 30+. NOTE: written
+     * in the same unverified style as the Wi-Fi Aware block above —
+     * this file has never been compiled on the build machine; the
+     * first `flutter build apk` on the operator's PC is the compile
+     * check, and the Dart decoder treats the bytes as untrusted.
+     */
+    private fun ridBeaconPayload(r: android.net.wifi.ScanResult): List<Int>? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+        return try {
+            val elements = r.informationElements ?: return null
+            for (element in elements) {
+                if (element.id != 221) continue
+                val buf = element.bytes ?: continue
+                val body = ByteArray(buf.remaining())
+                buf.get(body)
+                // OUI (3) + OUI type (1) precede the app bytes.
+                if (body.size < 4 + 1 + 25) continue
+                if (body[0] != 0xFA.toByte() ||
+                    body[1] != 0x0B.toByte() ||
+                    body[2] != 0xBC.toByte() ||
+                    body[3] != 0x0D.toByte()
+                ) {
+                    continue
+                }
+                return body.copyOfRange(4, body.size).map { it.toInt() and 0xFF }
+            }
+            null
+        } catch (_: Exception) {
+            null
         }
     }
 
