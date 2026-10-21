@@ -50,7 +50,13 @@ class _TrackingScreenState extends State<TrackingScreen> {
   /// Universal sensor observation overlay (lidar arcs, acoustic
   /// bearings, camera motion…). Needs a GPS origin to project.
   bool _showSensors = true;
-  bool _showAir = true;
+
+  /// Cooperative-contacts layer: CoT friendly platforms (air AND
+  /// ground), Remote ID contacts, operator points. Renamed from
+  /// AIR in v0.23.0 — the layer stopped being air-only when
+  /// PRC-163 ground PLI joined it; the toggle copy now says what
+  /// it gates.
+  bool _showContacts = true;
 
   /// Map zoom (wheel / buttons). Pinch is reserved for node dragging.
   double _mapZoom = 1.0;
@@ -108,6 +114,7 @@ class _TrackingScreenState extends State<TrackingScreen> {
             _readoutCard(),
             const SizedBox(height: 12),
             if (state.airframeRecords.isNotEmpty ||
+                state.groundTrackRecords.isNotEmpty ||
                 state.ridContacts.isNotEmpty ||
                 state.settings.remoteIdEnabled) ...[
               _airContactsCard(),
@@ -181,8 +188,9 @@ class _TrackingScreenState extends State<TrackingScreen> {
               ),
               TextButton(
                 style: _toggleStyle,
-                onPressed: () => setState(() => _showAir = !_showAir),
-                child: Text(_showAir ? 'AIR ON' : 'AIR OFF'),
+                onPressed: () =>
+                    setState(() => _showContacts = !_showContacts),
+                child: Text(_showContacts ? 'CONTACTS ON' : 'CONTACTS OFF'),
               ),
               // Mode label rides the toggle wrap: in the title row it
               // still overflowed narrow cards under fallback fonts.
@@ -292,12 +300,25 @@ class _TrackingScreenState extends State<TrackingScreen> {
             // Airframes (Skydio P1/P2): friendly platforms, Remote ID
             // contacts, operator points. Diamonds = aircraft,
             // squares = operator/takeoff. Needs the GPS origin.
-            if (_showAir && origin != null)
+            if (_showContacts && origin != null)
               ...airframeLayer(
                 records: state.airframeRecords,
                 ridContacts: state.ridContacts,
                 project: (lat, lon) {
                   final m = latLonToMeters(lat, lon, origin.lat, origin.lon);
+                  return tr.toScreen(m.x, m.y);
+                },
+              ),
+            // Friendly ground tracks (PRC-163 PLI, v0.23.0): person
+            // glyphs — never diamonds — under the same CONTACTS
+            // toggle. Projection uses the display origin (the GPS
+            // origin, or the sim demo anchor in simulated mode).
+            if (_showContacts && state.displayOrigin != null)
+              ...groundLayer(
+                records: state.groundTrackRecords,
+                project: (lat, lon) {
+                  final o = state.displayOrigin!;
+                  final m = latLonToMeters(lat, lon, o.lat, o.lon);
                   return tr.toScreen(m.x, m.y);
                 },
               ),
@@ -457,12 +478,15 @@ class _TrackingScreenState extends State<TrackingScreen> {
     );
   }
 
-  /// Air contacts readout (Skydio P1/P2): what the cooperative
-  /// feeds report — friendly platforms and Remote ID broadcasts.
-  /// Copy is the honesty contract: RID identity is a CLAIM, coverage
-  /// is broadcast-only, and an empty card never means an empty sky.
+  /// Contacts readout (Skydio P1/P2; ground tracks v0.23.0): what
+  /// the cooperative feeds report — friendly air platforms,
+  /// friendly ground units, and Remote ID broadcasts. Copy is the
+  /// honesty contract: RID identity is a CLAIM, coverage is
+  /// broadcast-only, and an empty card never means an empty sky
+  /// (or an empty field).
   Widget _airContactsCard() {
     final records = state.airframeRecords;
+    final ground = state.groundTrackRecords;
     final contacts = state.ridContacts;
     String ageText(DateTime? seen) {
       if (seen == null) return '—';
@@ -474,13 +498,15 @@ class _TrackingScreenState extends State<TrackingScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('AIR CONTACTS', style: SentryType.section()),
+          Text('CONTACTS', style: SentryType.section()),
           const SizedBox(height: 8),
-          if (records.isEmpty && contacts.isEmpty)
+          if (records.isEmpty && contacts.isEmpty && ground.isEmpty)
             Text(
               'NOTHING HEARD YET. FRIENDLY AIRCRAFT ARRIVE VIA THE '
-              'CONTROLLER COT FEED; CIVIL DRONES VIA REMOTE ID '
-              'BROADCAST WHEN THE RECEIVER IS ON (SETTINGS → DRONES).',
+              'CONTROLLER COT FEED AND FRIENDLY GROUND UNITS '
+              '(PRC-163 PLI) VIA THE SAME TAK FEED; CIVIL DRONES VIA '
+              'REMOTE ID BROADCAST WHEN THE RECEIVER IS ON '
+              '(SETTINGS → DRONES).',
               style: SentryType.section(10).copyWith(height: 1.6),
             ),
           for (final r in records) ...[
@@ -503,6 +529,31 @@ class _TrackingScreenState extends State<TrackingScreen> {
               ),
               const SizedBox(height: 4),
             ],
+          if (ground.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Text('GROUND TRACKS — FRIENDLY PLI VIA THE TAK FEED',
+                style: SentryType.section()),
+            const SizedBox(height: 6),
+            for (final g in ground) ...[
+              _row(
+                g.displayName,
+                '${g.affiliationLabel} · GROUND'
+                    '${g.batteryPct != null ? ' · BATT ${g.batteryPct!.round()}%' : ''}'
+                    '${g.speedMps != null ? ' · ${g.speedMps!.toStringAsFixed(1)} M/S' : ''}'
+                    ' · ${ageText(g.lastSeen)}',
+                airframeAffiliationColor(g.affiliationLabel),
+              ),
+              const SizedBox(height: 4),
+            ],
+            Text(
+              'A PRC-163 APPEARS HERE AS A POSITION ONLY: THE RADIO '
+              'REPORTS WHERE ITS CARRIER IS (PLI) OVER THE TAK FEED. '
+              'IT IS NOT A SENSING NODE — NO LINK METRICS EXIST FOR '
+              'IT, AND ITS SILENCE REMOVES NOTHING.',
+              style: SentryType.section(10).copyWith(height: 1.6),
+            ),
+            const SizedBox(height: 4),
+          ],
           const SizedBox(height: 4),
           Text(
             'REMOTE ID IS A BROADCAST CLAIM — UNAUTHENTICATED AND '
