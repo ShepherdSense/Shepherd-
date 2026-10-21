@@ -162,7 +162,22 @@ class MainActivity : FlutterActivity() {
 
     override fun onDestroy() {
         releaseMulticastLock()
+        stopAwareDiscovery()
         super.onDestroy()
+    }
+
+    /// Re-arm the prompt latch once the user has answered, so a later
+    /// attempt (e.g. after they dismissed the dialog) can prompt again
+    /// instead of staying dead for the rest of the process.
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == WIFI_PERM_REQUEST) {
+            wifiPermRequested = false
+        }
     }
 
     // --- WiFi Vision source helpers ---
@@ -192,7 +207,13 @@ class MainActivity : FlutterActivity() {
     private fun requestWifiPermissions() {
         if (wifiPermRequested || hasWifiScanPermission()) return
         wifiPermRequested = true
-        val perms = mutableListOf(Manifest.permission.ACCESS_FINE_LOCATION)
+        // Android 12+ (targetSdk 31+) silently IGNORES a request for
+        // ACCESS_FINE_LOCATION alone: FINE must be requested together
+        // with COARSE so the user can pick precise vs approximate.
+        val perms = mutableListOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION,
+        )
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             perms.add(Manifest.permission.NEARBY_WIFI_DEVICES)
         }
@@ -240,7 +261,10 @@ class MainActivity : FlutterActivity() {
         } catch (_: Exception) {
         }
         val connectedBssid = try {
-            wifi.connectionInfo?.bssid?.lowercase()
+            val b = wifi.connectionInfo?.bssid?.lowercase()
+            // Redacted placeholder / absent: no AP is "the connected one"
+            // (null == null must never mark every scan entry connected).
+            if (b == null || b == "02:00:00:00:00:00") null else b
         } catch (_: Exception) {
             null
         }
@@ -251,7 +275,8 @@ class MainActivity : FlutterActivity() {
                     "bssid" to (r.BSSID?.lowercase() ?: ""),
                     "rssi" to r.level,
                     "capabilities" to (r.capabilities ?: ""),
-                    "connected" to (r.BSSID?.lowercase() == connectedBssid),
+                    "connected" to (connectedBssid != null &&
+                        r.BSSID?.lowercase() == connectedBssid),
                     // ScanResult.timestamp is µs since boot — the Dart
                     // side uses it to tell a fresh scan from a throttled
                     // re-read of this same cache.
