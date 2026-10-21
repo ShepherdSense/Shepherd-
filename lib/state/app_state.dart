@@ -43,6 +43,7 @@ import '../services/wifi_aware.dart';
 import '../services/wifi_rtt.dart';
 import '../services/wifi_sense.dart';
 import '../services/airframe_identity.dart';
+import '../services/simulated.dart';
 import '../services/remote_id.dart';
 import '../services/remote_id_service.dart';
 import '../services/device_autoconnect.dart';
@@ -977,16 +978,44 @@ class AppState extends ChangeNotifier {
   /// Drone tab).
   List<AirframeRecord> get airframeRecords => airframes.records;
 
+  /// Live friendly ground tracks (PRC-163 PLI via TAK/CoT),
+  /// freshest first (Tracking overlay only — never the Drone tab).
+  /// Display-only, like [airframeRecords].
+  List<GroundTrackRecord> get groundTrackRecords => airframes.groundRecords;
+
+  /// Projection origin for lat/lon overlays: the GPS origin when
+  /// set; in simulated mode only, the sim feed's demo anchor when
+  /// no origin is set (so sim ground tracks can render). Live mode
+  /// never invents an origin.
+  GpsOrigin? get displayOrigin =>
+      gpsOrigin ??
+      (settings.simulatedMode
+          ? GpsOrigin(
+              lat: SimGroundFeed.demoOriginLat,
+              lon: SimGroundFeed.demoOriginLon)
+          : null);
+
   /// Live Remote ID contacts, freshest first.
   List<RidContact> get ridContacts => remoteId.contacts;
 
-  /// Fold the latest platform/RID/mesh evidence into the airframe
-  /// classifier. Runs on the 1 Hz watchdog and on RID updates.
-  /// Display-only: nothing here touches detection state.
-  void _foldAirframeEvidence() {
-    final listener = _cotListener;
-    if (listener != null) {
-      for (final p in listener.platformObservations) {
+  /// Route platform observations into the classifier BY DOMAIN:
+  /// ground observations become ground tracks, never airframes
+  /// (the PRC-163 rule — a dismount is not a drone).
+  void _foldPlatformObservations(List<PlatformObservation> observations) {
+    for (final p in observations) {
+      if (p.isGround) {
+        airframes.observeCotGround(CotGroundEvidence(
+          uid: p.uid,
+          callsign: p.callsign,
+          cotType: p.type,
+          lat: p.lat,
+          lon: p.lon,
+          time: p.time,
+          courseDeg: p.courseDeg,
+          speedMps: p.speedMps,
+          batteryPct: p.batteryPct,
+        ));
+      } else {
         airframes.observeCotPlatform(CotPlatformEvidence(
           uid: p.uid,
           callsign: p.callsign,
@@ -1001,6 +1030,51 @@ class AppState extends ChangeNotifier {
         ));
       }
     }
+  }
+
+  /// Sim-only friendly-ground feed + its private listener
+  /// (v0.23.0): sim dismount PLI runs through the real CoT parse
+  /// path, so the demo is the production path with a fake radio.
+  SimGroundFeed? _simGroundFeed;
+  CotListener? _simGroundListener;
+  DateTime? _lastSimGroundTick;
+
+  /// Simulated-mode ground tracks: two dismounts carrying "163s"
+  /// walking the sim field. Inert in live mode.
+  void _foldSimGround() {
+    if (!settings.simulatedMode) return;
+    final origin = displayOrigin;
+    if (origin == null) return;
+    final feed = _simGroundFeed ??= SimGroundFeed();
+    final listener = _simGroundListener ??= CotListener(
+      config: const CotListenerConfig(enabled: true, windowSeconds: 60),
+      // Ground events enter by their a-f-G type; the matcher stays
+      // shut so nothing else can sneak into the sim collection.
+      platformMatcher: (_, __, ___) => false,
+    );
+    final now = DateTime.now();
+    final last = _lastSimGroundTick;
+    _lastSimGroundTick = now;
+    var dt = last == null ? 1.0 : now.difference(last).inMilliseconds / 1000.0;
+    if (dt <= 0) dt = 1.0;
+    // A backgrounded app must not teleport the patrol on resume.
+    if (dt > 5) dt = 5;
+    for (final xml in feed.tick(
+        dt: dt, originLat: origin.lat, originLon: origin.lon, now: now)) {
+      listener.handleDatagram(utf8.encode(xml), now.toUtc());
+    }
+    _foldPlatformObservations(listener.platformObservations);
+  }
+
+  /// Fold the latest platform/RID/mesh evidence into the airframe
+  /// classifier. Runs on the 1 Hz watchdog and on RID updates.
+  /// Display-only: nothing here touches detection state.
+  void _foldAirframeEvidence() {
+    final listener = _cotListener;
+    if (listener != null) {
+      _foldPlatformObservations(listener.platformObservations);
+    }
+    _foldSimGround();
     if (remoteId.enabled) {
       for (final c in remoteId.contacts) {
         final serial = c.serial;
