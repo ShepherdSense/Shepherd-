@@ -153,6 +153,58 @@ class TrackPosition {
   final double lon;
 }
 
+/// One inbound FRIENDLY PLATFORM observation from a CoT event
+/// (Skydio integration P1: his X10Ds arrive as controller CoT).
+///
+/// This is a separate collection from [EmitterObservation] with a
+/// separate contract: emitter observations are corroboration-only
+/// and never originate anything; platform observations ARE the
+/// platform's own cooperative self-report (position node evidence,
+/// Class B) and render as friendly platforms. They never feed the
+/// confidence merger and never corroborate or suppress a track.
+class PlatformObservation {
+  const PlatformObservation({
+    required this.uid,
+    required this.callsign,
+    required this.type,
+    required this.lat,
+    required this.lon,
+    required this.time,
+    this.haeM,
+    this.courseDeg,
+    this.speedMps,
+    this.batteryPct,
+  });
+
+  /// CoT event uid (stable per platform while the feed runs).
+  final String uid;
+  final String callsign;
+
+  /// CoT type string, e.g. `a-f-A` (friendly air).
+  final String type;
+  final double lat;
+  final double lon;
+  final DateTime time; // UTC, from the event's time attribute
+
+  /// Height above ellipsoid (m) from the point element, when sane.
+  final double? haeM;
+
+  /// Course over ground (deg) and speed (m/s) from `<track>`.
+  final double? courseDeg;
+  final double? speedMps;
+
+  /// Battery percent 0..100 from `<status battery>`, when present.
+  /// ATAK writes an integer percent; a non-integer value in (0,1)
+  /// is read as a fraction (documented ambiguity, see parser).
+  final double? batteryPct;
+}
+
+/// Whether a CoT event belongs to a known friendly platform:
+/// (callsign, uid, cotType) → keep as platform observation. Supplied
+/// by the app from the friendly registry; the listener stays dumb.
+typedef CotPlatformMatcher = bool Function(
+    String callsign, String uid, String cotType);
+
 /// Hand-rolled CoT event attribute extractor. Parses `<tag attr="v"
 /// ...>` WITHOUT the xml package: finds the opening tag, then matches
 /// attr="value" pairs. Returns null when the tag or any attribute
@@ -180,9 +232,19 @@ Map<String, String>? _tagAttrs(String xml, String tag) {
 /// fully testable without sockets; [start]/[stop] own the multicast
 /// subscription.
 class CotListener {
-  CotListener({required this.config});
+  CotListener({required this.config, this.platformMatcher});
 
   final CotListenerConfig config;
+
+  /// Friendly-platform ingest (Skydio P1). When non-null, CoT events
+  /// are ALSO evaluated as platform observations: an event is kept as
+  /// a platform when its type is friendly air (`a-f-A*`) or this
+  /// matcher accepts it (registry callsign/uid). Null = platform
+  /// ingest off; the emitter path is unaffected either way.
+  final CotPlatformMatcher? platformMatcher;
+
+  /// Platform observations keyed by event uid (upsert on repeat).
+  final Map<String, PlatformObservation> _platforms = {};
 
   /// Largest tolerated future-dating of an event vs. local time.
   static const Duration maxClockSkew = Duration(seconds: 30);
@@ -231,8 +293,11 @@ class CotListener {
     if (event == null || point == null || contact == null) return;
 
     final callsign = contact['callsign'] ?? '';
-    if (!callsign.startsWith(config.emitterPrefix)) return;
 
+    // Shared position/time validation for both ingest paths. The
+    // emitter path historically applied exactly these checks; the
+    // platform path needs the same hygiene (a far-future timestamp
+    // would never be pruned and pins memory).
     final lat = double.tryParse(point['lat'] ?? '');
     final lon = double.tryParse(point['lon'] ?? '');
     if (lat == null || lon == null) return;
@@ -246,25 +311,103 @@ class CotListener {
     // modest clock skew.
     if (time.toUtc().isAfter(now.add(maxClockSkew))) return;
 
-    final ceRaw = double.tryParse(point['ce'] ?? '');
-    // DOCUMENTED default: 25.0 m when ce is absent/unparseable (see
-    // EmitterObservation docs).
-    final ce =
-        (ceRaw == null || !ceRaw.isFinite || ceRaw < 0) ? 25.0 : ceRaw;
+    final type = event['type'] ?? '';
+    final uid = event['uid'] ?? '';
 
-    // Bounded: unique callsigns under the prefix must not grow the map
-    // without limit between prunes.
-    if (!_observations.containsKey(callsign) &&
-        _observations.length >= maxObservations) {
+    // --- Emitter path (Predator corroboration contract, unchanged).
+    if (callsign.startsWith(config.emitterPrefix)) {
+      final ceRaw = double.tryParse(point['ce'] ?? '');
+      // DOCUMENTED default: 25.0 m when ce is absent/unparseable (see
+      // EmitterObservation docs).
+      final ce =
+          (ceRaw == null || !ceRaw.isFinite || ceRaw < 0) ? 25.0 : ceRaw;
+
+      // Bounded: unique callsigns under the prefix must not grow the
+      // map without limit between prunes.
+      if (_observations.containsKey(callsign) ||
+          _observations.length < maxObservations) {
+        _observations[callsign] = EmitterObservation(
+          callsign: callsign,
+          lat: lat,
+          lon: lon,
+          ce: ce,
+          time: time.toUtc(),
+          type: type,
+        );
+      }
+    }
+
+    // --- Platform path (Skydio P1 friendly platforms).
+    final matcher = platformMatcher;
+    if (matcher != null &&
+        (type.startsWith('a-f-A') || matcher(callsign, uid, type))) {
+      _handlePlatform(xml, event, point,
+          callsign: callsign, uid: uid, type: type,
+          lat: lat, lon: lon, time: time.toUtc());
+    }
+  }
+
+  void _handlePlatform(
+    String xml,
+    Map<String, String> event,
+    Map<String, String> point, {
+    required String callsign,
+    required String uid,
+    required String type,
+    required double lat,
+    required double lon,
+    required DateTime time,
+  }) {
+    final key = uid.isNotEmpty ? uid : callsign;
+    if (key.isEmpty) return;
+    if (!_platforms.containsKey(key) &&
+        _platforms.length >= maxObservations) {
       return;
     }
-    _observations[callsign] = EmitterObservation(
+    // hae: CoT uses 999999.0 as the unknown sentinel; only plausible
+    // altitudes are kept, absence stays null (never zero-filled).
+    final haeRaw = double.tryParse(point['hae'] ?? '');
+    final hae = (haeRaw != null && haeRaw.isFinite && haeRaw.abs() < 100000)
+        ? haeRaw
+        : null;
+    final track = _tagAttrs(xml, 'track');
+    final courseRaw =
+        track == null ? null : double.tryParse(track['course'] ?? '');
+    final course = (courseRaw != null &&
+            courseRaw.isFinite &&
+            courseRaw >= 0 &&
+            courseRaw <= 360)
+        ? courseRaw
+        : null;
+    final speedRaw =
+        track == null ? null : double.tryParse(track['speed'] ?? '');
+    final speed =
+        (speedRaw != null && speedRaw.isFinite && speedRaw >= 0)
+            ? speedRaw
+            : null;
+    final status = _tagAttrs(xml, 'status');
+    final battRaw =
+        status == null ? null : double.tryParse(status['battery'] ?? '');
+    double? battery;
+    if (battRaw != null && battRaw.isFinite) {
+      // ATAK convention is integer percent 0..100. A non-integer
+      // value strictly inside (0,1) can only be a fraction — read it
+      // as one; 0 and 1 stay percent (documented ambiguity).
+      battery = (battRaw > 0 && battRaw < 1)
+          ? (battRaw * 100).clamp(0.0, 100.0)
+          : battRaw.clamp(0.0, 100.0);
+    }
+    _platforms[key] = PlatformObservation(
+      uid: key,
       callsign: callsign,
+      type: type,
       lat: lat,
       lon: lon,
-      ce: ce,
-      time: time.toUtc(),
-      type: event['type'] ?? '',
+      time: time,
+      haeM: hae,
+      courseDeg: course,
+      speedMps: speed,
+      batteryPct: battery,
     );
   }
 
@@ -272,6 +415,7 @@ class CotListener {
   void _prune(DateTime now) {
     final cutoff = now.subtract(Duration(seconds: config.windowSeconds));
     _observations.removeWhere((_, o) => o.time.isBefore(cutoff));
+    _platforms.removeWhere((_, o) => o.time.isBefore(cutoff));
   }
 
   /// Amortized prune: datagrams can arrive at high rate and each
@@ -294,6 +438,14 @@ class CotListener {
   List<EmitterObservation> get activeEmitters {
     _maybePrune(DateTime.now().toUtc());
     return List.unmodifiable(_observations.values);
+  }
+
+  /// Fresh friendly-platform observations (pruned to the window),
+  /// for the airframe classifier and the Drone tab. Empty unless a
+  /// platform matcher was supplied at construction.
+  List<PlatformObservation> get platformObservations {
+    _maybePrune(DateTime.now().toUtc());
+    return List.unmodifiable(_platforms.values);
   }
 
   /// Dashboard "N emitters tracked" count: fresh observations that are
@@ -445,5 +597,8 @@ class CotListener {
   }
 
   /// Clear all held observations (for tests / operator reset).
-  void clear() => _observations.clear();
+  void clear() {
+    _observations.clear();
+    _platforms.clear();
+  }
 }
