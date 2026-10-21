@@ -153,15 +153,24 @@ class TrackPosition {
   final double lon;
 }
 
+/// Domain of a platform observation, from its CoT type: friendly
+/// GROUND (`a-f-G*` — a dismount's PLI out of an ATAK EUD, the
+/// PRC-163 path, v0.23.0) vs AIR (everything else the platform path
+/// accepts). Derived from the type string at read time — the type
+/// IS the source of truth, so domain and type can never disagree.
+enum PlatformDomain { air, ground }
+
 /// One inbound FRIENDLY PLATFORM observation from a CoT event
-/// (Skydio integration P1: his X10Ds arrive as controller CoT).
+/// (Skydio integration P1: his X10Ds arrive as controller CoT;
+/// v0.23.0: his dismounts arrive the same way, as `a-f-G*` PLI).
 ///
 /// This is a separate collection from [EmitterObservation] with a
 /// separate contract: emitter observations are corroboration-only
 /// and never originate anything; platform observations ARE the
-/// platform's own cooperative self-report (position node evidence,
-/// Class B) and render as friendly platforms. They never feed the
-/// confidence merger and never corroborate or suppress a track.
+/// platform's own cooperative self-report (air: position node
+/// evidence, Class B; ground: a friendly track position) and render
+/// as friendly platforms. They never feed the confidence merger and
+/// never corroborate or suppress a track.
 class PlatformObservation {
   const PlatformObservation({
     required this.uid,
@@ -180,8 +189,15 @@ class PlatformObservation {
   final String uid;
   final String callsign;
 
-  /// CoT type string, e.g. `a-f-A` (friendly air).
+  /// CoT type string, e.g. `a-f-A` (friendly air) or `a-f-G-U-C`
+  /// (friendly ground unit).
   final String type;
+
+  /// Ground vs air, derived from [type] (see [PlatformDomain]).
+  PlatformDomain get domain =>
+      type.startsWith('a-f-G') ? PlatformDomain.ground : PlatformDomain.air;
+
+  bool get isGround => domain == PlatformDomain.ground;
   final double lat;
   final double lon;
   final DateTime time; // UTC, from the event's time attribute
@@ -337,10 +353,17 @@ class CotListener {
       }
     }
 
-    // --- Platform path (Skydio P1 friendly platforms).
+    // --- Platform path (Skydio P1 friendly platforms; v0.23.0
+    // adds friendly GROUND: `a-f-G*` PLI events — a PRC-163
+    // carrier's position out of an EUD — enter by type exactly as
+    // `a-f-A*` does. The domain is read off the type downstream
+    // ([PlatformObservation.domain]), so ground events can never
+    // be mistaken for airframes by this collection's consumers.
     final matcher = platformMatcher;
     if (matcher != null &&
-        (type.startsWith('a-f-A') || matcher(callsign, uid, type))) {
+        (type.startsWith('a-f-A') ||
+            type.startsWith('a-f-G') ||
+            matcher(callsign, uid, type))) {
       _handlePlatform(xml, event, point,
           callsign: callsign, uid: uid, type: type,
           lat: lat, lon: lon, time: time.toUtc());
@@ -441,8 +464,10 @@ class CotListener {
   }
 
   /// Fresh friendly-platform observations (pruned to the window),
-  /// for the airframe classifier and the Drone tab. Empty unless a
-  /// platform matcher was supplied at construction.
+  /// for the identity classifier (air + ground records). The Drone
+  /// tab reads only the classifier's AIR records — ground
+  /// observations can never reach it. Empty unless a platform
+  /// matcher was supplied at construction.
   List<PlatformObservation> get platformObservations {
     _maybePrune(DateTime.now().toUtc());
     return List.unmodifiable(_platforms.values);
