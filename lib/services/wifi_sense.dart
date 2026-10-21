@@ -521,6 +521,15 @@ class WifiVisionService {
   Timer? _timer;
   int _tick = 0;
 
+  /// True while a poll is awaiting its source. A slow adapter call
+  /// (netsh, Android scan) must not be overlapped by the next 1 s tick.
+  bool _polling = false;
+
+  /// Bumped by [stop]/[start]; an in-flight poll from an older
+  /// generation drops its result instead of repopulating a cleared
+  /// (or restarted) service.
+  int _gen = 0;
+
   /// Latest reading per known AP — merged across polls, not replaced,
   /// so the field view stays populated between 20 s neighbor surveys.
   final List<WifiApReading> readings = [];
@@ -547,6 +556,17 @@ class WifiVisionService {
     if (v != _dipThresholdDb) {
       _dipThresholdDb = v;
       _baselines.clear();
+      // Fresh baselines never report `was == true`, so a crossing that
+      // was open under the old threshold would never close while its AP
+      // stays visible (DETECTED stuck on). Close them here.
+      final now = DateTime.now();
+      for (final done in activeCrossings.values) {
+        done.endTime = now;
+        crossings.insert(0, done);
+        if (crossings.length > 30) crossings.removeLast();
+      }
+      activeCrossings.clear();
+      disturbedBssids.clear();
     }
   }
   final List<double> connectedHistory = [];
@@ -665,6 +685,9 @@ class WifiVisionService {
   void stop() {
     _timer?.cancel();
     _timer = null;
+    _gen++;
+    _polling = false;
+    _tick = 0;
     readings.clear();
     disturbedBssids.clear();
     _registry.clear();
@@ -683,21 +706,30 @@ class WifiVisionService {
 
   Future<void> _poll() async {
     final src = _source;
-    if (src == null) return;
+    if (src == null || _polling) return;
+    _polling = true;
+    final gen = _gen;
     try {
       _tick++;
       final isSurvey = _tick % 20 == 1 && _tick > 1;
-      List<WifiApReading> fresh;
+      // The fast poll runs on EVERY tick, survey ticks included, so the
+      // connected AP never has a one-second hole and connection state
+      // is always judged from a fast result.
+      final fast = await src.pollFast();
+      if (gen != _gen) return;
+      ingest(fast, survey: false);
       if (isSurvey) {
         // Slow neighbor survey every ~20 s.
-        fresh = await src.pollSurvey();
-      } else {
-        fresh = await src.pollFast();
+        final survey = await src.pollSurvey();
+        if (gen != _gen) return;
+        ingest(survey, survey: true);
       }
-      ingest(fresh, survey: isSurvey);
       error = null;
     } catch (e) {
-      error = e.toString();
+      if (gen != _gen) return;
+      error = e is StateError ? e.message : e.toString();
+    } finally {
+      if (gen == _gen) _polling = false;
     }
     onUpdate?.call();
   }
@@ -709,8 +741,28 @@ class WifiVisionService {
   /// streak that would take 40 s to form.
   void ingest(List<WifiApReading> fresh, {bool survey = false}) {
     final now = DateTime.now();
-    for (final r in fresh) {
-      _registry[r.bssid] = _ApEntry(r, now);
+    for (final raw in fresh) {
+      // A fast poll carries no capabilities and may carry a redacted
+      // SSID; keep what an earlier survey learned instead of wiping it.
+      var r = raw;
+      final prev = _registry[raw.bssid]?.reading;
+      if (prev != null) {
+        final needAuth = raw.auth.isEmpty && prev.auth.isNotEmpty;
+        final needSsid = (raw.ssid == '(unknown)' || raw.ssid == '(hidden)') &&
+            prev.ssid != '(unknown)' &&
+            prev.ssid != '(hidden)';
+        if (needAuth || needSsid) {
+          r = WifiApReading(
+            ssid: needSsid ? prev.ssid : raw.ssid,
+            bssid: raw.bssid,
+            rssiDbm: raw.rssiDbm,
+            isConnected: raw.isConnected,
+            auth: needAuth ? prev.auth : raw.auth,
+            cipher: needAuth ? prev.cipher : raw.cipher,
+          );
+        }
+      }
+      _registry[raw.bssid] = _ApEntry(r, now);
     }
     _registry.removeWhere(
         (k, v) => now.difference(v.lastSeen) > apMaxAge);
@@ -745,6 +797,11 @@ class WifiVisionService {
       final b = _baselines.putIfAbsent(
           r.bssid, () => _WifiBaseline(dipThresholdDb: dipThresholdDb));
       final was = b.disturbed;
+      // The connected AP is sampled at 1 Hz by the fast poll. Its
+      // scan-cache RSSI is a different (older, averaged) measurement;
+      // mixing it in injects a periodic offset and, via the survey
+      // "one solid sample confirms" rule, false disturbances.
+      if (survey && r.isConnected) continue;
       b.add(r.rssiDbm, survey: survey);
       if (b.disturbed) {
         disturbedBssids.add(r.bssid);
