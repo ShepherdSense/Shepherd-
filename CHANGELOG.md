@@ -1,5 +1,60 @@
 # Changelog
 
+## v0.21.3 — 2026-10-21 — Review-fixes merge (Hermes pass, reviewed + applied)
+
+An externally-authored hardening/correctness pass over the
+unauthenticated inputs and stuck-state bugs, reviewed on the merits,
+independently re-reviewed, and applied with the reviewer's four
+should-fixes addressed. 356/356 tests (32 new). Highlights:
+
+- **Node UDP hub**: 16 KB datagram cap, 2000/s flood guard, optional
+  source allowlist, UTF-8 decode (was garbling non-ASCII names),
+  socket-death recovery, and truthful `lastError`/`isBound` — both
+  passive drivers' `probe()` now reports a failed bind as unhealthy.
+- **Wi-Fi sensing**: surveys no longer feed the connected AP's
+  baseline; connection state judged only from fast polls (empty
+  surveys fabricated disconnect flaps → false deauth alerts);
+  auto-trust requires a 3-survey dwell on one BSSID, with an
+  auth-match gate for extra BSSIDs of a trusted SSID.
+- **Pairing**: WireGuard conf builder rejects newline injection in
+  hub-supplied keys/endpoints; AllowedIPs follows the assigned
+  tunnel /24 (was hard-coded 10.99.0.0/24); public-CA mode keeps
+  the ingest bearer token on the invite hub's domain family;
+  redeem body size-bounded; copied conf auto-clears from the
+  clipboard after 60 s (it carries a private key); token persisted
+  only after all join validations pass.
+- **Tripwire**: closed episodes report true duration/peak and events
+  are reclassified on the full episode; stale links swept after
+  10 min; `confirmPolls: 0` can no longer disable all events.
+- **CoT listener**: single-quoted attributes parse; far-future
+  events rejected (30 s skew); observations capped at 256;
+  optional source allowlist.
+- **ESP32 driver**: datagram hardening (object-only JSON, ID
+  charset/length caps, node/sensor/active caps, coordinate
+  validation — lat 0 alone is now kept, only the (0,0) no-fix pair
+  is rejected).
+- **Trusted sender IPs** setting gates both UDP inputs (node 49160
+  + CoT), applied at boot as well as on save (reviewer fix).
+- **Android**: FINE+COARSE requested together (Android 12+ ignores
+  FINE alone); permission latch re-arms after an answer; redacted
+  connected-BSSID placeholder never marks scan entries connected;
+  backups disabled; optional release signing via key.properties.
+- **Reviewer fixes on top**: calib flag accepts the firmware's
+  integer 0/1 (was never readable as a JSON bool); ingest token
+  cache also invalidates on 403 and on settings save; the stale-link
+  sweep closes open episodes instead of discarding them.
+- CI workflow (analyze + test) added for the repo.
+- **Wi-Fi RTT ranging fixed** (field report, same day): every RANGE
+  tap failed with `NO_MATCHING_AP` — the wifi_ftm plugin matches
+  targets against a scan cache only its own scan call populates,
+  and the app never scanned. The service now scans first and ranges
+  only APs present in that scan (the scan's verbatim BSSID strings;
+  stale registry entries dropped), and failures surface as plain
+  operator copy — "not in the latest scan" is now distinguishable
+  from "AP doesn't answer FTM", and no raw exception reaches the UI.
+  Regression-locked with a mock-channel test that emulates the
+  plugin's native cache.
+
 ## v0.21.2 — 2026-10-21 — Wi-Fi DETECTED headline size fix
 
 - **Wi-Fi status headline no longer wraps mid-word** (field report:
