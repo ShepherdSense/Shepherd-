@@ -195,27 +195,34 @@ void main() {
       WifiApReading fromMap(Map<String, dynamic> m) =>
           AndroidWifiSource.readingFromMap(m,
               connected: m['connected'] == true)!;
-      svc.ingest([
-        fromMap({
-          'ssid': 'HOME-NET',
-          'bssid': 'AA:BB:CC:DD:EE:01',
-          'rssi': -57,
-          'capabilities': '[WPA2-PSK-CCMP][ESS]',
-          'connected': true,
-          'tsMs': 1000,
-        }),
-        fromMap({
-          'ssid': 'Neighbor',
-          'bssid': 'aa:bb:cc:dd:ee:02',
-          'rssi': -80,
-          'capabilities': '[ESS]',
-          'connected': false,
-          'tsMs': 1000,
-        }),
-      ], survey: true);
+      void survey() => svc.ingest([
+            fromMap({
+              'ssid': 'HOME-NET',
+              'bssid': 'AA:BB:CC:DD:EE:01',
+              'rssi': -57,
+              'capabilities': '[WPA2-PSK-CCMP][ESS]',
+              'connected': true,
+              'tsMs': 1000,
+            }),
+            fromMap({
+              'ssid': 'Neighbor',
+              'bssid': 'aa:bb:cc:dd:ee:02',
+              'rssi': -80,
+              'capabilities': '[ESS]',
+              'connected': false,
+              'tsMs': 1000,
+            }),
+          ], survey: true);
+      survey();
       expect(svc.readings, hasLength(2));
-      // One batch, one connected sample — never double-fed.
-      expect(svc.connectedHistory, [-57.0]);
+      // Survey batches never feed the connected AP's 1 Hz history (the
+      // fast poll owns it), so a survey alone leaves it empty.
+      expect(svc.connectedHistory, isEmpty);
+      // Auto-trust needs a dwell: one survey is not enough...
+      expect(svc.threats.trustedAuth['HOME-NET'], isNull);
+      survey();
+      survey();
+      // ...three surveys associated to the same BSSID learn the real label.
       expect(svc.threats.trustedAuth['HOME-NET'], 'wpa2-personal/ccmp');
     });
   });
@@ -235,6 +242,61 @@ void main() {
           AndroidWifiSource.authCipherFromCapabilities('[WPA-PSK-TKIP][ESS]'),
           ('WPA-Personal', 'TKIP'));
       expect(AndroidWifiSource.authCipherFromCapabilities(''), ('Open', ''));
+    });
+  });
+
+  group('review fixes', () {
+    WifiApReading ap(String bssid, double rssi,
+            {bool connected = false, String ssid = 'HOME-NET'}) =>
+        WifiApReading(
+            ssid: ssid,
+            bssid: bssid,
+            rssiDbm: rssi,
+            isConnected: connected,
+            auth: 'WPA2-Personal',
+            cipher: 'CCMP');
+
+    test('empty survey batches never count as disconnects', () {
+      SharedPreferences.setMockInitialValues({});
+      final svc = WifiVisionService();
+      svc.ingest([ap('aa:00:00:00:00:01', -50, connected: true)]);
+      for (var i = 0; i < 10; i++) {
+        svc.ingest(const [], survey: true); // throttled survey
+        svc.ingest([ap('aa:00:00:00:00:01', -50, connected: true)]);
+      }
+      expect(svc.threats.bursts, isEmpty);
+    });
+
+    test('changing sensitivity closes open crossings', () {
+      SharedPreferences.setMockInitialValues({});
+      final svc = WifiVisionService();
+      for (var i = 0; i < 12; i++) {
+        svc.ingest([ap('aa:00:00:00:00:01', -50, connected: true)]);
+      }
+      for (var i = 0; i < 3; i++) {
+        svc.ingest([ap('aa:00:00:00:00:01', -75, connected: true)]);
+      }
+      expect(svc.wifiDetected, isTrue);
+      svc.dipThresholdDb = 9.0;
+      expect(svc.wifiDetected, isFalse);
+      expect(svc.disturbedBssids, isEmpty);
+    });
+
+    test('fast poll keeps the auth label a survey learned', () {
+      SharedPreferences.setMockInitialValues({});
+      final svc = WifiVisionService();
+      svc.ingest([ap('aa:00:00:00:00:01', -50, connected: true)],
+          survey: true);
+      svc.ingest([
+        WifiApReading(
+            ssid: '(unknown)',
+            bssid: 'aa:00:00:00:00:01',
+            rssiDbm: -51,
+            isConnected: true)
+      ]);
+      final r = svc.readings.single;
+      expect(r.auth, 'WPA2-Personal');
+      expect(r.ssid, 'HOME-NET');
     });
   });
 }
