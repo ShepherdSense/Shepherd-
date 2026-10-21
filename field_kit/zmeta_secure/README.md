@@ -31,7 +31,11 @@ The tunnel is the encryption.
 4. The operator replies with: your tunnel IP (e.g. `10.99.0.11`), the
    gateway's public key, and the gateway's public `host:port`.
 5. Copy `shepherd-mesh.conf.example` → `shepherd-mesh.conf`, fill in
-   the 4 values, import into WireGuard, Activate.
+   the 4 values, import into WireGuard, Activate. For an EUD instead
+   of a PC: double-click `MAKE_TUNNEL_QR.bat` and scan the QR with
+   the phone's WireGuard app (+ → Scan from QR code) — the tunnel
+   imports directly, no file to copy. The QR contains the private
+   key; treat it like the key itself.
 6. In Shepherd → Settings → ZMeta export: set host to the gateway's
    **tunnel** address (`10.99.0.1`), port `5555`, and your unique
    Platform ID (e.g. `shepherd-mesh-a` — must match the PEERS registry).
