@@ -65,6 +65,46 @@ class ZMetaHttpsEmitter {
   int dropped = 0;
   int _consecutive401 = 0;
 
+  /// Most sends allowed in flight at once. Beyond this an event is
+  /// dropped (counted) instead of queueing without bound behind a dead
+  /// hub — each send can hold ~30 s of timeouts.
+  static const int maxInFlight = 32;
+  int _inFlight = 0;
+
+  /// In-memory token cache: the keystore read is slow and was paid per
+  /// event, with a 5 s timeout that could stall every send. Re-read
+  /// after [_tokenTtl], and immediately after any 401 (so a re-joined
+  /// token is picked up without a restart).
+  static const Duration _tokenTtl = Duration(seconds: 30);
+  String? _cachedToken;
+  DateTime? _cachedAt;
+
+  /// Forget the cached token (call after a re-join).
+  void invalidateToken() {
+    _cachedToken = null;
+    _cachedAt = null;
+  }
+
+  Future<String?> _token() async {
+    final at = _cachedAt;
+    if (_cachedToken != null &&
+        at != null &&
+        DateTime.now().difference(at) < _tokenTtl) {
+      return _cachedToken;
+    }
+    String? t;
+    try {
+      t = await tokenProvider().timeout(const Duration(seconds: 5));
+    } catch (_) {
+      t = null;
+    }
+    if (t != null && t.isNotEmpty) {
+      _cachedToken = t;
+      _cachedAt = DateTime.now();
+    }
+    return t;
+  }
+
   /// True once the hub has rejected the token [kIngestTokenRejectThreshold]
   /// times in a row — the settings screen tells the operator to re-join.
   /// Resets on any 2xx.
@@ -78,25 +118,36 @@ class ZMetaHttpsEmitter {
     // redeem used; Cloudflare mode (or unknown) uses system roots.
     if (RegExp(r'^[0-9a-f]{64}$').hasMatch(fpMode)) {
       final c = HttpClient(context: SecurityContext())
+        ..maxConnectionsPerHost = 4
         ..connectionTimeout = const Duration(seconds: 10);
       c.badCertificateCallback =
           (X509Certificate cert, String host, int port) =>
               zmetaFingerprintHex(cert) == fpMode;
       return c;
     }
-    return HttpClient()..connectionTimeout = const Duration(seconds: 10);
+    return HttpClient()
+      ..maxConnectionsPerHost = 4
+      ..connectionTimeout = const Duration(seconds: 10);
   }
 
   /// POSTs one event as JSON. Safe to call without awaiting; errors are
   /// swallowed and counted.
   Future<void> send(Map<String, dynamic> event) async {
     if (_closed) return;
-    String? token;
-    try {
-      token = await tokenProvider().timeout(const Duration(seconds: 5));
-    } catch (_) {
-      token = null;
+    if (_inFlight >= maxInFlight) {
+      dropped++;
+      return;
     }
+    _inFlight++;
+    try {
+      await _send(event);
+    } finally {
+      _inFlight--;
+    }
+  }
+
+  Future<void> _send(Map<String, dynamic> event) async {
+    final token = await _token();
     if (token == null || token.isEmpty) {
       dropped++;
       return;
@@ -106,6 +157,9 @@ class ZMetaHttpsEmitter {
       final req = await _client!
           .postUrl(Uri.parse(ingestUrl))
           .timeout(const Duration(seconds: 10));
+      // Never follow redirects with a bearer token attached: a redirect
+      // must not carry the credential to another host.
+      req.followRedirects = false;
       req.headers.contentType = ContentType.json;
       req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
       req.write(jsonEncode(event));
@@ -120,6 +174,13 @@ class ZMetaHttpsEmitter {
         dropped++;
         if (resp.statusCode == 401) {
           _consecutive401++;
+          invalidateToken();
+        } else if (resp.statusCode == 403) {
+          // A platform-binding rejection is also a credential problem:
+          // drop the cached token so a re-joined token is picked up on
+          // the next send instead of after the cache TTL (reviewer
+          // catch, 2026-10-21).
+          invalidateToken();
         }
       }
     } catch (_) {
