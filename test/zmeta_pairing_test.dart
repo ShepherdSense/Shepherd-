@@ -3,6 +3,9 @@ import 'dart:convert';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shepherd/services/zmeta_pairing.dart';
 
+final String _k1 = base64.encode(List<int>.filled(32, 1));
+final String _k2 = base64.encode(List<int>.filled(32, 2));
+
 String _code({
   String host = 'hub.example.com',
   String pairPort = '8443',
@@ -104,20 +107,69 @@ void main() {
   group('wg conf', () {
     test('builds exact config text', () {
       final conf = zmetaBuildWgConf(
-        privateKeyB64: 'PRIV',
+        privateKeyB64: _k1,
         tunnelIp: '10.99.0.11',
-        hubPubkey: 'HUBPUB',
+        hubPubkey: _k2,
         hubEndpoint: 'hub.example.com:51820',
       );
       expect(conf, '[Interface]\n'
-          'PrivateKey = PRIV\n'
+          'PrivateKey = $_k1\n'
           'Address = 10.99.0.11/32\n'
           '\n'
           '[Peer]\n'
-          'PublicKey = HUBPUB\n'
+          'PublicKey = $_k2\n'
           'Endpoint = hub.example.com:51820\n'
           'AllowedIPs = 10.99.0.0/24\n'
           'PersistentKeepalive = 25\n');
+    });
+  });
+
+  group('wg conf hardening', () {
+    String build({String? pub, String? ep, String ip = '10.99.0.11'}) =>
+        zmetaBuildWgConf(
+          privateKeyB64: _k1,
+          tunnelIp: ip,
+          hubPubkey: pub ?? _k2,
+          hubEndpoint: ep ?? 'hub.example.com:51820',
+        );
+
+    test('rejects newline injection in endpoint and key', () {
+      expect(
+          () => build(
+              ep: 'hub.example.com:51820\n[Peer]\nAllowedIPs = 0.0.0.0/0'),
+          throwsA(isA<ZmetaPairingException>()));
+      expect(() => build(pub: '$_k2\nPostUp = x'),
+          throwsA(isA<ZmetaPairingException>()));
+      expect(() => build(ep: 'host:99999'),
+          throwsA(isA<ZmetaPairingException>()));
+    });
+
+    test('AllowedIPs follows the assigned tunnel subnet', () {
+      expect(build(ip: '10.50.7.9'), contains('AllowedIPs = 10.50.7.0/24\n'));
+    });
+
+    test('accepts ipv6 endpoints', () {
+      expect(zmetaIsValidWgEndpoint('[2001:db8::1]:51820'), isTrue);
+      expect(zmetaIsValidWgEndpoint('no port'), isFalse);
+    });
+  });
+
+  group('ingest host policy', () {
+    test('public-CA mode keeps the token on the invite hub family', () {
+      expect(
+          zmetaIngestHostAllowed('hub.example.com', 'hub.example.com',
+              pinMode: false),
+          isTrue);
+      expect(
+          zmetaIngestHostAllowed('ingest.example.com', 'hub.example.com',
+              pinMode: false),
+          isTrue);
+      expect(
+          zmetaIngestHostAllowed('evil.test', 'hub.example.com',
+              pinMode: false),
+          isFalse);
+      expect(zmetaIngestHostAllowed('evil.test', 'hub.example.com',
+          pinMode: true), isTrue);
     });
   });
 
