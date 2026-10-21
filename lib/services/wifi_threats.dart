@@ -146,7 +146,12 @@ class WifiThreatDetector {
     required String? connectedBssid,
     required DateTime now,
   }) {
-    _ingestConnection(connectedBssid != null, now);
+    // Connection state is judged only from FAST polls. A survey batch
+    // can legitimately come back empty (Android throttles scans and the
+    // stale-cache guard drops the repeat) or omit the connected AP;
+    // reading that as "disconnected" fabricated flap pairs and, with
+    // 4 in 2 min, a false deauth-pattern alert.
+    if (!survey) _ingestConnection(connectedBssid != null, now);
     if (survey) _ingestSurvey(fresh, connectedBssid, now);
   }
 
@@ -196,11 +201,7 @@ class WifiThreatDetector {
       // The AP we chose to associate with is, by definition, the one we
       // trust for this SSID. Auto-learn it.
       if (connectedBssid != null && r.bssid == connectedBssid) {
-        final t = trusted.putIfAbsent(ssid, () => <String>{});
-        if (t.add(r.bssid)) {
-          trustedAuth[ssid] = _authLabel(r);
-          _persist();
-        }
+        _maybeAutoTrust(ssid, r);
       }
     }
     // Decay sightings for BSSIDs absent from this survey.
@@ -222,6 +223,36 @@ class WifiThreatDetector {
       }
     }
     _evaluateRogues(now);
+  }
+
+  /// Surveys the device must stay associated to the same BSSID before
+  /// it is auto-trusted (~1 min at the 20 s survey cadence). Trust on
+  /// first sight would bless an evil twin the phone happened to join.
+  static const int kAutoTrustSurveys = 3;
+  final Map<String, int> _connDwell = {};
+
+  void _maybeAutoTrust(String ssid, WifiApReading r) {
+    if (ssid == '(unknown)') return;
+    final known = trusted[ssid];
+    if (known != null && known.contains(r.bssid)) return;
+    // A second BSSID for an already-trusted SSID is only auto-learned
+    // when its security matches what we trust; a mismatch is exactly
+    // the evil-twin signature and needs an explicit trust() tap.
+    final refAuth = trustedAuth[ssid];
+    if (known != null && known.isNotEmpty && refAuth != null &&
+        _authLabel(r) != refAuth) {
+      return;
+    }
+    final k = '$ssid|${r.bssid}';
+    final n = (_connDwell[k] ?? 0) + 1;
+    _connDwell[k] = n;
+    if (n < kAutoTrustSurveys) return;
+    _connDwell.remove(k);
+    final t = trusted.putIfAbsent(ssid, () => <String>{});
+    if (t.add(r.bssid)) {
+      trustedAuth.putIfAbsent(ssid, () => _authLabel(r));
+      _persist();
+    }
   }
 
   void _evaluateRogues(DateTime now) {
@@ -287,6 +318,7 @@ class WifiThreatDetector {
     _sightings.clear();
     _rssiEma.clear();
     _authSeen.clear();
+    _connDwell.clear();
     _evented.clear();
     _flaps.clear();
     _wasConnected = false;
