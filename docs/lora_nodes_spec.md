@@ -48,14 +48,28 @@ them — ~$15 class) and needs real tripwire sensing at LoRa range.
 - `field_kit/esp32/lora_node/lora_node.ino` — ESP32 + SX1276. Senses
   with WiFi (promiscuous RSSI + MAD edge tripwire, same approach as the
   WiFi node); **LoRa is the backhaul, not the sensor**. Sends compact
-  binary packets: beacons (~20 B every 30 s) + events (~16–20 B,
-  immediate). Node IDs `SLN-XXXX`.
+  binary packets: beacons and events, 22 B each in codec v1, sent
+  every 30 s (beacons) or immediately (events). Node IDs `SLN-XXXX`.
 - `field_kit/esp32/lora_gateway/lora_gateway.ino` — ESP32 + SX1276.
   Hosts AP `Shepherd-LoRa-XXXX` (password `shepherd-field`); the
   Shepherd PC joins it. Decodes LoRa packets and re-emits byte-
   compatible UDP 49160 JSON beacons/events with the *original* node IDs,
   plus its own `SLG-XXXX` beacon, mDNS `_shepherd-node._udp`, and a
   status page of recently heard nodes.
+
+**Wire encryption (codec v2, PSK):** v1 put the node ID in plaintext
+in every packet header — the exact handle Aras et al. (MobiQuitous
+2017) used for ~€100 per-node selective jamming. Codec v2 wraps the
+v1 payload in AES-128-CCM under a per-deployment pre-shared key set
+once on each status page: 34 B on air (schema byte + nonce stay
+readable so the gateway's schema gate still fires before decryption;
+everything else, node ID included, is ciphertext + auth tag). The
+gateway decrypts after the gate and feeds the *unchanged* decode path,
+so app-visible JSON is byte-identical to v1. A device with no PSK set
+stays on v1 plaintext and says so loudly on its status page — there is
+no default key. Migration order: gateways first, then node keys.
+Full spec: `docs/lora_psk_codec_spec.md`; test vectors:
+`field_kit/esp32/tests/`.
 
 **App side:** `lib/services/esp32_driver.dart` (driverId `esp32`) is a
 passive UDP-49160 listener. It reconstructs each sensor's disturbance
@@ -70,8 +84,9 @@ no config: add radio → ESP32 NODE → it listens.
 meters in clutter/urban. Higher spreading factor = more range, less
 duty-cycle headroom. See the sketch headers for the full table.
 
-**Bandwidth (honest):** beacons 30 s cadence (~40 ms airtime each — far
-under 1% duty cycle where regulated); events are rare and immediate.
+**Bandwidth (honest):** beacons 30 s cadence (~57 ms airtime each in
+v1, ~77 ms in v2-PSK — far under 1% duty cycle where regulated);
+events are rare and immediate.
 This link carries detections only: no firmware updates, no streaming,
 no mesh LoRa-to-LoRa (star to the gateway).
 
