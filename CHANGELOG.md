@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.23.1 — 2026-10-21 — New app icon
+
+Icon-only release: no code or behavior changes.
+
+- **New launcher icon.** A photorealistic black tricolor
+  Australian shepherd wearing an olive Comtac headset with
+  boom mic on a dark background — chosen by the operator from
+  his own photo. Regenerated across the full set from that
+  photo: `assets/icon/shepherd_icon_1024.png` master, all five
+  Android mipmap densities (`ic_launcher.png`), and the
+  Windows `app_icon.ico`.
+- Replaces the v0.22.0 icon, which is backed up at
+  `docs/shepherd_icon_v0220_backup.png`.
+
 ## v0.23.0 — 2026-10-21 — PRC-163 friendly ground tracks (published)
 
 Friendly GROUND tracks per `docs/prc163_ground_tracks_spec.md`:
