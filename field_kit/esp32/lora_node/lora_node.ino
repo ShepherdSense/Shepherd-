@@ -60,10 +60,33 @@
  * A second schema version will bump byte [0]; the gateway drops any
  * packet whose schema it does not understand instead of mis-decoding it.
  *
+ * Codec v2 — PSK wrap (schema byte = 2), full spec in
+ * docs/lora_psk_codec_spec.md. v1 put the node ID in PLAINTEXT at
+ * bytes [2-3] of every packet; Aras et al. (MobiQuitous 2017) showed
+ * that is exactly the handle needed for ~EUR100 per-node selective
+ * jamming. When a deployment PSK is set (status page, see below), the
+ * v1 payload bytes [1-21] are AES-128-CCM encrypted under that key:
+ *
+ * WIRE packet — 34 bytes (0x02):
+ *   [0]     schema version = 2 (PLAINTEXT — the gateway's schema gate
+ *           must fire before any decryption; also the CCM AAD)
+ *   [1-8]   nonce: boot_ctr uint32 || frame_ctr uint32 (big-endian,
+ *           plaintext — nonces are unique, not secret; boot_ctr is
+ *           persisted in Preferences and bumped once per boot,
+ *           frame_ctr is a RAM counter bumped per packet)
+ *   [9-29]  ciphertext: CCM of v1 bytes [1-21] (type + all fields)
+ *   [30-33] CCM tag (4 bytes — wrong key or any tamper => the gateway
+ *           drops the packet; unauthenticated modes cannot do that)
+ *
+ * No PSK set => this node transmits legacy v1 plaintext and says so
+ * loudly (Serial banner + status page). There is NO default key.
+ *
  * Duty-cycle math (why a 30 s beacon cadence is polite):
  *   SF7 / 125 kHz / CR 4/5, 22-byte payload => ~57 ms airtime.
  *   One beacon per 30 s = 0.19% duty cycle — far under the 1% EU868
- *   limit and a rounding error under US915. Events add ~57 ms each and
+ *   limit and a rounding error under US915. With a PSK set the wire
+ *   packet is 34 bytes => ~77 ms => 0.257% duty cycle — same story.
+ *   Events add one packet's airtime each and
  *   are rare by design (a tripwire that fires constantly is broken).
  *   Higher SF = more range, much more airtime: SF12 would be ~1.3 s per
  *   packet, which blows the EU 1% budget at this cadence — if you raise
@@ -82,6 +105,9 @@
  *
  * Flash-once defaults: AP "Shepherd-SLN-XXXX", password "shepherd-field",
  * WiFi channel 6, status page at 192.168.4.1. No serial config needed.
+ * The deployment LoRa PSK (32 hex chars, same on every node + the
+ * gateway) is set on that status page under "LoRa security" and stored
+ * in Preferences; generate one with `openssl rand -hex 16`.
  */
 
 #include <WiFi.h>
@@ -91,6 +117,10 @@
 #include <SPI.h>
 #include <esp_wifi.h>
 #include <RadioLib.h>
+#include <lora_psk_codec.h>  // codec v2 wrap — SHARED with the gateway
+                               // (esp32/shepherd_lora_psk library; see
+                               // docs/lora_psk_codec_spec.md)
+#include "mbedtls/md.h"    // SHA-256 for the displayed key ID only
 
 // ---------------- region / frequency ----------------
 #if defined(LORA_REGION_EU868)
@@ -124,6 +154,11 @@
 #define PKT_EVENT      0x02
 #define PKT_BEACON_LEN 22
 #define PKT_EVENT_LEN  22
+
+// Codec v2 (PSK wrap) — the wire constants and the wrap/unwrap codec
+// live in the SHARED header <lora_psk_codec.h> (esp32/shepherd_lora_psk
+// library), used by this node and the gateway so the two can never
+// drift apart on the wire format. See docs/lora_psk_codec_spec.md.
 
 enum EvClass : uint8_t { CLS_UNKNOWN = 0, CLS_PASSING = 1, CLS_LINGERING = 2 };
 enum SensorId : uint8_t { SEN_WIFI = 0 };
@@ -165,6 +200,53 @@ static void encodeEvent(uint8_t *p, uint16_t suffix, uint32_t t0,
   uint32_t cf = (uint32_t)roundf(conf * 100.0f);
   p[20] = cf > 100 ? 100 : (uint8_t)cf;
   p[21] = sensor;
+}
+
+// ---------------- codec v2: PSK state + wrap ----------------
+// pskSet == false is a first-class, LOUD state (legacy v1 plaintext),
+// never a silent fallback to a default key — there is no default key.
+static uint8_t  pskKey[16];
+static bool     pskSet = false;
+static char     pskKeyId[5] = "----";   // first 2 B of SHA-256(key), hex
+static uint32_t bootCtr = 0;            // persisted, +1 per boot
+static uint32_t frameCtr = 0;           // RAM only, +1 per packet
+static bool     bootCtrOk = true;       // boot_ctr NVS write verified
+static uint32_t pskClearRefused = 0;    // /pskclear attempts refused
+static bool     apPassDefault = true;   // ap_pass still the public default
+
+static bool parseHexKey(const String &s, uint8_t out[16]) {
+  if (s.length() != 32) return false;
+  for (int i = 0; i < 16; i++) {
+    auto hv = [](char c) -> int {
+      if (c >= '0' && c <= '9') return c - '0';
+      if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+      if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+      return -1;
+    };
+    int hi = hv(s[2 * i]), lo = hv(s[2 * i + 1]);
+    if (hi < 0 || lo < 0) return false;
+    out[i] = (uint8_t)((hi << 4) | lo);
+  }
+  return true;
+}
+
+static void computeKeyId() {
+  const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  uint8_t digest[32];
+  if (info && mbedtls_md(info, pskKey, 16, digest) == 0)
+    snprintf(pskKeyId, sizeof(pskKeyId), "%02X%02X", digest[0], digest[1]);
+}
+
+// Encrypt a complete 22-byte v1 packet into its 34-byte v2 wire form,
+// via the SHARED codec (shepherd_psk::wrap — same code the gateway's
+// unwrap and the host C++ test use). The sketch owns the counters:
+// frameCtr advances ONLY on success, so a failed wrap never burns a
+// nonce. Returns false (packet must NOT be sent) on crypto failure.
+static bool wrapPsk(const uint8_t *plain22, uint8_t *wire) {
+  if (!shepherd_psk::wrap(pskKey, bootCtr, frameCtr, plain22, wire))
+    return false;
+  frameCtr++;
+  return true;
 }
 
 // ---------------- globals ----------------
@@ -345,39 +427,189 @@ void loraTx(const uint8_t *p, size_t len) {
   if (st == RADIOLIB_ERR_NONE) txOk++; else txErr++;
   Serial.printf("LoRa TX %u B -> %d\n", (unsigned)len, st);
 }
+// Every codec packet (beacon and event are both 22 B in v1) goes out
+// through here: PSK set => 34 B encrypted v2 wire form; no PSK =>
+// legacy v1 plaintext, exactly as before. A crypto failure drops the
+// packet rather than ever sending it half-wrapped.
+void txCodec(const uint8_t *plain22) {
+  if (!pskSet) { loraTx(plain22, PKT_BEACON_LEN); return; }
+  if (!bootCtrOk) {
+    // boot_ctr could not be verified in NVS (setup) — transmitting
+    // now could reuse a (key, nonce) pair from a previous boot, which
+    // breaks CCM outright. Refuse: drop, count, stay loud. NEVER fall
+    // back to plaintext instead (no silent downgrade).
+    txErr++;
+    Serial.println("LoRa TX REFUSED: boot_ctr unverified (nonce-reuse risk)");
+    return;
+  }
+  uint8_t wire[shepherd_psk::WIRE_LEN];
+  if (wrapPsk(plain22, wire)) loraTx(wire, sizeof(wire));
+  else { txErr++; Serial.println("PSK wrap FAILED — packet not sent"); }
+}
 void sendLoraBeacon() {
   uint8_t p[PKT_BEACON_LEN];
   uint8_t flags = (gpsFix ? 0x01 : 0) | (ppsSeen > 0 ? 0x02 : 0);
   encodeBeacon(p, nodeSuffix, (millis() - bootMs) / 1000, (uint16_t)eventCount,
                gpsLat, gpsLon, flags, 1000 / (int)SAMPLE_MS, 0);
-  loraTx(p, sizeof(p));
+  txCodec(p);
 }
 void sendLoraEvent(uint32_t t0, uint64_t tUs, float durS, float depthDb,
                    uint8_t cls, float conf) {
   uint8_t p[PKT_EVENT_LEN];
   encodeEvent(p, nodeSuffix, t0, tUs, durS, depthDb, cls, conf, SEN_WIFI);
-  loraTx(p, sizeof(p));
+  txCodec(p);
 }
 
 // ---------------- status page ----------------
+void handlePskSave() {
+  String k = server.arg("k"); k.trim();
+  uint8_t tmp[16];
+  if (!parseHexKey(k, tmp)) {
+    server.send(400, "text/html",
+      "<html><body style='background:#111;color:#f87171;font-family:sans-serif;padding:24px'>"
+      "PSK must be exactly 32 hex characters. <a href=/ style='color:#a855f7'>Back</a></body></html>");
+    return;
+  }
+  prefs.putString("psk_hex", k);
+  server.send(200, "text/html",
+    "<html><body style='background:#111;color:#c9a7eb;font-family:sans-serif;padding:24px'>"
+    "PSK saved. <b>Reboot the node</b> to start encrypted TX, and set the SAME "
+    "key on the gateway. <a href=/ style='color:#a855f7'>Back</a></body></html>");
+}
+// Clearing the PSK downgrades this node's wire to plaintext, so
+// reaching this page is not enough (the AP password is a public
+// default): the operator must type the currently displayed key ID
+// into the confirmation field. A wrong or absent confirmation is
+// refused, counted, and logged — the key stays set.
+static bool confirmMatchesKeyId() {
+  String c = server.arg("confirm"); c.trim(); c.toUpperCase();
+  return pskSet && c.length() > 0 && c == String(pskKeyId);
+}
+
+void handlePskClear() {
+  if (!pskSet) {
+    server.send(200, "text/html",
+      "<html><body style='background:#111;color:#c9a7eb;font-family:sans-serif;padding:24px'>"
+      "No PSK is set on this node — nothing to clear. "
+      "<a href=/ style='color:#a855f7'>Back</a></body></html>");
+    return;
+  }
+  if (!confirmMatchesKeyId()) {
+    pskClearRefused++;
+    Serial.printf("PSK clear REFUSED (bad key-ID confirmation) — refusals: %lu\n",
+                  (unsigned long)pskClearRefused);
+    server.send(403, "text/html",
+      "<html><body style='background:#111;color:#f87171;font-family:sans-serif;padding:24px'>"
+      "Clear REFUSED: type the key ID shown on the status page into the "
+      "confirmation box, exactly as displayed. The PSK was NOT cleared. "
+      "<a href=/ style='color:#a855f7'>Back</a></body></html>");
+    return;
+  }
+  Serial.println("PSK cleared by operator (key-ID confirmation matched)");
+  prefs.remove("psk_hex");
+  server.send(200, "text/html",
+    "<html><body style='background:#111;color:#c9a7eb;font-family:sans-serif;padding:24px'>"
+    "PSK cleared. Reboot the node — it returns to PLAINTEXT codec v1. "
+    "<a href=/ style='color:#a855f7'>Back</a></body></html>");
+}
+
+// AP password change. ap_pass lives in Preferences and is read once
+// at boot (setup), so a change takes effect on reboot — the page says
+// so, plainly. The submitted value is only stored: never echoed into
+// a response, never printed on Serial, never shown on the status page
+// (the page reports only "public DEFAULT in use" vs "custom set").
+void handleApPassSave() {
+  String p = server.arg("ap");
+  if (p.length() < 8 || p.length() > 63) {
+    server.send(400, "text/html",
+      "<html><body style='background:#111;color:#f87171;font-family:sans-serif;padding:24px'>"
+      "AP password must be 8-63 characters (the WPA2 rule). Nothing was "
+      "saved. <a href=/ style='color:#a855f7'>Back</a></body></html>");
+    return;
+  }
+  prefs.putString("ap_pass", p);
+  Serial.println("AP password changed by operator (takes effect on reboot)");
+  server.send(200, "text/html",
+    "<html><body style='background:#111;color:#c9a7eb;font-family:sans-serif;padding:24px'>"
+    "AP password saved. It takes effect on <b>reboot</b> — after rebooting "
+    "you will need to rejoin this AP with the new password. "
+    "<a href=/ style='color:#a855f7'>Back</a></body></html>");
+}
+
 void handleRoot() {
-  char html[1400];
+  char html[3200];
   snprintf(html, sizeof(html),
     "<html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
     "<style>body{background:#111;color:#c9a7eb;font-family:sans-serif;padding:24px}"
-    "h1{color:#a855f7}.card{background:#1c1c22;padding:16px;border-radius:12px;margin:12px 0}</style>"
+    "h1{color:#a855f7}.card{background:#1c1c22;padding:16px;border-radius:12px;margin:12px 0}"
+    ".warn{color:#f87171;font-weight:bold}"
+    "input{background:#222;color:#eee;border:1px solid #444;padding:6px;width:280px}"
+    "button{background:#7c3aed;color:#fff;border:0;padding:6px 14px;border-radius:6px}</style>"
     "</head><body><h1>Shepherd LoRa Node %s</h1>"
     "<div class=card>LoRa %.1f MHz SF7/125kHz — backhaul only, star to gateway<br>"
     "Uptime %lu s &nbsp; Packets seen %lu<br>LoRa TX ok %lu err %lu &nbsp; Events %lu</div>"
     "<div class=card>WiFi tripwire metric %.1f dB &nbsp; GPS: %s &nbsp; PPS: %s<br>"
     "Lat %.6f Lon %.6f</div>"
     "<div class=card>Join this AP for the local JSON feed.<br>"
-    "LoRa detections go to the Shepherd gateway on UDP %d.</div></body></html>",
+    "LoRa detections go to the Shepherd gateway on UDP %d.</div>",
     nodeId, LORA_FREQ_MHZ, (unsigned long)((millis() - bootMs) / 1000),
     (unsigned long)pktSeen, (unsigned long)txOk, (unsigned long)txErr,
     (unsigned long)eventCount, lastMetric,
     gpsFix ? "fix" : "no fix", ppsSeen > 0 ? "locked" : "free-run",
     gpsLat, gpsLon, BEACON_PORT);
+  size_t o = strlen(html);
+  if (pskSet) {
+    snprintf(html + o, sizeof(html) - o,
+      "<div class=card>LoRa security: PSK <b>SET</b> (key ID %s) — packets "
+      "encrypted, codec v2 (34 B on air).<br>"
+      "<form method=post action=/psk><input name=k maxlength=32 "
+      "placeholder='new 32-hex PSK'> <button>Replace PSK</button></form>"
+      "<form method=post action=/pskclear><input name=confirm maxlength=4 "
+      "placeholder='type key ID to confirm'> <button>Clear PSK (back to "
+      "plaintext v1)</button></form></div>", pskKeyId);
+  } else {
+    snprintf(html + o, sizeof(html) - o,
+      "<div class=card><span class=warn>LoRa PSK NOT SET — this node is "
+      "transmitting PLAINTEXT codec v1 (node ID visible to anyone in RF range).</span><br>"
+      "Set the deployment key (32 hex chars, same key on the gateway):<br>"
+      "<form method=post action=/psk><input name=k maxlength=32 "
+      "placeholder='32 hex characters'> <button>Save PSK</button></form>"
+      "Takes effect on reboot.</div>");
+  }
+  size_t oa = strlen(html);
+  if (apPassDefault) {
+    snprintf(html + oa, sizeof(html) - oa,
+      "<div class=card>AP password: <span class=warn>public DEFAULT still "
+      "in use</span> — change it below, especially before setting the "
+      "LoRa PSK.<br>"
+      "<form method=post action=/appass><input type=password name=ap "
+      "maxlength=63 placeholder='new AP password (8-63 chars)'> "
+      "<button>Save AP password</button></form>"
+      "Takes effect on reboot — you will need to rejoin the AP with the "
+      "new password.</div>");
+  } else {
+    snprintf(html + oa, sizeof(html) - oa,
+      "<div class=card>AP password: <b>custom set</b> (never shown).<br>"
+      "<form method=post action=/appass><input type=password name=ap "
+      "maxlength=63 placeholder='new AP password (8-63 chars)'> "
+      "<button>Replace AP password</button></form>"
+      "Takes effect on reboot — you will need to rejoin the AP with the "
+      "new password.</div>");
+  }
+  size_t o2 = strlen(html);
+  if (!bootCtrOk) {
+    o2 += snprintf(html + o2, sizeof(html) - o2,
+      "<div class=card><span class=warn>boot_ctr NVS FAULT — encrypted "
+      "(v2) transmissions are REFUSED until this clears (nonce-reuse "
+      "risk). Reboot the node; if it persists, its flash/NVS is "
+      "failing.</span></div>");
+  }
+  if (pskClearRefused > 0) {
+    o2 += snprintf(html + o2, sizeof(html) - o2,
+      "<div class=card>Clear-PSK refusals so far: %lu (bad key-ID "
+      "confirmation).</div>", (unsigned long)pskClearRefused);
+  }
+  snprintf(html + o2, sizeof(html) - o2, "</body></html>");
   server.send(200, "text/html", html);
 }
 
@@ -398,6 +630,34 @@ void setup() {
   }
   nid.toCharArray(nodeId, sizeof(nodeId));
   String pass = prefs.getString("ap_pass", "shepherd-field");
+  apPassDefault = (pass == "shepherd-field");
+  if (apPassDefault)
+    Serial.println("!! AP password is the public DEFAULT — change it on the status page.");
+
+  // Codec v2 PSK + nonce state. boot_ctr is bumped ONCE per boot (one
+  // NVS write — negligible wear) so (boot_ctr, frame_ctr) nonces never
+  // repeat across reboots; frame_ctr restarts at 0 each boot.
+  String pskHex = prefs.getString("psk_hex", "");
+  if (pskHex.length() > 0 && parseHexKey(pskHex, pskKey)) {
+    pskSet = true; computeKeyId();
+  } else if (pskHex.length() > 0) {
+    Serial.println("!! stored psk_hex is malformed (need 32 hex chars) — ignoring it");
+  }
+  bootCtr = prefs.getUInt("boot_ctr", 0) + 1;
+  prefs.putUInt("boot_ctr", bootCtr);
+  // Verify the write landed: if NVS silently dropped it, this boot
+  // would reuse a previous boot's boot_ctr and (boot_ctr, frame_ctr)
+  // nonces would repeat under the same key — fatal to CCM. Read back
+  // and compare; on mismatch, txCodec refuses v2 transmission and
+  // the status page shows the fault. (Model note: the host model does
+  // not simulate NVS faults; this is a firmware-only guard, spec'd in
+  // docs/lora_psk_codec_spec.md.)
+  bootCtrOk = (prefs.getUInt("boot_ctr", 0) == bootCtr);
+  if (!bootCtrOk) {
+    Serial.println("!! boot_ctr NVS write FAILED verification — v2 TX REFUSED");
+    Serial.println("!! (nonce-reuse risk). Reboot; persistent failure = failing flash/NVS.");
+  }
+  frameCtr = 0;
 
   WiFi.mode(WIFI_AP);
   char ssid[24]; snprintf(ssid, sizeof(ssid), "Shepherd-%s", nodeId + 4);
@@ -430,7 +690,19 @@ void setup() {
 
   udp.begin(BEACON_PORT);
   server.on("/", handleRoot);
+  server.on("/psk", HTTP_POST, handlePskSave);
+  server.on("/pskclear", HTTP_POST, handlePskClear);
+  server.on("/appass", HTTP_POST, handleApPassSave);
   server.begin();
+  if (pskSet) {
+    Serial.printf("LoRa PSK SET (key ID %s) — codec v2 encrypted TX, boot_ctr=%lu\n",
+                  pskKeyId, (unsigned long)bootCtr);
+    if (!bootCtrOk)
+      Serial.println("!! ...but boot_ctr is UNVERIFIED — v2 TX is REFUSED (see above).");
+  } else {
+    Serial.println("!! LoRa PSK NOT SET — transmitting PLAINTEXT codec v1 !!");
+    Serial.println("!! Set a deployment PSK on the status page (LoRa security card).");
+  }
   Serial.printf("Shepherd LoRa node %s ready\n", nodeId);
 }
 
