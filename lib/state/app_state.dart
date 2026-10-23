@@ -606,7 +606,9 @@ class AppState extends ChangeNotifier {
     final cur = _zmetaHttps;
     if (cur != null &&
         cur.ingestUrl == settings.zmetaIngestUrl &&
-        cur.fpMode == settings.zmetaIngestFp) return cur;
+        cur.fpMode == settings.zmetaIngestFp) {
+      return cur;
+    }
     cur?.close();
     final next = ZMetaHttpsEmitter(
       ingestUrl: settings.zmetaIngestUrl,
