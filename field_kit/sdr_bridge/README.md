@@ -64,6 +64,19 @@ Example: `RUN_SDR_BRIDGE.bat --simulate --plan fpv`.
 
 - `energy_dbfs` — **median** power across the band. The tripwire input; it
   rises for *wideband* emitters (FPV video, Wi-Fi) and ignores narrow tones.
+- `noise_dbfs` — **adaptive noise floor**: the 20th percentile of the
+  band's spectrum, recomputed from every capture (detector design after
+  Șorecău et al. 2025, defensive detection only). The signature scorer's
+  "hot" threshold is this floor + 12 dB, so the threshold tracks a
+  rising/drifting floor instead of false-alarming on it. *Behaviour
+  change:* earlier builds used the 10th percentile — on a flat floor the
+  new estimate reads ~0.8 dB higher, so `noise_dbfs` values and hot
+  thresholds sit ~0.8 dB higher than before, and the ELRS chirp
+  detector's CPU gate (peak − noise) is ~0.8 dB stricter. The packet
+  format is unchanged. The 20th percentile is also far more robust when
+  10–20% of a band sits in a fade or filter notch, where the old estimate
+  collapsed toward the notch and dragged the threshold down with it
+  (past ~20% notched, any percentile estimator lands in the notch).
 - `bins_dbfs` — 8 sub-bands, **low → high frequency**, peak power each.
   Catches narrowband emitters (LoRa, RC links) the median ignores; more
   spur-sensitive, so it is an investigation aid, not an alarm source.
