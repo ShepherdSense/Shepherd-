@@ -260,6 +260,160 @@ def test_sim_5780_burst_fires_when_staring_off_center():
     assert hot["energy"] - quiet["energy"] > 15.0, (quiet, hot)
 
 
+# ------------------------------------------- percentile-adaptive floor
+# Sorecău et al. 2025 (DOI 10.2478/kbo-2025-0093) detector design,
+# defensive detection only: noise floor = 20th percentile of the
+# in-band PSD, hot threshold = floor + SIG_HOT_DB, recomputed from
+# every capture (see NOISE_FLOOR_PCT in sdr_bridge.py). Replaces the
+# old 10th-percentile floor.
+
+def test_noise_floor_is_20th_percentile():
+    # The estimator IS the 20th percentile, and the constant pins it.
+    assert b.NOISE_FLOOR_PCT == 20.0
+    ps = np.linspace(-100.0, -60.0, 401)
+    assert abs(b.noise_floor_dbfs(ps)
+               - float(np.percentile(ps, 20))) < 1e-9
+    assert b.noise_floor_dbfs(ps) > float(np.percentile(ps, 10))
+
+
+def test_noise_floor_old_vs_new_on_flat_and_notched_spectra():
+    # Direct old (10th pct) vs new (20th pct) comparison on synthetic
+    # PSD arrays (seeded, deterministic).
+    rng = np.random.default_rng(7)
+    flat = rng.normal(-85.0, 0.8, size=20000)
+    old_flat = float(np.percentile(flat, 10))
+    new_flat = b.noise_floor_dbfs(flat)
+    # Flat floor: the two estimates are close (0.35 dB on this array)
+    # and the new one sits just under the median -- on a quiet band
+    # the adaptive threshold behaves ~like the old static expectation.
+    assert 0.0 < new_flat - old_flat < 1.5, (old_flat, new_flat)
+    assert abs(new_flat - float(np.median(flat))) < 1.5
+    # Notched floor: 12% of bins faded 12 dB (filter notch / fade).
+    # The 10th percentile collapses into the notch and under-reads
+    # the true floor; the 20th stays on the true floor. 5% genuine
+    # occupancy must not set the floor either way.
+    notched = flat.copy()
+    idx = rng.choice(notched.size, size=int(0.12 * notched.size),
+                     replace=False)
+    notched[idx] -= 12.0
+    sig_idx = rng.choice(notched.size, size=int(0.05 * notched.size),
+                         replace=False)
+    notched[sig_idx] = -60.0
+    old_n = float(np.percentile(notched, 10))
+    new_n = b.noise_floor_dbfs(notched)
+    assert new_n - old_n > 5.0, (old_n, new_n)      # measured ~10 dB
+    assert abs(new_n - (-85.0)) < 1.5, new_n        # measured ~1.0 dB
+    # Consequence: with the old floor the hot threshold (floor +
+    # SIG_HOT_DB) lands within ~1 dB of the band's own median, so
+    # plain noise peaks would read "hot" constantly; with the new
+    # floor it clears the median by ~SIG_HOT_DB.
+    med = float(np.median(notched))
+    assert old_n + b.SIG_HOT_DB - med < 3.0, (old_n, med)
+    assert new_n + b.SIG_HOT_DB - med > 8.0, (new_n, med)
+
+
+def test_adaptive_floor_quiet_flat_no_spurious_fhss():
+    # (a) Quiet flat floor, end to end: repeated pure-noise captures
+    # through band_measurement + SigHistory never produce an FHSS
+    # hint, and no sub-band peak ever comes near floor + SIG_HOT_DB
+    # (worst AWGN excursion measured ~6.7 dB against this floor).
+    rng = np.random.default_rng(3)
+    sig = b.SigHistory(window_s=120.0, min_obs=3)
+    hint = "unset"
+    for i in range(6):
+        x = ((rng.standard_normal(N) + 1j * rng.standard_normal(N))
+             / math.sqrt(2) * 10 ** (-85.0 / 20.0)).astype(np.complex64)
+        m = b.band_measurement(x, SR, 20.0)
+        assert m is not None
+        # Measurement keys unchanged (UDP packet stays byte-compatible
+        # in structure; only the noise VALUE's estimator changed).
+        assert set(m) == {"energy", "noise", "bins", "peak_off_mhz",
+                          "peak_dbfs", "span_mhz"}, set(m)
+        assert max(m["bins"]) - m["noise"] < b.SIG_HOT_DB, m
+        hint = sig.observe("2437", 2437.0, 1000.0 + i * 2.0,
+                           m["bins"], m["energy"], m["noise"])
+    assert hint is None, hint
+
+
+def test_adaptive_floor_tracks_rising_floor_no_false_fhss():
+    # (b) Rising floor: the whole band climbs 15 dB across the
+    # observations (front end warming up / interference rising). The
+    # bins are sub-band PEAKS: they ride the floor with only the usual
+    # few-dB noise excursion and a rotating slightly-highest sub-band
+    # -- ordinary noise, not hopping.
+    floors = [-85.0 + 3.0 * i for i in range(6)]   # -85 -> -70
+
+    def obs_bins(fl, i):
+        bins = [fl + 2.0] * 8
+        bins[i % 8] = fl + 6.0       # rotating noise peak, < SIG_HOT_DB
+        return bins
+
+    # Adaptive path (what the scorer does now): each observation is
+    # judged against its own contemporaneous floor -> nothing is ever
+    # hot -> no FHSS call, however far the floor has drifted.
+    sig = b.SigHistory(window_s=120.0, min_obs=3)
+    hint = None
+    for i, fl in enumerate(floors):
+        hint = sig.observe("x", 2437.0, 1000.0 + i * 2.0,
+                           obs_bins(fl, i), fl + 1.0, fl)
+    assert hint is None, hint
+    # Counterfactual fixed threshold: freeze the floor at its
+    # starting value (the failure mode adaptive thresholding exists
+    # to prevent). The SAME bins late in the rise sit > SIG_HOT_DB
+    # over the frozen floor in rotating sub-bands and the scorer
+    # calls it FHSS -- proof the scenario discriminates, and that the
+    # per-capture adaptation is what saves it.
+    sig_fixed = b.SigHistory(window_s=120.0, min_obs=3)
+    hint_fixed = None
+    for i, fl in enumerate(floors):
+        hint_fixed = sig_fixed.observe("x", 2437.0, 1000.0 + i * 2.0,
+                                       obs_bins(fl, i), fl + 1.0,
+                                       floors[0])
+    assert hint_fixed == "fhss-2g4", hint_fixed
+
+
+def test_adaptive_floor_end_to_end_rising_capture_levels():
+    # (b, end to end) Real captures whose noise level rises 15 dB:
+    # band_measurement's floor estimate tracks the rise while the
+    # peak-over-floor margin stays at its quiet value -- the scorer
+    # sees nothing new to call hot.
+    rng = np.random.default_rng(11)
+    margins, floors = [], []
+    for lvl in (-85.0, -78.0, -70.0):
+        x = ((rng.standard_normal(N) + 1j * rng.standard_normal(N))
+             / math.sqrt(2) * 10 ** (lvl / 20.0)).astype(np.complex64)
+        m = b.band_measurement(x, SR, 20.0)
+        assert m is not None
+        floors.append(m["noise"])
+        margins.append(max(m["bins"]) - m["noise"])
+    assert floors[-1] - floors[0] > 12.0, floors   # tracked the rise
+    assert all(mg < b.SIG_HOT_DB for mg in margins), margins
+
+
+def test_fhss_hopper_still_detected_over_adaptive_floor():
+    # (c) FHSS hopper over the floor, end to end at capture level: a
+    # strong narrowband tone hopping between sub-bands across
+    # captures is still called fhss-2g4 under the 20th-percentile
+    # floor. The hop peaks sit ~68 dB over the floor, so the ~0.8 dB
+    # threshold rise from the percentile change cannot hide them;
+    # detection is floor-relative, not absolute.
+    sig = b.SigHistory(window_s=120.0, min_obs=3)
+    hint = None
+    for i, off_mhz in enumerate([-1.4, -0.2, 1.0, -1.0, 0.6]):
+        x = noise() + tone(off_mhz * 1e6, -50.0)
+        m = b.band_measurement(x, SR, 20.0)
+        assert m is not None
+        assert max(m["bins"]) - m["noise"] > b.SIG_HOT_DB + 10.0, m
+        hint = sig.observe("2437", 2437.0, 1000.0 + i * 2.0,
+                           m["bins"], m["energy"], m["noise"])
+    assert hint == "fhss-2g4", hint
+    # Same pattern riding on a floor 15 dB higher (drifted band):
+    # floor-relative scoring calls it identically.
+    hint = _sig_hint(2437.0, [[0], [3], [6], [1], [4]],
+                     energy=-68.0, noise=-70.0)
+    assert hint == "fhss-2g4", hint
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):
