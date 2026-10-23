@@ -71,6 +71,16 @@ no default key. Migration order: gateways first, then node keys.
 Full spec: `docs/lora_psk_codec_spec.md`; test vectors:
 `field_kit/esp32/tests/`.
 
+**Key refresh / rotation (prototype, 2026-10-23):** the deployment
+PSK can now be rotated without re-visiting devices by hand —
+ML-KEM-512 refresh (new key derived from a post-quantum exchange
+authenticated by the current PSK) or gateway-pushed rotation (new
+key wrapped in the existing codec wrap), both over the devices'
+Wi-Fi link (nodes have no LoRa receive path), both through one
+stage → confirm → commit machine with a monotonic key counter and
+a dual-key acceptance window. Gateway UDP JSON stays byte-identical
+throughout. Full spec: `docs/lora_key_refresh_spec.md`.
+
 **App side:** `lib/services/esp32_driver.dart` (driverId `esp32`) is a
 passive UDP-49160 listener. It reconstructs each sensor's disturbance
 from the node's reported `depth_db` as a virtual link
