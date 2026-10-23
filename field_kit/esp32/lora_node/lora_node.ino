@@ -120,6 +120,9 @@
 #include <lora_psk_codec.h>  // codec v2 wrap — SHARED with the gateway
                                // (esp32/shepherd_lora_psk library; see
                                // docs/lora_psk_codec_spec.md)
+#include <keyrefresh.h>    // key refresh/rotation — SHARED library
+                               // (esp32/shepherd_lora_keyrefresh; see
+                               // docs/lora_key_refresh_spec.md)
 #include "mbedtls/md.h"    // SHA-256 for the displayed key ID only
 
 // ---------------- region / frequency ----------------
@@ -262,6 +265,81 @@ uint32_t eventCount = 0;
 uint32_t txOk = 0, txErr = 0;
 float lastMetric = 0;
 uint32_t pktSeen = 0;
+
+// ---------------- key refresh / rotation (spec: lora_key_refresh_spec.md) --
+// Transport is this device's Wi-Fi WebServer (the node has NO LoRa
+// receive path — refresh can never arrive over LoRa). The protocol
+// and state machine live in the SHARED library <keyrefresh.h>; this
+// sketch owns the HTTP endpoints, the identities, and NVS. The
+// committed counter is the ONLY refresh state persisted; the staged
+// context is RAM-only, so a reboot before commit is a safe abort.
+static shepherd_kr::NodeCtx krCtx;
+static uint32_t krCtr = 0;              // committed key_counter (NVS kr_ctr)
+static uint8_t  krSelfId[8] = {0};      // "SLN-XXXX"
+static bool     krPersistFault = false; // commit NVS verify failed
+static char     krLastFail[48] = "";    // F10: last KR failure, page-visible
+#define KR_STAGE_TIMEOUT_MS 120000UL
+
+static void krIdFromNodeId() { memcpy(krSelfId, nodeId, 8); }
+
+static void krNoteFail(const char *what, shepherd_kr::KrResult r) {
+  snprintf(krLastFail, sizeof(krLastFail), "%s (code %d)", what, (int)r);
+  Serial.printf("KR failure: %s\n", krLastFail);
+}
+
+// Persist a freshly committed key + counter (the ONLY NVS write the
+// refresh machinery ever makes) and adopt them as the live PSK.
+//
+// F1(a): the commit ALSO bumps boot_ctr persistently (same
+// write-then-read-back-verify discipline as the boot-time bump).
+// Without the bump, the gateway's per-suffix freshness high-water
+// (boot_ctr, frame_ctr) would reject every post-commit frame — the
+// node restarts frame_ctr at 0 under the SAME boot counter — as a
+// replay, for hours of silent outage.
+//
+// All-or-nothing (F3): psk_hex, kr_ctr and the bumped boot_ctr are
+// written, then ALL are read back and verified. Only on full
+// success are the new key/counters adopted in RAM. On any mismatch:
+// krPersistFault is flagged (status page + Serial), a best-effort
+// restore of the previous persisted values is attempted, RAM keeps
+// running the OLD key/counters, and false is returned so the
+// /kr/commit handler replies NON-200 — the gateway then stays in
+// its dual-key window instead of promoting onto a key this node
+// did not durably take (spec §9).
+static bool krPersistCommit(const uint8_t key[16], uint32_t ctr) {
+  static const char *H = "0123456789abcdef";
+  char hex[33];
+  for (int i = 0; i < 16; i++) { hex[2 * i] = H[key[i] >> 4]; hex[2 * i + 1] = H[key[i] & 15]; }
+  hex[32] = 0;
+  uint32_t newBoot = bootCtr + 1;
+  prefs.putString("psk_hex", hex);
+  prefs.putUInt("kr_ctr", ctr);
+  prefs.putUInt("boot_ctr", newBoot);
+  String back = prefs.getString("psk_hex", "");
+  if (back != hex || prefs.getUInt("kr_ctr", 0) != ctr ||
+      prefs.getUInt("boot_ctr", 0) != newBoot) {
+    krPersistFault = true;
+    // Best-effort restore of the pre-commit persisted state so a
+    // reboot does not land on a half-written mix.
+    static const char *H2 = "0123456789abcdef";
+    char oldHex[33];
+    for (int i = 0; i < 16; i++) { oldHex[2 * i] = H2[pskKey[i] >> 4]; oldHex[2 * i + 1] = H2[pskKey[i] & 15]; }
+    oldHex[32] = 0;
+    prefs.putString("psk_hex", oldHex);
+    prefs.putUInt("kr_ctr", krCtr);
+    prefs.putUInt("boot_ctr", bootCtr);
+    Serial.println("!! KR commit NVS verify FAILED — node keeps the OLD key; commit NOT acknowledged");
+    return false;
+  }
+  memcpy(pskKey, key, 16);
+  pskSet = true;
+  computeKeyId();
+  krCtr = ctr;
+  bootCtr = newBoot;  // F1(a): post-commit frames are (boot+1, 0..)
+  frameCtr = 0;       // new key + bumped boot => fresh nonce space
+  return true;
+}
+
 
 // GPS / clock
 float gpsLat = 0, gpsLon = 0;
@@ -536,8 +614,114 @@ void handleApPassSave() {
     "<a href=/ style='color:#a855f7'>Back</a></body></html>");
 }
 
+// ---- key-refresh endpoints (raw binary bodies via upload handler) ----
+static uint8_t krBody[832];
+static size_t krBodyLen = 0;
+static bool krBodyOverflow = false;
+void krUpload() {
+  HTTPUpload &up = server.upload();
+  if (up.status == UPLOAD_FILE_START) { krBodyLen = 0; krBodyOverflow = false; }
+  else if (up.status == UPLOAD_FILE_WRITE) {
+    if (krBodyLen + up.currentSize <= sizeof(krBody)) {
+      memcpy(krBody + krBodyLen, up.buf, up.currentSize);
+      krBodyLen += up.currentSize;
+    } else krBodyOverflow = true;
+  }
+}
+static void krSendCode(int http, shepherd_kr::KrResult r) {
+  uint8_t b = (uint8_t)r;
+  server.send_P(http, "application/octet-stream", (const char *)&b, 1);
+}
+static void krSendBin(int http, const uint8_t *p, size_t n) {
+  server.send_P(http, "application/octet-stream", (const char *)p, n);
+}
+static int krHttpFor(shepherd_kr::KrResult r) {
+  using namespace shepherd_kr;
+  return r == KR_ERR_AUTH ? 403 : r == KR_ERR_FORMAT ? 400 : 409;
+}
+
+void handleKrBegin() {
+  using namespace shepherd_kr;
+  if (!pskSet) { krSendCode(403, KR_ERR_STATE); return; }  // F8 uniform guard
+  if (krBodyOverflow || krBodyLen != 12) { krSendCode(400, KR_ERR_FORMAT); return; }
+  uint32_t counter = shepherd_kr::getU32(krBody + 8);
+  uint8_t ek[shepherd_kr::EK_LEN];
+  KrResult r = nodeBeginKem(krCtx, krCtr, krSelfId, krBody, counter, millis(), ek);
+  if (r != KR_OK) { krNoteFail("begin refused", r); krSendCode(krHttpFor(r), r); return; }
+  uint8_t resp[812];
+  memcpy(resp, krSelfId, 8);
+  shepherd_kr::putU32(resp + 8, counter);
+  memcpy(resp + 12, ek, shepherd_kr::EK_LEN);
+  krSendBin(200, resp, sizeof(resp));
+  Serial.printf("KR begin: refresh staged target ctr=%lu (peer %.8s)\n",
+                (unsigned long)counter, (const char *)krBody);
+}
+void handleKrEncap() {
+  using namespace shepherd_kr;
+  if (!pskSet) { krSendCode(403, KR_ERR_STATE); return; }  // F8 uniform guard
+  if (krBodyOverflow || krBodyLen != shepherd_kr::CT_LEN + 32) { krSendCode(400, KR_ERR_FORMAT); return; }
+  uint8_t confirm[32];
+  KrResult r = nodeAcceptEncap(krCtx, pskKey, krBody, krBody + shepherd_kr::CT_LEN, confirm);
+  if (r != KR_OK) { krNoteFail("encap refused", r); krSendCode(krHttpFor(r), r); return; }
+  krSendBin(200, confirm, 32);
+  Serial.println("KR encap: candidate STAGED + confirmed (TX still on committed key)");
+}
+void handleKrRotate() {
+  using namespace shepherd_kr;
+  if (!pskSet) { krSendCode(403, KR_ERR_STATE); return; }  // F8 uniform guard
+  // F6: the body is gwId[8] || codec wire packet[34] — the gateway
+  // identity is bound into the commit context on BOTH sides, so a
+  // commit proof for one node cannot be replayed to another.
+  if (krBodyOverflow || krBodyLen != 8 + shepherd_psk::WIRE_LEN) { krSendCode(400, KR_ERR_FORMAT); return; }
+  KrResult r = nodeStageRotation(krCtx, pskKey, krCtr, krSelfId, krBody /*gwId*/,
+                                 krBody + 8, millis());
+  if (r != KR_OK) { krNoteFail("rotate refused", r); krSendCode(krHttpFor(r), r); return; }
+  uint8_t resp[6];
+  uint8_t id[2];
+  shepherd_kr::keyId(krCtx.stagedKey, id);
+  resp[0] = id[0]; resp[1] = id[1];
+  shepherd_kr::putU32(resp + 2, krCtx.targetCounter);
+  krSendBin(200, resp, sizeof(resp));
+  Serial.printf("KR rotate: candidate STAGED ctr=%lu (TX still on committed key)\n",
+                (unsigned long)krCtx.targetCounter);
+}
+void handleKrCommit() {
+  using namespace shepherd_kr;
+  if (!pskSet) { krSendCode(403, KR_ERR_STATE); return; }  // F8 uniform guard
+  if (krBodyOverflow || krBodyLen != 32) { krSendCode(400, KR_ERR_FORMAT); return; }
+  uint8_t newKey[16]; uint32_t co = 0;
+  KrResult r = nodeCommit(krCtx, krBody, newKey, &co);
+  if (r != KR_OK) { krNoteFail("commit refused", r); krSendCode(krHttpFor(r), r); return; }
+  memset(krLastFail, 0, sizeof(krLastFail));
+  bool persisted = krPersistCommit(newKey, co);
+  if (!persisted) {
+    // F3: NON-200 — the gateway must NOT promote onto a key this
+    // node did not durably take; it stays in its dual-key window
+    // (F4) and the operator re-runs the session once the flash
+    // fault is fixed. This node keeps running the OLD key.
+    krNoteFail("commit persist failed", KR_ERR_CRYPTO);
+    krSendCode(500, KR_ERR_CRYPTO);
+    return;
+  }
+  Serial.printf("KR COMMIT: new key ID %s ctr=%lu persisted=1 boot_ctr=%lu\n",
+                pskKeyId, (unsigned long)co, (unsigned long)bootCtr);
+  krSendCode(200, KR_OK);
+}
+void handleKrAbort() {
+  using namespace shepherd_kr;
+  if (!pskSet) { krSendCode(403, KR_ERR_STATE); return; }  // F8 uniform guard
+  if (krBodyOverflow) { krSendCode(400, KR_ERR_FORMAT); return; }
+  // F5: with a staged context, the abort must carry the staged-key
+  // proof (same style as commit); with none, it is a no-op success.
+  KrResult r = nodeVerifyAbort(krCtx, pskKey,
+                               krBodyLen ? krBody : nullptr, krBodyLen);
+  if (r != KR_OK) { krNoteFail("abort refused", r); krSendCode(krHttpFor(r), r); return; }
+  Serial.println("KR abort: staged context discarded (committed key unchanged)");
+  krSendCode(200, shepherd_kr::KR_OK);
+}
+
 void handleRoot() {
-  char html[3200];
+  char html[4600];
   snprintf(html, sizeof(html),
     "<html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
     "<style>body{background:#111;color:#c9a7eb;font-family:sans-serif;padding:24px}"
@@ -575,6 +759,29 @@ void handleRoot() {
       "<form method=post action=/psk><input name=k maxlength=32 "
       "placeholder='32 hex characters'> <button>Save PSK</button></form>"
       "Takes effect on reboot.</div>");
+  }
+  if (pskSet) {
+    char stagedId[5] = "----";
+    if (krCtx.state != shepherd_kr::KR_IDLE)
+      shepherd_kr::keyIdHex(krCtx.stagedKey, stagedId);
+    const char *stName = krCtx.state == shepherd_kr::KR_CONFIRMED ? "CONFIRMED"
+                       : krCtx.state == shepherd_kr::KR_STAGED ? "STAGED" : "IDLE";
+    size_t ok2 = strlen(html);
+    snprintf(html + ok2, sizeof(html) - ok2,
+      "<div class=card>Key refresh: state <b>%s</b> &nbsp; committed "
+      "key_counter %lu &nbsp; staged key ID %s<br>"
+      "Completed: ML-KEM refresh %lu &nbsp; rotation %lu<br>"
+      "Refusals: auth %lu &nbsp; counter %lu &nbsp; state %lu &nbsp; "
+      "failures %lu%s%s%s</div>",
+      stName, (unsigned long)krCtr, stagedId,
+      (unsigned long)krCtx.okKem, (unsigned long)krCtx.okRot,
+      (unsigned long)krCtx.refuseAuth, (unsigned long)krCtx.refuseCounter,
+      (unsigned long)krCtx.refuseState, (unsigned long)krCtx.failures,
+      krPersistFault ? "<br><span class=warn>KR commit NVS FAULT — the "
+      "node kept the OLD key and did not acknowledge the commit; fix "
+      "the flash fault and re-run the refresh.</span>" : "",
+      krLastFail[0] ? "<br>Last KR failure: " : "",
+      krLastFail[0] ? krLastFail : "");
   }
   size_t oa = strlen(html);
   if (apPassDefault) {
@@ -629,6 +836,8 @@ void setup() {
     nodeSuffix = (uint16_t)strtoul(nid.c_str() + 4, NULL, 16);
   }
   nid.toCharArray(nodeId, sizeof(nodeId));
+  krIdFromNodeId();
+  krCtr = prefs.getUInt("kr_ctr", 0);
   String pass = prefs.getString("ap_pass", "shepherd-field");
   apPassDefault = (pass == "shepherd-field");
   if (apPassDefault)
@@ -693,6 +902,11 @@ void setup() {
   server.on("/psk", HTTP_POST, handlePskSave);
   server.on("/pskclear", HTTP_POST, handlePskClear);
   server.on("/appass", HTTP_POST, handleApPassSave);
+  server.on("/kr/begin", HTTP_POST, handleKrBegin, krUpload);
+  server.on("/kr/encap", HTTP_POST, handleKrEncap, krUpload);
+  server.on("/kr/rotate", HTTP_POST, handleKrRotate, krUpload);
+  server.on("/kr/commit", HTTP_POST, handleKrCommit, krUpload);
+  server.on("/kr/abort", HTTP_POST, handleKrAbort, krUpload);
   server.begin();
   if (pskSet) {
     Serial.printf("LoRa PSK SET (key ID %s) — codec v2 encrypted TX, boot_ctr=%lu\n",
@@ -712,6 +926,13 @@ void loop() {
 
   gpsPoll();
   server.handleClient();
+
+  // Key-refresh staged contexts expire: timeout == abort (old key
+  // was never touched, so this is always safe).
+  if (shepherd_kr::nodeExpired(krCtx, now, KR_STAGE_TIMEOUT_MS)) {
+    shepherd_kr::nodeAbort(krCtx);
+    Serial.println("KR staged context EXPIRED — reverted to committed key");
+  }
 
   if (now - lastSample >= SAMPLE_MS) {
     lastSample = now;
