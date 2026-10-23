@@ -697,6 +697,39 @@ def psd_dbfs(x, seg=SEG_N):
     return freqs, (10.0 * np.log10(p + 1e-24)).astype(np.float32)
 
 
+# Noise-floor estimator: the 20th percentile of the in-band PSD,
+# recomputed from every capture, so the estimate -- and every
+# threshold derived from it -- continuously adapts to the band.
+#
+# Design follows the adaptive detector in Sorecău et al., "SDR System
+# for Real-Time FHSS Communications Detection and Jamming," Int.
+# Conf. Knowledge-Based Organization XXXI(3), 2025,
+# DOI 10.2478/kbo-2025-0093: noise floor = 20th percentile of the
+# spectrum, detection threshold = floor + a dB offset (SIG_HOT_DB in
+# the signature scorer below). Defensive detection only: just the
+# detector design is borrowed -- Shepherd is RX-only and has no
+# transmit path of any kind.
+#
+# Why 20th, replacing the old 10th percentile: on a flat AWGN floor
+# the two differ by only ~0.8 dB, but the 10th percentile is fragile
+# against low-side outliers -- when >10% of bins sit in a fade or a
+# filter notch it collapses toward the notch (measured ~11 dB under
+# the true floor on a synthetic notched spectrum), dragging the
+# SIG_HOT_DB threshold down with it and inviting false FHSS calls.
+# The 20th percentile stayed within ~1 dB of the true floor in the
+# same test. A genuinely wideband emitter still lifts it (any
+# percentile would move) -- that case is the median/energy metric's
+# job, and the OFDM scorer compares against the calmest floor seen
+# in its window, not the current one.
+NOISE_FLOOR_PCT = 20.0
+
+
+def noise_floor_dbfs(ps_dbfs):
+    """Adaptive noise-floor estimate: the NOISE_FLOOR_PCT percentile
+    of an in-band PSD array in dBFS. See the note above the constant."""
+    return float(np.percentile(ps_dbfs, NOISE_FLOOR_PCT))
+
+
 def band_measurement(x, sample_rate=SAMPLE_RATE, bw_mhz=None):
     """Per-band energy metrics from one capture, or None if unusable.
 
@@ -705,7 +738,9 @@ def band_measurement(x, sample_rate=SAMPLE_RATE, bw_mhz=None):
 
     energy: median PSD across the band -- the stable wideband metric and
         the primary tripwire input (robust to spurs and narrow tones).
-    noise: 10th-percentile PSD -- the band's noise floor estimate.
+    noise: adaptive noise floor -- 20th-percentile PSD, recomputed per
+        capture (see NOISE_FLOOR_PCT; Sorecău et al. 2025 detector
+        design, defensive detection only).
     bins: 8 contiguous sub-bands, LOW to HIGH frequency, PEAK PSD each --
         catches narrowband emitters (LoRa/RC tones) that the median
         deliberately ignores. Peak-based, so spur-sensitive: treat as an
@@ -733,7 +768,7 @@ def band_measurement(x, sample_rate=SAMPLE_RATE, bw_mhz=None):
     if dc.any() and (~dc).any():
         ps[dc] = np.median(ps[~dc])
     energy = float(np.median(ps))
-    noise = float(np.percentile(ps, 10))
+    noise = noise_floor_dbfs(ps)
     bins = [float(np.max(e)) for e in np.array_split(ps, 8) if e.size]
     while len(bins) < 8:
         bins.append(noise)
@@ -748,8 +783,13 @@ def band_measurement(x, sample_rate=SAMPLE_RATE, bw_mhz=None):
 # ---------------------------------------------------------------- signature hints
 
 # Emitter-signature detection tuning. A "hot" sub-band is this far above
-# the band's own noise floor (10th percentile -- self-calibrating per
-# band, so it survives gain differences).
+# the band's own adaptive noise floor (20th-percentile PSD, recomputed
+# per capture -- see NOISE_FLOOR_PCT; Sorecău et al. 2025 detector
+# design, defensive detection only). Self-calibrating per band and per
+# capture, so it survives gain differences and tracks a drifting floor:
+# a slow broadband rise lifts bins and floor together and never reads
+# as hopping, while a real hopper's sub-band peaks stand tens of dB
+# over the floor -- far above the gate under either percentile.
 SIG_WINDOW_S = 30.0     # how far back the statistics look, per band
 SIG_MIN_OBS = 3         # observations needed before any hint is emitted
 SIG_HOT_DB = 12.0       # sub-band "hot" threshold above the noise floor
@@ -758,7 +798,10 @@ SIG_HOT_DB = 12.0       # sub-band "hot" threshold above the noise floor
                       # ~2.4 dB headroom under 10 dB; 12 dB buys margin
                       # against front-end spurs without touching any
                       # scripted emitter -- the weakest, the 915 MHz
-                      # LoRa-like tone, still sits 18 dB up)
+                      # LoRa-like tone, still sits 18 dB up. Against the
+                      # 20th-percentile floor the worst excursion measures
+                      # ~6.7 dB over 30 trials: the gate is unchanged, its
+                      # margin grew by ~1 dB.)
 SIG_FHSS_MIN_BINS = 3   # distinct hot sub-bands => hopping, not a tone
 SIG_FHSS_MAX_DUTY = 0.6  # no single sub-band may dominate (else: static)
 SIG_FHSS_MIN_ACTIVE = 0.3  # fraction of observations showing any hop
@@ -787,6 +830,11 @@ class SigHistory:
 
     Needs several observations of the band (a few seconds at least);
     returns None until then and for anything that matches no pattern.
+
+    Thresholding is percentile-adaptive: each observation's sub-bands
+    are judged against that same capture's 20th-percentile noise floor
+    + SIG_HOT_DB (see NOISE_FLOOR_PCT), never against a fixed level,
+    so a rising or drifting floor does not false-alarm.
     """
 
     def __init__(self, window_s=SIG_WINDOW_S, min_obs=SIG_MIN_OBS):
@@ -832,7 +880,11 @@ class SigHistory:
         family = self._family(center_mhz)
         if family is None:
             return None
-        # hot[i][k]: sub-band k hot in observation i.
+        # hot[i][k]: sub-band k hot in observation i. Each observation
+        # is judged against its OWN contemporaneous floor (n, the
+        # capture's 20th-percentile estimate), so the hot threshold
+        # adapts capture-to-capture -- percentile + offset, per
+        # Sorecău et al.'s detector design (defensive detection only).
         hots = [[b > n + SIG_HOT_DB for b in bins]
                 for _, bins, _, n in dq]
         n = len(hots)
