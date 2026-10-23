@@ -1,5 +1,61 @@
 # Changelog
 
+## v0.24.0 — 2026-10-23 — Research-sweep build (FHSS threshold, classifier retrain, dropout bench, TinyML boundary)
+
+The four remaining actionable items from the 2026-10-23 research
+sweep (lanes 5+6). Defensive-only throughout; no new transmit,
+detection, or alerting behavior — the classifier still only labels
+what the deterministic tripwire found, and never suppresses alerts.
+
+- **FHSS percentile-adaptive threshold (lane 5, Șorecău et al.
+  2025).** The SDR bridge's noise floor is now the **20th
+  percentile** of each capture (`NOISE_FLOOR_PCT`, `noise_floor_dbfs`
+  in `sdr_bridge.py`), replacing the 10th percentile; the signature
+  scorer's hot threshold stays floor + 12 dB and now tracks a
+  rising/drifting floor. UDP packet format unchanged. Measured
+  behavior changes: `noise_dbfs` and hot thresholds read ~0.8 dB
+  higher on a flat floor; the ELRS chirp CPU gate is ~0.8 dB
+  stricter on marginal captures; thresholds no longer collapse
+  (~10 dB) when 10–20% of a band sits in a fade/filter notch
+  (past ~20% notched, any percentile estimator lands in the notch).
+  Only the paper's detector design was ported — nothing from its
+  jamming path. 6 new Python tests (63/63 bridge suite).
+- **Synthetic corpus regeneration + retrain (lane 6, WiFi-JEPA).**
+  `tools/train_disturbance_clf.py` now generates trajectory-diverse
+  examples — randomized speeds, headings, start points, loiter
+  durations, gait wobble, body-shadow dropouts — instead of
+  near-fixed trajectories (which caused negative transfer in the
+  paper). Retrained weights ship in
+  `assets/models/disturbance_clf.json`; the 10-feature contract and
+  JSON schema are unchanged. Synthetic holdout: 0.967 on the new
+  (harder) corpus vs 0.994 for the old model on its narrow corpus;
+  on a shared trajectory-diverse bench set the old weights score
+  0.868 vs the new 0.961. **Synthetic accuracy does not establish
+  field accuracy** — no real-data validation exists yet.
+- **Link-dropout bench (lane 6, link-masking ablation).**
+  `tools/bench_link_dropout.py` + `docs/link_dropout_bench.md`:
+  accuracy vs 0–14 dropped links is flat for the shipped model
+  (0.961 → 0.956), and link-dropout augmentation (feature-level
+  masking on the aggregate link-count features, exactly as the
+  runtime would see it — see the bench doc's explicit runtime
+  assumption) beats the no-augmentation ablation by +0.2–0.4 points
+  at every drop count ≥ 2. Reproducible via the training script's
+  new `--no-aug` / `--out` flags.
+- **TinyML boundary doc (lane 6).** `docs/tinyml_boundary.md`
+  records the measured numbers behind the standing split: ESP32-S3
+  CSI-HAR typing at 232 ms / 127 kB / PSRAM-required vs the <50 ms
+  on-node budget, CSI ceiling >200 pps (watchdog) / ≤5 ms per
+  sample — typing (`disturbance_clf`, track stitcher) stays
+  on-phone, nodes do detection/tripwire only. The proposed 5th
+  model-card item is referenced there as proposed, NOT adopted.
+- **Tests.** New Dart golden test (`test/ai_golden_test.dart`)
+  loads the shipped weights into the real TinyMlp kernel and
+  asserts the golden probabilities — closing the gap where new
+  weights shipped with manual-only Dart-side verification.
+  Flutter: analyze clean, 438/438 tests. Python bridge suite:
+  63/63. Two independent reviews: SHIP-AFTER-FIXES, all fixes
+  applied and re-verified.
+
 ## v0.23.1 — 2026-10-21 — New app icon
 
 Icon-only release: no code or behavior changes.
