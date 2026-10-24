@@ -81,14 +81,63 @@ Protocol (UDP JSON datagrams to the Shepherd host, default 127.0.0.1:49161):
 
   (Passive Doppler on the ambient LTE downlink -- the carrier transmits
   it whether or not we listen; the bridge only receives and never
-  decodes payload bits. Emitted only on a 1.8-1.9 GHz stare (Doppler
-  mode), where it replaces the band-energy packet. doppler_hz /
+  decodes payload bits. Emitted only on a --stare (Doppler mode),
+  where it replaces the band-energy packet: the Doppler chain is
+  STARE-ONLY -- a --bands/--plan list containing 1.8-1.9 GHz (or any
+  LTE DL centre) is a sweep and emits band packets, not doppler_ref
+  (see the routing note in main()). doppler_hz /
   radial_ms are signed with approaching = negative (app convention);
   radial_ms = doppler_hz * c / (2 * center_hz). snr_db is the peak over
   the clutter-canceled floor. ref_locked=false means the direct-path
   reference was lost -- no coherent measurement that CPI; Shepherd must
   give such events zero weight. Silent when the reference is locked
   and nothing clears the SNR gate.)
+
+  lte_illuminator packet (LTE downlink illuminator presence; sweep
+  mode only, at most ~1 per band per sweep while detected):
+    {"v":1,"kind":"lte_illuminator","radio":"rtlsdr0","band":"465",
+     "center_mhz":465.0,"dl_band":"LTE450","occupied_bw_mhz":3.1,
+     "flatness_db":1.8,"snr_db":19.4,"t":1729123456.789}
+
+  (A flat-top wideband signal occupying an LTE downlink band -- an
+  illuminator-of-opportunity presence report, NOT an LTE
+  identification: this DSP level cannot distinguish an LTE downlink
+  from any other flat wideband energy in the band, and it never
+  decodes payload bits. On an LTE-band --stare (the --stare flag;
+  an explicit single-band --bands list is still a sweep) the bridge
+  instead runs the existing doppler_ref chain, so no
+  lte_illuminator packet is emitted there -- the Doppler events are
+  the feed. ADDITIVE packet kind: older Shepherd builds ignore
+  unknown kinds; every pre-existing packet schema is unchanged.)
+
+  LTE450 HONESTY NOTE (read before quoting any range): the ~1.6 km
+  bistatic figure sometimes attached to FKIE LTE450 (Demissie &
+  Steffes, IET Radar Sonar & Navigation 2025, e70092) is CLAIMED,
+  not validated: it reaches Shepherd through a single secondary
+  source (MiGFlug blog, Oct 2025, read in full) while the paper's
+  full text remains UNREAD (bot-blocked on every host tried). It is
+  NOT a Shepherd capability, NOT a validated target, and must never
+  be quoted as one. The bench-measurement hook in this file
+  (LteBenchLog / summarize_lte_bench) exists so an operator can
+  replace that claimed number with a measured detection-vs-range
+  curve from their own known-range passes. LTE450 is enabled only
+  by operator opt-in (--lte450, or an explicit --bands/--stare
+  listing it) -- the operator's radio must cover ~465 MHz and local
+  rules must allow passive reception there; the bridge only ever
+  receives.
+
+  5G NR adapter (v0.25.0): a documented, tested STUB. NR downlink
+  channels are 20-100 MHz wide; the bridge pipeline runs at 4 MSPS
+  (2.4 MSPS RTL-SDR), so no available radio configuration can
+  practically ingest an NR channel here -- even a USRP at the
+  bridge's 4 MSPS sees only a 3.2 MHz slice, which cannot identify
+  NR. The Nr5gAdapter therefore gates on USRP-class hardware at
+  >= 20 MSPS, and even when that gate opens it emits NOTHING: the
+  interface (band table, probe/status) exists so a future wideband
+  capture path can fill it in, but no NR detection runs today and
+  no NR packet kind is emitted. No BSense numbers are claimed
+  anywhere for Shepherd (no 1 km, no F1 95.56% -- BSense ran on a
+  carrier 5G-A base station Shepherd does not control).
 
   wpp_idp_doppler packet (single-channel passive-radar Doppler line):
     {"v":1,"kind":"wpp_idp_doppler","radio":"rtlsdr0","band":"2437",
@@ -125,6 +174,7 @@ Examples:
 """
 
 import argparse
+import csv
 import json
 import math
 import socket
@@ -591,6 +641,27 @@ class SimBackend(RadioBackend):
                 ph = (2 * np.pi * 150e3 * t
                       + 2.0 * np.sin(2 * np.pi * 37.0 * t))
                 x = x + (np.exp(1j * ph) * amp).astype(np.complex64)
+        if (462.5 <= self.center <= 467.5
+                and self._band_caps.get(465, 0) >= 1):
+            # LTE450 demo: a flat-top wideband signal filling the
+            # usable span, like an LTE downlink slice -- RX-only
+            # synthetic receive data, not a transmission, and not
+            # an LTE identification (shape only, like the detector).
+            # Gated on one prior quiet capture of this band, like
+            # the 5780 MHz OFDM demo: the LTE detector needs a
+            # quiet reference before it can report, and this makes
+            # the demo deterministic.
+            amp = floor_lin * (10 ** (20.0 / 20.0))
+            w = (self.rng.standard_normal(n)
+                 + 1j * self.rng.standard_normal(n)) / np.sqrt(2.0)
+            W = np.fft.fftshift(np.fft.fft(w))
+            fr = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / self.sample_rate))
+            W[np.abs(fr) > 1.5e6] = 0.0
+            flat = np.fft.ifft(np.fft.ifftshift(W))
+            # FFT/IFFT round-trip preserves RMS up to the mask
+            # fraction; rescale to the intended amplitude.
+            rms = float(np.sqrt(np.mean(np.abs(flat) ** 2))) or 1.0
+            x = x + (flat / rms * amp).astype(np.complex64)
         if abs(self.center - 2437.0) < 1.0:
             # WPP-IDP demo: ambient WiFi-like frame train (always on)
             # + wall-clock-gated mover echo. Coexists with the band's
@@ -936,6 +1007,358 @@ class SigHistory:
         return None
 
 
+# ------------------------------------------------- LTE / 5G NR adapters
+#
+# RX-ONLY illuminators of opportunity. Both adapters RECEIVE ONLY:
+# no TX code, no transmit-adjacent code (no attach, no RACH, no
+# paging, no decoding of user payload bits -- the LTE detector reads
+# only the SHAPE of the spectrum, the NR adapter reads nothing).
+# They feed the existing Doppler-only track-refinement layer
+# (doppler_ref, 0.5 s CPI -> ~2 Hz / ~0.16 m/s at 1.86 GHz): on an
+# LTE-band stare the existing DopplerTracker runs; on sweeps the
+# LTE detector reports illuminator presence per band. Neither
+# adapter identifies a network, a handset, or a target, and neither
+# produces a position.
+
+# LTE downlink bands the adapter recognises: (name, low MHz, high MHz,
+# is_lte450). FDD downlink only -- TDD bands are excluded because a
+# shared uplink/downlink channel cannot be claimed as a downlink
+# illuminator from spectrum shape alone. Matching is by tuned centre
+# falling inside the DL range, so any stare inside a DL band works.
+# FIRST-MATCH RULE (load-bearing for overlapping bands): the table
+# is scanned in order and the first band containing the centre wins.
+# B28 (758-803 MHz) and B20 (791-821 MHz) OVERLAP on 791-803 MHz, so
+# a centre at e.g. 800 MHz is labelled B28 even where it is also B20
+# -- the label is a table-lookup result, not a band identification,
+# and downstream code must not treat it as one.
+LTE_DL_BANDS = [
+    ("LTE450", 462.5, 467.5, True),   # Band 31 DL; FKIE test freq
+                                      # 467.37 MHz sits inside it.
+                                      # Opt-in only (see --lte450).
+    ("B28", 758.0, 803.0, False),
+    ("B20", 791.0, 821.0, False),
+    ("B12", 729.0, 746.0, False),
+    ("B5", 869.0, 894.0, False),
+    ("B8", 925.0, 960.0, False),
+    ("B3", 1805.0, 1880.0, False),
+    ("B2", 1930.0, 1990.0, False),
+    ("B1", 2110.0, 2170.0, False),
+    ("B7", 2620.0, 2690.0, False),
+]
+
+# 5G NR downlink bands, for the FUTURE real adapter. The v0.25.0
+# Nr5gAdapter is a stub and never uses this table for detection;
+# it is recorded here so the interface's band coverage is explicit
+# and reviewable, not invented later under time pressure.
+NR_DL_BANDS = [
+    ("n28", 758.0, 803.0),
+    ("n3", 1805.0, 1880.0),
+    ("n1", 2110.0, 2170.0),
+    ("n41", 2496.0, 2690.0),
+    ("n77", 3300.0, 4200.0),
+    ("n78", 3300.0, 3800.0),
+]
+
+
+def lte_band_for_center(center_mhz):
+    """LTE DL band name for a tuned centre, or None if it is not
+    inside any recognised downlink band. Returns (name, is_lte450).
+    First match wins in LTE_DL_BANDS order: overlapping bands
+    (B28/B20 on 791-803 MHz) resolve to the earlier entry, so
+    800 MHz labels B28, not B20."""
+    for name, low, high, is450 in LTE_DL_BANDS:
+        if low <= center_mhz <= high:
+            return name, is450
+    return None
+
+
+def nr_band_for_center(center_mhz):
+    """NR DL band name for a tuned centre, or None. (Interface only;
+    the stub adapter never calls this for detection.)"""
+    for name, low, high in NR_DL_BANDS:
+        if low <= center_mhz <= high:
+            return name
+    return None
+
+
+# LTE illuminator-presence thresholds. A flat-top wideband signal
+# fills the usable span nearly uniformly: most bins sit near the
+# peak, and the span median sits near the peak too. A tone fails
+# the median test (median stays at the noise floor); quiet fails
+# the SNR test; a narrowband burst fails the fill test.
+LTE_MIN_SNR_DB = 10.0     # peak over the bounded-window quiet floor
+                          # (minimum 20th-percentile floor over the
+                          # last LTE_QUIET_WINDOW captures at the
+                          # centre -- NOT the current capture's floor)
+LTE_QUIET_WINDOW = 20     # captures retained per centre for the
+                          # quiet reference; a transient low floor
+                          # (gain drop, antenna disconnect) expires
+                          # after this many later captures instead
+                          # of permanently inflating snr_db
+LTE_MIN_FILL_FRAC = 0.70  # fraction of usable-span bins within 6 dB
+                          # of the peak
+LTE_FILL_DB = 6.0
+LTE_MEDIAN_GAP_DB = 6.0   # span median must sit within this of peak
+
+
+class LteIlluminatorDetector:
+    """Spectrum-shape detector for LTE downlink illuminator presence.
+
+    Input: one raw capture + sample rate + tuned centre. Output: a
+    dict, or None when nothing illuminator-like is present (idle =
+    silent, like every other bridge detector). The detection is a
+    SHAPE claim only -- "flat-top wideband energy in an LTE DL band"
+    -- never "this is LTE", never an identification, never a
+    position. No payload bits are touched: psd_dbfs gives power per
+    bin, and that is all this detector reads.
+
+    Quiet-reference subtlety (load-bearing): a flat-top signal
+    filling ~94% of the span lifts the CURRENT capture's own
+    20th-percentile floor into the signal itself (measured: only
+    ~6 dB of apparent SNR on a 20 dB signal), so SNR is measured
+    against the CALMEST floor recently seen at this centre (same
+    pattern as SigHistory's OFDM quiet reference), not the
+    current capture's floor. The quiet reference is the
+    BOUNDED-WINDOW minimum: the minimum 20th-percentile floor
+    over the last LTE_QUIET_WINDOW captures at the centre, NOT
+    an all-time minimum. A flat-top capture's floor is always
+    HIGHER than a true quiet floor, so min-updating can never
+    calibrate a real emitter away, and a later quiet capture
+    repairs a reference seeded during an active emitter -- but
+    the window is what keeps a TRANSIENT low floor honest: one
+    gain drop or antenna disconnect used to permanently lower
+    the reference and inflate every later snr_db (potentially
+    pushing a genuinely sub-gate flat signal over the 10 dB
+    gate); now that floor expires after LTE_QUIET_WINDOW
+    later captures at the centre. Consequences, stated
+    plainly: a centre whose emitter has NEVER been quiet reads
+    only its own lifted floor (~6 dB apparent SNR, below the
+    10 dB gate) and reports nothing -- at startup with an
+    already-active full-span emitter the detector stays silent
+    until one quiet capture arrives. White noise itself is
+    spectrally flat, so shape alone cannot separate "signal" from
+    "floor": the 10 dB SNR gate against the quiet reference is
+    what does that (pure noise measures only ~7 dB peak-to-floor).
+    Quiet references are keyed per (radio, centre) when the
+    caller passes a key, else per centre.
+    """
+
+    def __init__(self, quiet_window=LTE_QUIET_WINDOW):
+        if not isinstance(quiet_window, int) or quiet_window < 1:
+            raise ValueError("quiet_window must be a positive int")
+        self.quiet_window = quiet_window
+        # key -> deque of the last `quiet_window` floors; _quiet
+        # mirrors the current window minimum for inspection.
+        self._quiet_hist = {}
+        self._quiet = {}  # key -> window-minimum floor seen recently
+
+    def detect(self, x, sample_rate, center_mhz, key=None):
+        band = lte_band_for_center(center_mhz)
+        if band is None:
+            return None
+        freqs, p = psd_dbfs(x)
+        if p.size == 0 or not np.all(np.isfinite(p)):
+            return None
+        f_hz = freqs * float(sample_rate)
+        half = USABLE_FRAC * float(sample_rate) / 2.0
+        sel = np.abs(f_hz) <= half
+        if int(sel.sum()) < 16:
+            return None
+        ps = p[sel].copy()
+        fs = f_hz[sel]
+        dc = np.abs(fs) <= 3.0 * float(sample_rate) / SEG_N
+        if dc.any() and (~dc).any():
+            ps[dc] = np.median(ps[~dc])
+        noise = noise_floor_dbfs(ps)
+        peak = float(np.max(ps))
+        median = float(np.median(ps))
+        fill = float(np.mean(ps > peak - LTE_FILL_DB))
+        qkey = key if key is not None else round(float(center_mhz))
+        # Bounded-window quiet reference (see the class docstring):
+        # updated on EVERY capture; the reference is the minimum
+        # over the last `quiet_window` floors, so a transient low
+        # floor expires instead of permanently inflating snr_db.
+        hist = self._quiet_hist.setdefault(
+            qkey, deque(maxlen=self.quiet_window))
+        hist.append(noise)
+        quiet = min(hist)
+        self._quiet[qkey] = quiet
+        if fill < LTE_MIN_FILL_FRAC or peak - median > LTE_MEDIAN_GAP_DB:
+            return None
+        snr = peak - quiet
+        if snr < LTE_MIN_SNR_DB:
+            return None
+        # Occupied bandwidth: central 99% of linear power in-span.
+        lin = 10.0 ** (ps.astype(np.float64) / 10.0)
+        order = np.argsort(fs)
+        cum = np.cumsum(lin[order])
+        total = cum[-1]
+        if total <= 0:
+            return None
+        lo = fs[order][int(np.searchsorted(cum, 0.005 * total))]
+        hi = fs[order][int(min(len(cum) - 1,
+                               np.searchsorted(cum, 0.995 * total)))]
+        flatness = float(np.std(ps))
+        return {
+            "dl_band": band[0],
+            "is_lte450": bool(band[1]),
+            "occupied_bw_mhz": round((hi - lo) / 1e6, 3),
+            "flatness_db": round(flatness, 1),
+            "snr_db": round(snr, 1),
+            "fill_frac": round(fill, 3),
+        }
+
+    def event(self, radio, label, center_mhz, t, det):
+        """UDP-ready lte_illuminator packet for a detection dict."""
+        return {"v": 1, "kind": "lte_illuminator", "radio": radio,
+                "band": label, "center_mhz": float(center_mhz),
+                "dl_band": det["dl_band"],
+                "occupied_bw_mhz": det["occupied_bw_mhz"],
+                "flatness_db": det["flatness_db"],
+                "snr_db": det["snr_db"],
+                "t": float(t)}
+
+
+class LteBenchLog:
+    """Bench-measurement hook: the honest replacement for the
+    CLAIMED FKIE LTE450 ~1.6 km figure.
+
+    The operator runs known-range passes (or a known-range static
+    reflector) with the bridge sweeping an LTE DL band, and the
+    main loop records ONE ROW PER LTE-BAND SWEEP VISIT -- a
+    detection (detected=1) AND a miss (detected=0, snr_db 0.0).
+    Logging detections only would make every bin's fraction 1.0
+    by construction and defeat the hook's purpose. The `range_m`
+    column is left for the operator's ground truth (GPS / surveyed
+    range) -- the bridge cannot know range, and inventing it would
+    be exactly the overclaim this hook exists to prevent.
+    summarize_lte_bench() then turns filled-in rows into a measured
+    detection-fraction-vs-range curve. Until such a curve exists,
+    there is NO Shepherd LTE detection-range number to quote.
+    Rows are written with the csv module, so a comma or newline
+    in a free-text field (e.g. range_m) is quoted, never a
+    broken row.
+    """
+
+    HEADER = "t,radio,center_mhz,dl_band,snr_db,range_m,detected\n"
+
+    def __init__(self, path):
+        self.path = path
+        try:
+            with open(path, "r") as f:
+                exists = bool(f.read(1))
+        except OSError:
+            exists = False
+        if not exists:
+            with open(path, "w", newline="") as f:
+                f.write(self.HEADER)
+
+    def record(self, t, radio, center_mhz, dl_band, snr_db,
+               range_m="", detected=True):
+        with open(self.path, "a", newline="") as f:
+            csv.writer(f).writerow(
+                [float(t), radio, float(center_mhz), dl_band,
+                 float(snr_db), range_m, 1 if detected else 0])
+
+
+def summarize_lte_bench(rows, bin_width_m=100.0):
+    """Measured detection fraction per range bin from bench rows.
+
+    rows: iterable of dicts with numeric `range_m` and boolean-ish
+    `detected`. Returns a list of (bin_low_m, n, detection_fraction)
+    sorted by range. Rows without a usable range are ignored -- a
+    bench curve with no ground truth is no curve at all.
+    bin_width_m must be finite and > 0 (anything else raises
+    ValueError instead of a ZeroDivisionError or a nonsense bin).
+    """
+    try:
+        bin_width_m = float(bin_width_m)
+    except (TypeError, ValueError):
+        raise ValueError("bin_width_m must be a finite number > 0")
+    if not math.isfinite(bin_width_m) or bin_width_m <= 0:
+        raise ValueError("bin_width_m must be a finite number > 0")
+    bins = {}
+    for r in rows:
+        try:
+            rng = float(r["range_m"])
+            det = bool(int(r["detected"])) if not isinstance(
+                r["detected"], bool) else r["detected"]
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not math.isfinite(rng) or rng < 0:
+            continue
+        key = math.floor(rng / bin_width_m) * bin_width_m
+        n, d = bins.get(key, (0, 0))
+        bins[key] = (n + 1, d + (1 if det else 0))
+    return [(low, n, (d / n if n else 0.0))
+            for low, (n, d) in sorted(bins.items())]
+
+
+class Nr5gAdapter:
+    """5G NR downlink signal-of-opportunity adapter -- v0.25.0 STUB.
+
+    WHY A STUB, STATED PLAINLY: a real NR adapter must ingest an NR
+    channel (20-100 MHz wide, n78/n77 up to 100 MHz) to recognise
+    its structure. The bridge pipeline runs at 4 MSPS (2.4 MSPS
+    RTL-SDR) with a 3.2 MHz usable span; even a USRP at the bridge's
+    rate sees only a 3.2 MHz slice of a 20-100 MHz channel, and a
+    flat slice of NR is indistinguishable from a flat slice of LTE
+    or Wi-Fi at this DSP level. Claiming NR detection on that slice
+    would be faking a capability. So:
+
+    * probe(backend) gates on USRP-class hardware
+      (backend.name "uhd" / "soapy-uhd") at >= 20 MSPS;
+    * observe() ALWAYS returns [] -- no NR packet kind is emitted,
+      in any configuration, in v0.25.0;
+    * when the gate opens, status() says "stub" explicitly so a
+      future wideband capture path knows exactly what to fill in:
+      a >= 20 MSPS capture path + SSB/structure recognition, then
+      the same doppler_ref feed as the LTE adapter.
+
+    No BSense numbers are claimed: BSense (Meng et al.) ran on a
+    carrier 5G-A base station (4.9 GHz, 100 MHz, 128 channels) that
+    Shepherd does not control; its 1 km / F1 95.56% figures are
+    that system's results, not Shepherd's, and appear nowhere as
+    Shepherd capabilities.
+    """
+
+    MIN_SAMPLE_RATE_HZ = 20_000_000
+    USRP_BACKEND_NAMES = ("uhd", "soapy-uhd")
+
+    def probe(self, backend):
+        """Gate check. Returns a dict; `active` is True only for
+        USRP-class hardware at >= 20 MSPS, and even then `stub`
+        stays True -- active means "the interface is armed", not
+        "detection runs"."""
+        name = getattr(backend, "name", "?")
+        fs = float(getattr(backend, "sample_rate", 0) or 0)
+        is_usrp = name in self.USRP_BACKEND_NAMES
+        wide_enough = fs >= self.MIN_SAMPLE_RATE_HZ
+        if is_usrp and wide_enough:
+            reason = ("USRP-class + wideband capture present, but the "
+                      "v0.25.0 adapter is a STUB: interface only, no NR "
+                      "detection runs and no NR packets are emitted.")
+        elif is_usrp:
+            reason = (f"USRP-class but sample rate {fs / 1e6:g} MSPS < "
+                      f"20 MSPS: the bridge pipeline cannot ingest an "
+                      f"NR channel -- adapter inert.")
+        else:
+            reason = (f"backend '{name}' is not USRP-class -- 5G NR "
+                      f"adapter inert; everything else unchanged.")
+        return {"active": bool(is_usrp and wide_enough), "stub": True,
+                "backend": name, "sample_rate_hz": fs, "reason": reason}
+
+    def observe(self, *args, **kwargs):
+        """Stub: never emits. Kept signature-compatible with the
+        other detectors so the main loop can call it uniformly."""
+        return []
+
+    def status_line(self, backend):
+        p = self.probe(backend)
+        state = "ARMED-STUB" if p["active"] else "inert"
+        return f"[bridge] 5g-nr: {state} ({p['reason']})"
+
+
 # ---------------------------------------------------------------- main
 
 def parse_dest(s):
@@ -1046,7 +1469,22 @@ def main():
                     "(runs by default on 2.4 GHz / 900 MHz captures)")
     ap.add_argument("--no-doppler", action="store_true",
                     help="disable the ambient-LTE Doppler tracker "
-                    "(runs by default on 1.8-1.9 GHz stares)")
+                    "(runs by default on --stare only, incl. 1.8-1.9 "
+                    "GHz stares; a --bands list containing 1.8-1.9 GHz "
+                    "is a sweep, not a Doppler stare)")
+    ap.add_argument("--no-lte", action="store_true",
+                    help="disable the LTE downlink illuminator detector "
+                    "(runs by default on LTE DL bands; LTE450 still "
+                    "needs --lte450 or an explicit --bands/--stare)")
+    ap.add_argument("--lte450", action="store_true",
+                    help="opt in to the LTE450 downlink band (~465 MHz): "
+                    "only enable where the operator's radio covers it "
+                    "and local rules allow passive reception there")
+    ap.add_argument("--lte-bench-out", default="",
+                    help="CSV path for the LTE bench-measurement hook: "
+                    "one row per LTE-band sweep visit (detected 0/1); "
+                    "fill in the range_m column from ground truth "
+                    "afterwards (see LteBenchLog)")
     ap.add_argument("--no-wpp-ids", action="store_true",
                     help="disable the WPP-IDP per-preamble energy estimator "
                     "(runs by default on 2.4 GHz captures)")
@@ -1101,6 +1539,17 @@ def main():
     kept = [b for b in bands if b[1] <= backend.max_mhz]
     skipped = len(bands) - len(kept)
     bands = kept
+    # LTE450 gate: a plan or custom list that includes ~465 MHz
+    # stays off without an explicit operator opt-in (--lte450, or
+    # an explicit --bands/--stare listing of the band itself).
+    _pre = len(bands)
+    bands = [b for b in bands
+             if not (lte_band_for_center(b[1])
+                     and lte_band_for_center(b[1])[1]
+                     and not (args.lte450 or args.bands or args.stare))]
+    if len(bands) < _pre:
+        print("[bridge] LTE450 band skipped: needs --lte450 or an "
+              "explicit --bands/--stare listing (operator opt-in)")
     if not bands:
         sys.exit("No bands within this radio's frequency range. "
                  "Use --bands to pick lower ones or --stare <mhz>.")
@@ -1138,8 +1587,19 @@ def main():
     wpp = (None if args.no_wpp_ids
            else wpp_idp_detect.WppIdpEstimator(waveform=args.wpp_waveform,
                                                motion_state=args.motion_state))
+    lte = None if args.no_lte else LteIlluminatorDetector()
+    nr = Nr5gAdapter()
+    print(nr.status_line(backend))
+    # LTE450 gate: default sweeps never include it, but if a plan or
+    # custom list ever does, it stays off without an explicit
+    # operator opt-in (flag, or an explicit --bands/--stare listing).
+    lte450_ok = bool(args.lte450 or args.bands or args.stare)
+    if args.lte450:
+        print("[bridge] lte450: operator opt-in -- passive RX only; "
+              "check local rules for ~465 MHz reception")
+    bench = LteBenchLog(args.lte_bench_out) if args.lte_bench_out else None
     print(f"[bridge] doppler={'off' if args.no_doppler else 'on '
-          '(1.8-1.9 GHz stares)'} "
+          '(--stare only, incl. 1.8-1.9 GHz stares)'} "
           f"wpp_idp={'off' if args.no_wpp_ids
                          else args.wpp_waveform + ' ' + args.motion_state}")
 
@@ -1150,7 +1610,30 @@ def main():
         while True:
             for label, center, bw in bands:
                 backend.tune(center, bw, args.gain)
-                if doppler is not None and 1800.0 <= center < 1900.0:
+                _lte_band = lte_band_for_center(center)
+                # Doppler routing is STARE-ONLY (unified rule, fixed
+                # v0.25.0 review): the Doppler chain runs only when
+                # the band list itself came from --stare. That means
+                # (a) an explicit single-band --bands list is still a
+                # sweep: it keeps band-energy packets and gets
+                # lte_illuminator presence reports instead -- the
+                # earlier len(bands)==1 version misrouted single-band
+                # sweeps into the Doppler branch and silently
+                # suppressed the illuminator reports; (b) combined
+                # --bands + --stare: --bands wins band selection,
+                # so the list is NOT stare-derived and stays a sweep;
+                # (c) the old unconditional 1800-1900 MHz branch is
+                # GONE as a sweep route: a --bands list containing
+                # e.g. 1865 is now a sweep (band + lte_illuminator
+                # packets), while --stare 1865 still runs Doppler.
+                # LTE450 stares additionally need the opt-in gate.
+                _stare_derived = bool(args.stare) and not args.bands
+                _lte_stare = (
+                    doppler is not None and _stare_derived
+                    and _lte_band is not None
+                    and (not _lte_band[1] or lte450_ok))
+                if doppler is not None and _stare_derived and (
+                        1800.0 <= center < 1900.0 or _lte_stare):
                     # Doppler stare: a DSP chain instead of the
                     # band-energy chain. Consecutive captures (no retune
                     # between them) are assembled into 0.5 s CPIs by the
@@ -1221,6 +1704,33 @@ def main():
                        "sig_hint": sig_hint,
                        "t": now}
                 emit(pkt)
+                # LTE downlink illuminator presence (RX-only spectrum
+                # shape; sweep mode -- stares run the doppler_ref
+                # chain instead and `continue` above). LTE450 needs
+                # the opt-in gate; other DL bands run by default
+                # unless --no-lte. Silent when nothing is present.
+                if (lte is not None and x_last is not None
+                        and _lte_band is not None
+                        and (not _lte_band[1] or lte450_ok)):
+                    try:
+                        det = lte.detect(x_last, backend.sample_rate,
+                                         center)
+                    except Exception as ex:  # DSP never kills the sweep
+                        det = None
+                        if now - last_warn > 60.0:
+                            last_warn = now
+                            print(f"[bridge] lte detector error: {ex}")
+                    if det is not None:
+                        emit(lte.event(radio, label, center, now, det))
+                    # Bench hook: one row per LTE-band sweep visit,
+                    # detection AND miss -- detections-only logging
+                    # would force every bin's fraction to 1.0.
+                    if bench is not None:
+                        bench.record(now, radio, center,
+                                     _lte_band[0],
+                                     det["snr_db"] if det is not None
+                                     else 0.0,
+                                     detected=det is not None)
                 # ELRS chirp / Gemini-signature detection (RX-only DSP;
                 # corroboration, never an identification). Runs on the
                 # 2.4 GHz and 900 MHz families only; the detector gates
