@@ -1,5 +1,74 @@
 # Changelog
 
+## v0.25.0 — 2026-10-24 — Research-sweep build (BSense tracker gating, Kim tuning, LTE + 5G SDR-bridge adapters)
+
+The actionable items from the 2026-10-24 research sweep (lanes 1+2).
+Defensive-only throughout; no new transmit anywhere — the LTE and 5G
+paths are receive-only illuminators of opportunity, and the tracker
+gates are opt-in (default app behavior is unchanged; `app_state.dart`
+wiring is deferred to a follow-up, see below).
+
+- **BSense tracker gating (lane 2, Meng et al. 2026, portable parts
+  only).** (a) Per-spatial-cell Gaussian clutter fingerprint +
+  Mahalanobis gating replaces global thresholds for link-shadow
+  false alarms (adapted to link dips — Shepherd has no point
+  clouds; cell size/refresh mapped from the paper's 40 m cubes /
+  700 frames and documented in
+  `docs/bsense_tracker_gating_spec.md`). (b) Decayed (0.9)
+  spatial/velocity consistency confidence as a false-track gate
+  (report by default; strict veto is opt-in). Known limits carried
+  in code and docs: tangential-flight blindness, 50–100 m-style
+  occlusion gaps, and Doppler/continuity assumptions exploitable
+  by a knowledgeable operator. BSense's 1 km range and F1 95.56%
+  are NEVER claimed for Shepherd — they belong to carrier 5G-A
+  hardware Shepherd does not control. TrajFormer (the paper's
+  stage 3) was deliberately not ported.
+- **MilaGro gate pattern (lane 1, Picazo-Martinez et al. 2025).**
+  The sharpest/shortest-range channel gates (prunes) the
+  broad-coverage channel's search space, same shape as
+  anti-fade-link gating. No ML, no CNN imported.
+- **Size-aware detection thresholds (lane 1, Kim et al. 2025).**
+  Slim targets degrade detection, so thresholds are size-aware
+  (S 0.7 / M 1.0 / L 1.3 starting estimates, to field-calibrate),
+  not one global threshold. The 6-node/15-link ~1–2 m imaging
+  bound is NOT upgraded on this paper.
+- **Kim tuning discipline (lane 1).** Elastic Net α and
+  path-thickness γ are now tuned by optimization on recorded
+  data (deterministic grid search; the paper used Bayesian
+  optimization) instead of hand-picked, with tuned values logged
+  per deployment (provenance required, no default); DBSCAN-on-
+  binarized-image is the blob extractor. Demonstration data is
+  harness-generated, documented as NOT field data — the machinery
+  is data-agnostic and accepts recorded scenes. Field re-tuning
+  per deployment is required before trusting any tuned (α, γ).
+- **LTE illuminator adapter (lane 2, SDR bridge, RX-only).**
+  FDD LTE downlink bands (including LTE450, opt-in only) as
+  passive-radar illuminators feeding the Doppler-only refinement
+  layer (0.5 s CPI → ~2 Hz / 0.16 m/s radial resolution).
+  Presence is shape-only — never identity, never position, no
+  payload bits touched. FKIE LTE450's ~1.6 km bistatic figure is
+  CLAIMED (single secondary source, full text UNREAD) and is NOT
+  a Shepherd capability; the bridge ships a bench log (hits AND
+  misses) so a measured curve can replace it. LTE sweep presence
+  is bridge-only pending an app consumer; the stare path surfaces
+  via the existing `doppler_ref` parser.
+- **5G NR adapter (lane 2, SDR bridge, STUB — stated plainly).**
+  The bridge runs at 4 MSPS (3.2 MHz usable span) against
+  20–100 MHz NR channels, so claiming NR detection would be
+  faking a capability. `Nr5gAdapter` gates on USRP-class
+  hardware at ≥20 MSPS, is inert otherwise, and emits NO NR
+  packet in any v0.25.0 configuration. The interface exists for
+  a future wideband capture path.
+- **Reviews + tests.** Two independent reviews (both
+  SHIP-AFTER-FIXES); all 3 blockers, 20 should-fixes, and nits
+  fixed with regression tests, including: gate evaluation at
+  0.25 s poll cadence, veto state snapshot/restore, per-poll
+  refresh counting with trusted-cell floor, quiet-only
+  fingerprint learning, bounded-window LTE quiet reference,
+  stare-only Doppler routing, and bench miss rows. `flutter
+  analyze` clean; `flutter test` 472/472; bridge suite 83/83;
+  Kim suite 11/11.
+
 ## v0.24.0 — 2026-10-23 — Research-sweep build (FHSS threshold, classifier retrain, dropout bench, TinyML boundary)
 
 The four remaining actionable items from the 2026-10-23 research
