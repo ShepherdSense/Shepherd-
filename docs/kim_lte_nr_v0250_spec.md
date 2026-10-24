@@ -1,0 +1,318 @@
+# Kim Tuning Discipline + LTE / 5G NR Adapters — v0.25.0 Spec
+
+**Status:** implemented in v0.25.0; field validation pending for
+everything below. **Defensive-only, RX-only.** Nothing here
+transmits, jams, deauths, spoofs, or decodes user payload content.
+No ML/CNN is used by any item in this spec (Elastic Net is a
+regularized linear reconstruction; DBSCAN is a density rule).
+
+## 1. Kim tuning discipline (Kim et al., arXiv:2505.04085v2)
+
+Source: lane-1 research notes §6.12.1 — multipath-RTI on a 4-node
+SDR distributed-antenna network: Elastic Net (ℓ1+ℓ2)
+reconstruction + binarize + DBSCAN clustering for the position
+estimate; path thickness γ and sparsity α tuned by Bayesian
+optimization against ground truth.
+
+### What ports to Shepherd
+
+Implemented in `tools/train_disturbance_clf.py` (a separate
+section; the MLP disturbance classifier above it is untouched):
+
+- `build_link_pixel_weights(nodes, pixels, gamma)` — link-pixel
+  weight matrix with `w = 1 / (1 + excess_path / gamma)`, where
+  γ is the path-thickness scale. A 6-node deployment yields
+  15 links, matching Shepherd's sparse regime.
+- `elastic_net_reconstruct(W, y, alpha, l1_ratio=0.5)` —
+  non-negative Elastic Net reconstruction (scikit-learn).
+- `binarize_image(img, size_class)` + `dbscan_blobs(...)` —
+  binarization followed by pure-numpy DBSCAN (eps 1.5 pixels =
+  8-neighbourhood, min_samples 3) as the blob extractor. Isolated
+  hot pixels are noise, never detections. `binarize_image`
+  normalizes both size vocabularies — Python
+  "small"/"medium"/"large" and the Dart app's S/M/L
+  (`normalize_size_class`; anything else raises ValueError
+  naming the accepted values) — and requires an explicit frac
+  to satisfy 0 < frac <= 1; `dbscan_blobs` raises ValueError
+  up front when `binary_img` or `pixel_xy` does not have
+  exactly ny*nx entries. Size-vocabulary cross-reference:
+  Dart factors S 0.7 / M 1.0 / L 1.3 on a dip threshold;
+  Python fractions small 0.30 / medium 0.40 / large 0.50 of
+  image peak — different quantities on different scales,
+  agreeing only in direction (larger target -> higher bar).
+- `tune_kim_params(scenes, alphas, gammas)` — grid search over
+  (α, γ), scored against known target positions
+  (`score_blobs`: mean nearest-blob centroid error + a penalty
+  per wrong blob count; a missed scene scores a bounded
+  −(20 + penalty) so one miss cannot swamp a whole grid; the
+  empty-scene exception — no blobs AND no truth — scores 0.0,
+  a correct empty answer). Kim et
+  al. used Bayesian optimization; grid search is the
+  deterministic, dependency-free equivalent used here — the
+  distinction is stated in code, not hidden. The full grid is
+  returned, so a flat tuning surface (data that cannot
+  distinguish parameters) is visible, not hidden behind one
+  "best" pair.
+- `log_tuned_values(path, deployment, ...)` — per-deployment
+  JSONL log. `data_provenance` is REQUIRED and has no default:
+  a tuning record that does not say what its data was will be
+  misquoted later.
+- CLI: `--kim-tune-demo` (harness demo, no MLP training),
+  `--kim-tune FILE --kim-log FILE --kim-deployment NAME`
+  (recorded scenes; refuses to run without a log path and
+  without a `provenance` field in the scenes file).
+  Precedence (documented, not silent): `--kim-tune-demo`
+  wins over `--kim-tune` when both are passed — the demo
+  runs and the recorded-scenes path is skipped entirely.
+  Both refusal paths (no `--kim-log`, missing provenance)
+  are pinned by CLI tests.
+
+### What this paper does NOT support (do not upgrade on it)
+
+Kim et al. rescued few-node regimes with MPC/array
+multiplication (ray-traced paths, 8-element arrays), not with
+plain RSS — and their paper explicitly leaves the 6-node
+plain-RSS question unanswered. **Shepherd's standing 6-node /
+15-link imaging bound of ~1–2 m is UNCHANGED by this work.**
+This section tunes parameters for the imaging we already do;
+it claims no better imaging, and no accuracy number from Kim
+et al. is inherited (their CDFs are figure-only; their
+measurement used 4 USRP X310 nodes with rubidium sync, which
+Shepherd's tripwire layer correctly does not need).
+
+### Size-aware detection-threshold caveat (load-bearing)
+
+Kim et al. measured that a larger subject moderately increases
+error while a **slimmer subject significantly degrades**
+performance across the distribution — body size directly
+scales shadowing. A single global detection threshold is
+therefore wrong for mixed-size targets: slim targets
+(including small UAS) shadow less and need a lower
+binarization fraction to appear at all, at the cost of more
+false pixels, and their blobs must carry lower confidence.
+Starting fractions (NOT validated — re-tune per deployment on
+recorded data): large 0.50, medium 0.40, small 0.30.
+
+### Demonstration data honesty
+
+No recorded link-shadow image dataset exists in this repo
+(the bench fixtures are tracker replays, not RTI scenes), so
+the demonstration tuning run uses scenes generated by the
+file's own forward-model harness (`make_harness_scenes`: 6
+nodes, 20×16 grid over 10×8 m, one target per scene, forward
+model W(γ=0.6) + Gaussian noise). **That demonstration data
+is HARNESS-GENERATED, NOT FIELD DATA**, and it is labeled so
+in code, in CLI output, and in the log record. The tuning
+machinery is data-agnostic: point it at recorded scenes
+(provenance `"field-recorded, …"`) and the same code tunes on
+real data. Observed harness result (machinery check only):
+grid search recovers the forward-model γ = 0.6 at α = 0.001
+with mean score −0.155 (≈0.16 m mean centroid error on
+harness scenes). **Do not quote that error as field accuracy**
+— the forward model and the reconstruction share the same
+physics, so good harness scores prove the machinery runs, not
+that the field performance is that good.
+
+## 2. LTE detection adapter (in `sdr_bridge.py`)
+
+LTE downlink bands (FDD DL only; TDD excluded — a shared
+uplink/downlink channel cannot be claimed as a downlink
+illuminator from spectrum shape alone) as passive-radar
+illuminators of opportunity, feeding the existing
+Doppler-only track-refinement layer (0.5 s CPI → ~2 Hz /
+~0.16 m/s radial resolution at 1.86 GHz, per the Doppler
+spec). Two modes:
+
+- **Sweep:** `LteIlluminatorDetector` reports illuminator
+  PRESENCE per band as an additive `lte_illuminator` packet
+  (`dl_band`, `occupied_bw_mhz`, `flatness_db`, `snr_db`).
+  The detection is a spectrum-SHAPE claim only — "flat-top
+  wideband energy in an LTE DL band" — never "this is LTE",
+  never an identification, never a position, and no payload
+  bits are touched (only per-bin power).
+  **Sweep presence is bridge-only in v0.25.0: no app
+  consumer exists yet** (the app's radio-driver dispatch
+  drops `lte_illuminator`); wiring an app consumer is future
+  work, and no Dart parser was added for it here.
+- **Stare (`--stare` on an LTE DL centre):** the existing
+  `DopplerTracker` runs and emits the existing `doppler_ref`
+  schema — the wire format is unchanged, and the stare path
+  surfaces via the existing `doppler_ref` parser. An explicit
+  single-band `--bands` list is still a sweep (a routing bug
+  that sent it down the Doppler path was caught in smoke
+  testing and is pinned by a regression test).
+  **Doppler routing is stare-only (unified rule):** the
+  Doppler chain runs only when the band list itself came
+  from `--stare`. Combined `--bands` + `--stare` is a sweep
+  (`--bands` wins band selection, so the list is not
+  stare-derived), and the old unconditional 1800–1900 MHz
+  Doppler branch is gone as a sweep route — a `--bands`
+  list containing e.g. 1865 is now a sweep (band +
+  `lte_illuminator` packets), while `--stare 1865` still
+  runs Doppler. Both cases are pinned by subprocess tests.
+
+Detector internals (the part a reviewer should check):
+flat-top shape = ≥70% of usable-span bins within 6 dB of the
+peak AND span median within 6 dB of the peak (a tone fails
+the fill/median tests; quiet fails the SNR test). SNR is
+measured against the BOUNDED-WINDOW quiet floor at that
+centre — the minimum 20th-percentile floor over the last
+20 captures (`LTE_QUIET_WINDOW`), not the current capture's
+floor and NOT an all-time minimum: a flat-top signal filling
+~94% of the span lifts its own 20th-percentile floor into
+itself (measured: only ~6 dB apparent SNR on a 20 dB
+signal), while a true quiet floor is always lower, so
+min-updating can never calibrate a real emitter away, and
+the window is what keeps a transient low floor honest — one
+gain drop or antenna disconnect used to permanently lower
+an all-time-minimum reference and inflate every later
+snr_db (potentially pushing a sub-gate flat signal over
+the 10 dB gate); now that floor expires after 20 later
+captures at the centre. Consequence: a centre whose emitter
+has never been quiet stays silent until one quiet capture
+arrives.
+
+Band-label overlap (first-match rule): the LTE DL table is
+scanned in order and the first band containing the tuned
+centre wins. B28 (758–803 MHz) overlaps B20 (791–821 MHz),
+so a centre at 800 MHz is labelled B28 even where it is
+also B20 — the label is a table-lookup result, never a
+band identification.
+
+Centre-aware Doppler scales (no code change — the formula
+is centre-aware, but the numbers move a lot with centre):
+the fixed ±6 Hz notch and 400 Hz search are ±1.9 m/s /
+129 m/s at 465 MHz but ±0.43 m/s / 28 m/s at 2110 MHz
+(radial = doppler × c / (2 × centre)); quote a Doppler
+velocity only with its centre attached.
+
+**LTE450:** recognised (Band 31 DL, 462.5–467.5 MHz; the FKIE
+test frequency 467.37 MHz sits inside it) but OPT-IN ONLY:
+`--lte450`, or an explicit `--bands`/`--stare` listing of the
+band. The operator's radio must cover ~465 MHz and local
+rules must allow passive reception there; the bridge only
+ever receives. `--no-lte` disables the detector;
+`--lte-bench-out FILE` enables the bench hook.
+
+### FKIE LTE450 ~1.6 km: CLAIMED, not a capability
+
+The ~1.6 km bistatic figure sometimes attached to FKIE LTE450
+(Demissie & Steffes, IET Radar Sonar & Navigation 2025,
+e70092) reaches Shepherd through a SINGLE secondary source
+(MiGFlug blog, Oct 2025, read in full) while the paper's full
+text remains UNREAD (bot-blocked on every host tried). It is
+documented in code comments and here as an **unvalidated
+reference only**: it is NOT a Shepherd capability, NOT a
+validated target, and must never be quoted as one.
+`LteBenchLog` / `summarize_lte_bench()` exist so an operator
+can replace it with a measured detection-fraction-vs-range
+curve: run known-range passes, record one row per LTE-band
+sweep visit — detections AND misses (`detected` 0/1;
+detections-only logging would force every bin's fraction
+to 1.0 by construction) — the bridge cannot know range —
+the `range_m` column is left for the operator's GPS/surveyed
+ground truth, and inventing it would be exactly the
+overclaim this hook exists to prevent — then summarize per
+range bin. Rows are written via the csv module (a comma or
+newline in a free-text field is quoted, never a broken row)
+and `summarize_lte_bench` raises ValueError for a
+non-finite or ≤ 0 bin width. Until such a curve exists,
+there is NO Shepherd LTE detection-range number to quote.
+
+## 3. 5G NR adapter: a documented, tested STUB
+
+**The v0.25.0 5G NR adapter is a stub, stated plainly.** NR
+downlink channels are 20–100 MHz wide (n78/n77 up to 100 MHz);
+the bridge pipeline runs at 4 MSPS (2.4 MSPS RTL-SDR) with a
+3.2 MHz usable span, so no available radio configuration can
+practically ingest an NR channel here — even a USRP at the
+bridge's rate sees only a 3.2 MHz slice, and a flat slice of
+NR is indistinguishable from a flat slice of LTE or Wi-Fi at
+this DSP level. Claiming NR detection on that slice would be
+faking a capability.
+
+`Nr5gAdapter` therefore:
+
+- gates on USRP-class hardware (`uhd` / `soapy-uhd`) at
+  ≥ 20 MSPS — inert on every other backend, and inert on
+  USRP-class hardware at the bridge's 4 MSPS. Reachability
+  note: the armed-stub state is UNREACHABLE via
+  `--backend uhd` (no sample-rate flag exists there;
+  `UsrpBackend` always runs at 4 MSPS) and reachable in
+  practice only via `--backend soapy --soapy-driver uhd
+  --soapy-rate 20000000`;
+- even when the gate opens, `observe()` ALWAYS returns [] —
+  no NR packet kind is emitted in any configuration in
+  v0.25.0;
+- exposes the interface for a future wideband capture path:
+  the NR DL band table, `probe()` / `status_line()` (which
+  says "stub" explicitly when armed), and the documented
+  fill-in: a ≥ 20 MSPS capture path + SSB/structure
+  recognition, feeding the same `doppler_ref` layer as LTE.
+
+**No BSense numbers are claimed anywhere for Shepherd.**
+BSense (Meng et al., arXiv:2603.29187) ran on a carrier 5G-A
+base station (4.9 GHz, 100 MHz, 128 channels) that Shepherd
+does not control; its 1 km / F1 95.56% figures are that
+system's results, not Shepherd's, and appear nowhere in code,
+tests, or this spec as Shepherd capabilities. (Its portable
+lesson — layered false-alarm filtering — is tracker design,
+not an adapter claim, and is tracked separately.)
+
+## Wire-format decision
+
+**No existing packet schema changed.** The only new packet
+kind is the additive `lte_illuminator` (older Shepherd builds
+ignore unknown kinds, per the existing protocol contract);
+`band`, `beacon`, `doppler_ref`, and all other kinds are
+byte-identical to before. No NR packet kind exists in
+v0.25.0. The 5G NR adapter's inert/stub status is printed
+once at bridge startup (`[bridge] 5g-nr: inert …` /
+`ARMED-STUB …`) so an operator can see the gate state
+without reading code.
+
+## Tests
+
+- `sdr_bridge/test_lte_nr.py` (20 tests): LTE table
+  matching, flat-top detection / tone / quiet / out-of-band
+  negatives, SimBackend 465 MHz end-to-end, Doppler feed on
+  an LTE450-centre stare (same `doppler_ref` schema, radial
+  velocity at 465 MHz), bench log + summary, NR gating
+  (inert on RTL-SDR/Pluto/HackRF/simulate, inert on USRP at
+  4 MSPS, armed-stub on USRP at ≥ 20 MSPS with zero
+  emissions), sweep-vs-stare routing regression, plus the
+  v0.25.0 review fixes: bounded-window quiet reference
+  (transient low floor expires; strong signals still
+  detect), B28/B20 first-match overlap, bench bin-width
+  validation + csv quoting, combined `--bands` + `--stare`
+  stays a sweep, `--bands 1865` is a sweep (not Doppler),
+  bench logs misses as detected=0 rows.
+- `tools/test_kim_tuning.py` (11 tests, mlvenv): weight-matrix
+  shape and γ effect, DBSCAN blobs vs noise, size-aware
+  binarization ordering, bounded scoring, a full tuning run
+  on harness scenes (recovers γ = 0.6), per-deployment
+  logging with required provenance, recorded-scenes
+  round-trip plus both Kim CLI paths, plus the v0.25.0
+  review fixes: empty-scene score 0.0, Dart S/M/L aliases
+  + size/frac validation, DBSCAN length validation, Kim
+  CLI precedence (demo wins) and both refusal paths.
+- Full bridge regression: `test_sdr_bridge.py` (28),
+  `test_doppler_detect.py` (9), `test_elrs_detect.py` (17),
+  `test_wpp_idp_detect.py` (9) — all passing, unchanged
+  behaviour.
+
+## Honest limits (standing)
+
+- LTE presence ≠ LTE identification; a flat-top report in a
+  DL band is consistent with any flat wideband energy there.
+- LTE Doppler needs an ambient DL signal at usable strength
+  with a lockable direct-path reference; `ref_locked: false`
+  means zero weight, and a null return is uninformative
+  (tangential motion, low RCS, wrong geometry) — never
+  exonerating, per the Doppler spec's never-subtractive rule.
+- No Shepherd LTE range number exists until the bench hook
+  produces a measured curve; no Shepherd NR capability exists
+  until a wideband capture path lands.
+- Kim tuning on harness data validates machinery, not field
+  accuracy; per-deployment re-tuning on recorded data is
+  required before any tuned (α, γ) is trusted at a site.
