@@ -2,6 +2,7 @@ import 'dart:math' as math;
 
 import '../models/link_sample.dart';
 import '../models/tracking.dart';
+import 'tracker_gating.dart';
 
 /// Fuses disturbed mesh links into a single-target track estimate.
 ///
@@ -32,9 +33,61 @@ class Tracker {
   Tracker(
       {this.fixMinIntervalSecs = 1.5,
       this.idleResetSecs = 10.0,
-      this.sigma = 11.0}) {
+      this.sigma = 11.0,
+      this.clutterFingerprint,
+      this.consistencyGate,
+      this.consistencyGateStrict = false}) {
     imagingBands['default'] = ImagingBandParams.defaults();
     imagingBands['mesh'] = ImagingBandParams.defaults();
+  }
+
+  /// Optional BSense clutter fingerprint (tracker_gating.dart). When
+  /// attached, quiet link samples teach it per-cell clutter and
+  /// clutter-like disturbed links are demoted (replacing the global
+  /// threshold for those links). Null = off; default behavior is
+  /// byte-identical to before this change.
+  final ClutterFingerprint? clutterFingerprint;
+
+  /// Optional BSense decayed-consistency gate (tracker_gating.dart).
+  /// When attached, every estimate feeds it and [lastConsistencyGate]
+  /// carries its verdict. It suspends nothing by default — mirroring
+  /// TrackConsistencyMonitor, which suspends corroboration upgrades,
+  /// not detection — unless [consistencyGateStrict] is true, in which
+  /// case a failing verdict suppresses the estimate. The fingerprint
+  /// is deliberately NOT reset by [reset]: clutter learning is
+  /// long-lived (BSense ~2-day refresh), not per-track state.
+  final DecayedConsistencyGate? consistencyGate;
+
+  /// Strict mode for [consistencyGate]: failing verdict → no estimate.
+  /// Default false: the gate reports, it does not veto, so existing
+  /// behavior is unchanged unless the caller opts in.
+  /// Strict mode delays first reporting by one consistent fix:
+  /// confidence starts at 0.5 and passes only when strictly above
+  /// it, so the first fix is always suppressed in strict mode and
+  /// the second (consistent) fix is the first one reported.
+  final bool consistencyGateStrict;
+
+  /// Verdict of [consistencyGate] for the latest estimate, or null
+  /// when no gate is attached / no estimate has been produced yet.
+  ConsistencyGateVerdict? lastConsistencyGate;
+
+  /// MilaGro-style sharp-channel gate over RTI image cells: keep only
+  /// cells within the gate radius of a live sharp support point.
+  /// Empty live sharp set → all cells returned unchanged (fail open:
+  /// sharp silence is not a veto). See MilagroGate in tracker_gating.
+  List<RtiCell> gateRtiCells(
+    List<RtiCell> cells,
+    List<SharpSupport> sharp, {
+    MilagroGate? gate,
+    DateTime? now,
+  }) {
+    final g = gate ?? MilagroGate();
+    final points = [for (final c in cells) GatePoint(x: c.x, y: c.y)];
+    final kept = g.prune(points, sharp, now: now).toSet();
+    return [
+      for (var i = 0; i < cells.length; i++)
+        if (kept.contains(points[i])) cells[i],
+    ];
   }
 
   final List<_Fix> _fixes = [];
@@ -64,13 +117,30 @@ class Tracker {
     required Map<String, NodePosition> nodes,
     required double dipThreshold,
     required DefendedPoint defended,
+    // Size-aware thresholds (Kim et al. caveat, tracker_gating.dart):
+    // when both are supplied, the fallback threshold for samples that
+    // carry no per-link threshold of their own becomes the
+    // size-scaled threshold instead of the global [dipThreshold].
+    // [expectedSizeClass] must be an EXPECTED size (operator setting
+    // / prior), never the size class of the dip being thresholded —
+    // that would be circular. Omitted = global threshold, unchanged.
+    SizeAwareThresholds? sizeThresholds,
+    String? expectedSizeClass,
   }) {
     // Link *pairs* (directions deduped, strongest dip kept) — ALL pairs,
     // not just disturbed ones: quiet links carry "the target is NOT near
     // me" information that sharpens the fix.
-    final pairs = _dedupePairs(samples, nodes, dipThreshold);
-    final disturbed = pairs.values.where((p) => p.isDisturbed).toList();
+    final effectiveFallback = sizeThresholds == null
+        ? dipThreshold
+        : sizeThresholds.thresholdFor(expectedSizeClass, dipThreshold);
+    final pairs = _dedupePairs(samples, nodes, effectiveFallback);
+    // BSense clutter gate (tracker_gating.dart): when a fingerprint is
+    // attached, quiet pairs teach it and clutter-like disturbed pairs
+    // are demoted — per-cell Mahalanobis gating REPLACES the global
+    // threshold for those links. Untrusted cells fail open (kept).
+    final disturbed = _applyClutterGate(pairs, now);
     if (disturbed.isEmpty) {
+      consistencyGate?.noteMissedPoll();
       if (_lastDetect != null &&
           now.difference(_lastDetect!).inMilliseconds / 1000 >
               idleResetSecs) {
@@ -78,19 +148,37 @@ class Tracker {
       }
       return null;
     }
-    _lastDetect = now;
 
     // Geometry gate: one link (two nodes) only says "somewhere along this
     // line", and the grid search would pick an arbitrary point on it.
     // Without 3+ positioned nodes there is nothing honest to localize --
     // the disturbance is still reported by the tripwire / banner.
+    // Like the empty-disturbed path above, this counts as a missed
+    // poll for the consistency gate (symmetry: no fix was produced),
+    // and it does NOT refresh _lastDetect — a geometry-starved poll
+    // must not keep a dead track alive past the idle reset.
     final geometryIds = <String>{};
     for (final p in pairs.values) {
       geometryIds
         ..add(p.a.nodeId)
         ..add(p.b.nodeId);
     }
-    if (geometryIds.length < 3) return null;
+    if (geometryIds.length < 3) {
+      consistencyGate?.noteMissedPoll();
+      return null;
+    }
+
+    // Snapshot pre-estimate tracker state for the strict-gate veto
+    // below: a vetoed estimate must not advance the track. Without
+    // this, _fixes/_vx/_vy committed above and _lastDetect refreshed
+    // here would survive a veto, so the vetoed stream would drive
+    // velocity and permanently refresh _lastDetect (a vetoed stream
+    // could then never trigger the 10 s idle reset).
+    final savedFixes = List<_Fix>.of(_fixes);
+    final savedVx = _vx;
+    final savedVy = _vy;
+    final savedLastDetect = _lastDetect;
+    _lastDetect = now;
 
     // Position: coarse 3D tomographic grid search. Each candidate point is
     // scored by how well the disturbed links' dips match a Gaussian
@@ -264,7 +352,7 @@ class Tracker {
       }
     }
 
-    return TrackEstimate(
+    final estimate = TrackEstimate(
       timestamp: now,
       x: x,
       y: y,
@@ -278,6 +366,63 @@ class Tracker {
       linksUsed: disturbed.length,
       relation: relation,
     );
+    // BSense decayed-consistency gate: report by default, veto only
+    // in strict mode (see field docs). The non-strict default mirrors
+    // TrackConsistencyMonitor — the gate informs the merger, it does
+    // not silently delete detections the tripwire already confirmed.
+    final gate = consistencyGate;
+    if (gate != null) {
+      lastConsistencyGate = gate.observe(now, x, y, speed);
+      if (consistencyGateStrict && !lastConsistencyGate!.passes) {
+        // Veto: restore pre-estimate tracker state (fixes, velocity,
+        // last detection) so the vetoed estimate leaves no trace on
+        // the track. The gate verdict itself is kept in
+        // lastConsistencyGate — the gate did observe this fix; only
+        // the tracker's committed state rolls back.
+        _fixes
+          ..clear()
+          ..addAll(savedFixes);
+        _vx = savedVx;
+        _vy = savedVy;
+        _lastDetect = savedLastDetect;
+        return null;
+      }
+    }
+    return estimate;
+  }
+
+  /// Partition deduped pairs through the clutter fingerprint.
+  /// Returns the disturbed pairs that survive gating. Side effects
+  /// (only when a fingerprint is attached): exactly one poll is
+  /// counted toward the refresh frame bound (see notePoll), and
+  /// ONLY genuinely quiet pairs (isDisturbed == false) feed the
+  /// fingerprint at their midpoint cell with their dip. Disturbed
+  /// pairs are NEVER fed — neither survivors nor clutter-demoted
+  /// ones: feeding a demoted dip back in would shift the cell mean
+  /// toward the very disturbance just gated out, so a real
+  /// slow/loitering target demoted once could never re-emerge.
+  /// Null fingerprint = the input disturbed list, untouched.
+  List<_PairDip> _applyClutterGate(
+      Map<String, _PairDip> pairs, DateTime now) {
+    final disturbed = pairs.values.where((p) => p.isDisturbed).toList();
+    final fp = clutterFingerprint;
+    if (fp == null) return disturbed;
+    fp.notePoll(now: now);
+    final kept = <_PairDip>[];
+    for (final p in disturbed) {
+      final mx = (p.a.x + p.b.x) / 2;
+      final my = (p.a.y + p.b.y) / 2;
+      if (fp.gate(mx, my, p.dip).targetLike) {
+        kept.add(p);
+      }
+    }
+    for (final p in pairs.values) {
+      if (p.isDisturbed) continue;
+      final mx = (p.a.x + p.b.x) / 2;
+      final my = (p.a.y + p.b.y) / 2;
+      fp.observe(mx, my, p.dip, now: now);
+    }
+    return kept;
   }
 
   /// Least-squares velocity over fixes from the last [window] seconds.
@@ -313,6 +458,10 @@ class Tracker {
     _vx = null;
     _vy = null;
     _lastDetect = null;
+    consistencyGate?.reset();
+    lastConsistencyGate = null;
+    // NOTE: clutterFingerprint is NOT reset here — clutter learning
+    // is long-lived (BSense ~2-day refresh), not per-track state.
   }
 
   /// 2D shadow (attenuation) grid for the "what are the waves hitting"
