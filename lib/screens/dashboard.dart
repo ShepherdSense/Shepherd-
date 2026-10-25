@@ -2,10 +2,12 @@ import 'package:flutter/material.dart';
 
 import '../models/link_sample.dart';
 import '../services/health.dart';
+import '../services/phone_tier.dart';
 import '../services/radio_driver.dart';
 import '../state/app_state.dart';
 import '../theme.dart';
 import 'evidence_sheet.dart';
+import 'hunt_screen.dart';
 
 /// Dot color for a crossing event's size estimate. Pure function so the
 /// timeline and the detection card agree — and so it's unit-testable.
@@ -44,8 +46,16 @@ class DashboardScreen extends StatelessWidget {
           padding: const EdgeInsets.all(12),
           children: [
             _alertPanel(disturbed),
+            // v0.26.0: phone-tier banner — visible ONLY when the tier
+            // is actually active (switch on + no mesh/SDR hardware
+            // attached). Mesh users never see it. Labels verbatim
+            // from the tier service, never paraphrased.
+            if (state.phoneTier.active) ...[
+              const SizedBox(height: 12),
+              _phoneTierBanner(context),
+            ],
             const SizedBox(height: 12),
-            _controlRow(),
+            _controlRow(context),
             const SizedBox(height: 12),
             _radiosCard(),
             const SizedBox(height: 12),
@@ -229,7 +239,63 @@ class DashboardScreen extends StatelessWidget {
     );
   }
 
-  Widget _controlRow() {
+  /// v0.26.0 phone-tier banner + Hunt entry point. The Hunt screen
+  /// is pushed, not a tab, so the main tab bar stays untouched.
+  /// Hunt is reachable from here even when the tier is inactive —
+  /// the banner itself is tier-gated, the mode is not — via the
+  /// button below (mesh users can hunt a phone-visible emitter too).
+  Widget _phoneTierBanner(BuildContext context) {
+    final tier = state.phoneTier;
+    return SentryPanel(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '${tier.modeLabel} · ${tier.rangeLabel}',
+            style: SentryType.section().copyWith(
+              color: SentryColors.purple,
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            // v0.26.0 fix-pass: the source list renders from the
+            // tier's actual availableSources — never a hardcoded
+            // claim of all five when one is switched off.
+            tier.availableSources.isEmpty
+                ? 'PHONE SCANS ONLY — NO PHONE SOURCES CURRENTLY '
+                    'AVAILABLE. NO MESH HARDWARE ATTACHED, SO THERE '
+                    'IS NO AREA COVERAGE. NOTHING HEARD IS NOT '
+                    'NOTHING PRESENT.'
+                : 'PHONE SCANS ONLY — ${tier.availableSources.map((s) => s.label.toUpperCase()).join(', ')}. '
+                    'NO MESH HARDWARE ATTACHED, SO THERE IS NO AREA '
+                    'COVERAGE. NOTHING HEARD IS NOT NOTHING PRESENT.',
+            style: SentryType.section(10).copyWith(height: 1.6),
+          ),
+          if (tier.unavailableReason != null) ...[
+            const SizedBox(height: 6),
+            Text(
+              tier.unavailableReason!.toUpperCase(),
+              style: SentryType.section(10).copyWith(
+                color: SentryColors.orange,
+              ),
+            ),
+          ],
+          const SizedBox(height: 10),
+          ElevatedButton.icon(
+            icon: const Icon(Icons.whatshot, color: SentryColors.purple),
+            label: const Text('OPEN HUNT — PROXIMITY ONLY'),
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute(
+                builder: (_) => HuntScreen(state: state),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _controlRow(BuildContext context) {
     final live = !state.settings.simulatedMode;
     return SentryPanel(
       child: Column(
@@ -253,6 +319,20 @@ class DashboardScreen extends StatelessWidget {
             Text(state.error!,
                 style: SentryType.rowValue(SentryColors.red)),
           ],
+          // v0.26.0: Hunt entry for everyone, not just phone-tier
+          // users — a mesh operator can still hunt a phone-visible
+          // emitter. The phone-tier banner above is the tier-gated
+          // surface; this button is the always-visible one.
+          const SizedBox(height: 10),
+          OutlinedButton.icon(
+            icon: const Icon(Icons.whatshot, color: SentryColors.purple),
+            label: const Text('HUNT — PROXIMITY ONLY'),
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute(
+                builder: (_) => HuntScreen(state: state),
+              ),
+            ),
+          ),
         ],
       ),
     );
