@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.26.1 — 2026-10-25 — review-fix pass (from a PC-side static review of v0.26.0)
+
+Small, behavior-preserving fix set; no features, no gateway/CoT/ZMeta changes, no detection-path changes. Verified in this workspace: `flutter analyze` clean, full suite 576/576 (573 v0.26.0 baseline + 3 new v0.26.1 tests).
+
+- AppState.dispose(): cancel the ZMeta fix/heartbeat timers and the Remote ID Wi-Fi poll (they kept firing after dispose).
+- SensorsPlusStepSource.start(): a synchronous throw from the accelerometer stream (platforms without motion sensors) now degrades to "no steps" + lastError instead of crashing Hunt start; never adds to a closed controller.
+- TileCache: manifest writes serialized and atomic (temp + rename). Concurrent writes could corrupt the manifest, and a corrupt manifest deletes every cached tile on next launch.
+- tilesForBounds: O(n) de-duplication (was O(n^2) List.contains).
+- Tracker.update: guard against non-positive/non-finite max dip (NaN grid scores); reports a missed poll instead.
+
 ## v0.26.0 — 2026-10-24 — Fieldwatch-borrow build (Remote ID hardening/labels, signature library, Hunt, phone-only tier, offline maps)
 
 Phone/EUD-first build borrowing five Fieldwatch (OffGridPete, MIT)
