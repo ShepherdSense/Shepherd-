@@ -542,6 +542,26 @@ class _WifiVisionScreenState extends State<WifiVisionScreen> {
                       ),
                     ),
                   ),
+                  // v0.26.0 fix-pass: MINIMAL display-only signature
+                  // consumer. When the library switch is on, each
+                  // Wi-Fi row shows its best hypothesis match label
+                  // (HYPOTHESIS wording preserved verbatim, never
+                  // presented as identity). Display only: matching
+                  // here creates no detection, track, or alert.
+                  if (state.settings.deviceSignaturesEnabled)
+                    for (final match in state.deviceSignatures
+                        .matchWifi(bssid: ap.bssid, ssid: ap.ssid)
+                        .take(1))
+                      Padding(
+                        padding: const EdgeInsets.only(top: 3),
+                        child: Text(
+                          match.hypothesisLabel,
+                          style: SentryType.section(10).copyWith(
+                            color: SentryColors.muted,
+                            height: 1.4,
+                          ),
+                        ),
+                      ),
                 ],
               ),
             ),
