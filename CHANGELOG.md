@@ -1,5 +1,117 @@
 # Changelog
 
+## v0.26.0 — 2026-10-24 — Fieldwatch-borrow build (Remote ID hardening/labels, signature library, Hunt, phone-only tier, offline maps)
+
+Phone/EUD-first build borrowing five Fieldwatch (OffGridPete, MIT)
+ideas — concept adapted, no Fieldwatch code or catalog data copied.
+Defensive-only, RX-only throughout; no gateway, CoT, or ZMeta
+changes; no detection, tracker, or merger code paths touched. All
+five items are additive and opt-in; default behavior for existing
+mesh users is unchanged.
+
+- **Remote ID — harden, label, prove (NOT new).** Remote ID
+  decoding shipped in v0.22.0; this release hardens, labels, and
+  proves it instead of re-implementing it. Audit of
+  `remote_id.dart` / `remote_id_service.dart` for malformed and
+  short frames, with regression tests (truncated message, bad type
+  nibble, oversized pack count, empty service data, stale contact
+  expiry). Two service-layer crash fixes: (a) the BLE
+  advertisement path now decodes before ingesting, so empty or
+  garbled service data fires no spurious onUpdate (correction,
+  v0.26.0 fix-pass: the real BLE fix was the spurious update —
+  ingest already early-returned on empty lists, so no contact
+  was ever created by empty data); (b) the Wi-Fi survey poll now
+  treats a throwing
+  survey source as a soft no-op and skips rows with a non-string
+  BSSID or non-numeric beacon elements instead of `as`-casting
+  them — the old casts threw and took the whole poll down with one
+  bad row, and skipped (never ingested under a shared 'unknown'
+  key, which would have merged distinct drones into one contact). RID records now render `COOPERATIVE (RID)` (with
+  transport, e.g. `COOPERATIVE (RID · BLE)`) as a second marker
+  line on the Tracking map, visibly distinct from mesh tracks.
+  Proven by test: RID evidence never feeds detection, the tracker,
+  or the confidence merger, and never suppresses or downgrades a
+  mesh track/alert. Wi-Fi NAN Remote ID is NOT implemented —
+  stock Android does not expose NAN frames to the app; the RID
+  help copy in Settings now says so, and BLE 5 extended
+  advertising is labeled platform-dependent. Never faked.
+- **Wi-Fi/BLE signature library — "what's around me" (opt-in,
+  default off).** New `lib/services/device_signatures.dart`: a
+  const built-in catalog matched against phone-visible Wi-Fi scan
+  results and BLE advertisements, returning ranked candidate
+  device classes with firing evidence. User-added signatures load
+  from `device_signatures.json` in the app documents directory
+  (read by AppState via path_provider — the service itself does
+  no file I/O) and merge over built-in entries; user entries are
+  labeled USER-ADDED wherever they surface. Every match is
+  labeled HYPOTHESIS, never identity, in code and in UI strings;
+  catalog entries are grounded in a public assignment (Bluetooth
+  SIG company ID / service UUID, IEEE OUI) or marked
+  UNVERIFIED/COMMUNITY. Malformed user JSON degrades to built-in
+  only with a warning surfaced in Settings (never a crash, never
+  a silent whole-catalog drop). Settings shows built-in +
+  user-added + merged counts and a reload button. Live match
+  surface (v0.26.0 fix-pass): when the switch is on, Wi-Fi Vision
+  access-point rows show each row's best hypothesis match label
+  (display-only; matching creates no detection, track, or alert).
+- **Hunt heat-map mode (opt-in).** New `lib/services/hunt_tracker.dart`
+  (pure-Dart core) plus `lib/screens/hunt_screen.dart`: a selected
+  emitter's RSSI samples accumulate into a spatial heat grid with
+  decay/aging (driven on a ~5 s timer) and a highlighted loudest
+  cell; motion-sensor steps (`sensors_plus`, added to pubspec)
+  carry the walk between GPS fixes. Output is PROXIMITY ONLY —
+  NOT A POSITION FIX, labeled on the screen. Feedback wires
+  onBeep to a system click + visual flash and onVibrate to
+  haptics; there is NO audio plugin in this build, so the beep is
+  a system click, not a dedicated tone (documented on-screen).
+  TileBackgroundPainter paints the bottom layer when a cached
+  origin tile is available; missing tiles render the NO CACHED
+  TILE grid, never an invented map. Entered from the dashboard
+  (phone-tier banner, or the always-visible HUNT button in the
+  SOURCE card) — deliberately not a new bottom-nav tab.
+- **Phone-only tier.** New `lib/services/phone_tier.dart`, wired
+  in AppState from live driver state (mesh poller / SDR-bridge /
+  Kraken / ESP32 poller / simulated mode), recomputed on every
+  attachment change (start/stop already notify). The tier is
+  active ONLY when its switch is on (default true — but mesh
+  users see zero change, because any attached hardware deactivates
+  it) and no mesh/SDR hardware is attached. When active, the
+  dashboard shows its mode and range labels verbatim:
+  `PHONE-ONLY · PHONE-RANGE · tens of meters, not area
+  coverage`, plus the phone sources it exposes (BLE scan, Wi-Fi
+  survey, Remote ID, signature library, Hunt) — never presented
+  as mesh-equivalent. Unavailable sources degrade to off and are
+  named, never silently dropped.
+- **Offline maps pattern.** New `lib/services/offline_map_source.dart`:
+  keyless tile sources only (OpenStreetMap Standard, USGS
+  Imagery, USGS Topo — URL templates, no paid keys, no
+  Esri/MapTiler/Stadia/Thunderforest built in; the keyless
+  constructor refuses any template carrying a key parameter), a
+  cache-first 50 MB LRU disk cache (http + path_provider,
+  stale-on-error), and a CustomPaint-compatible tile-background
+  painter. Settings carries a keyless-only tile-source dropdown
+  (default OSM); the Hunt screen paints the cached origin tile
+  underneath its grid.
+- **UNVERIFIED until hardware runs it:** all live-RF and on-device
+  behavior in this release — Hunt step accuracy (0.75 m step
+  length is an assumption, not a measurement), the
+  SensorsPlusStepSource adapter on a real phone (its detector is
+  unit-tested; the adapter itself cannot be exercised without
+  hardware), phone-OS scan quotas and randomized-MAC hiding,
+  tile fetching on a real EUD, and the Hunt screen's manual
+  hunt-local position entry (no live GPS feed is wired into the
+  screen in this build — the onGpsFix plumbing is real, the feed
+  is operator-entered). Hunt disclosure (v0.26.0 fix-pass):
+  samples (RSSI + position) are operator-typed in this build, no
+  live RSSI/GPS feed is wired in, and step distance is
+  informational only — with no heading source it never places
+  samples. No performance numbers are claimed
+  anywhere in this release.
+- **Reviews + tests.** `flutter analyze` clean (no issues);
+  full `flutter test` 550/550 passing (v0.25.0 base 472 plus the
+  v0.26.0 service suites: Remote ID audit/never-override,
+  signature, Hunt, phone-tier, and offline-map tests).
+
 ## v0.25.0 — 2026-10-24 — Research-sweep build (BSense tracker gating, Kim tuning, LTE + 5G SDR-bridge adapters)
 
 The actionable items from the 2026-10-24 research sweep (lanes 1+2).
