@@ -61,11 +61,22 @@ List<Widget> airframeLayer({
     final lon = r.lon;
     if (lat == null || lon == null) continue;
     final color = airframeAffiliationColor(r.affiliationLabel);
+    // v0.26.0 fix-pass: a serial-bearing RID record folded into a
+    // record must carry the cooperative badge too — previously
+    // only serial-less contacts got one, so folded RID records
+    // rendered with no cooperative badge at all. RID-only
+    // evidence (hasRid with no telemetry position and no link
+    // metrics — Class C in practice) gets the badge; records a
+    // cooperative feed drives do not, because their position is
+    // not a broadcast claim.
+    final ridOnly =
+        r.hasRid && !r.hasTelemetryPosition && !r.hasLinkMetrics;
     out.add(_AirMarker(
       pos: project(lat, lon),
       color: color,
       operator: false,
       label: '${r.displayName} · ${r.klass.name.toUpperCase()}',
+      cooperativeLabel: ridOnly ? kRidCooperativeLabel : null,
     ));
     final oLat = r.operatorLat;
     final oLon = r.operatorLon;
@@ -88,11 +99,15 @@ List<Widget> airframeLayer({
     final lat = c.lat;
     final lon = c.lon;
     if (lat == null || lon == null) continue;
+    // v0.26.0: RID contacts render their cooperative label as a
+    // second line, so a cooperative broadcast can never be misread
+    // as a non-cooperative mesh track at a glance.
     out.add(_AirMarker(
       pos: project(lat, lon),
       color: SentryColors.amber,
       operator: false,
       label: c.serial ?? 'RID · NO ID',
+      cooperativeLabel: c.cooperativeSourceLabel,
     ));
     final oLat = c.operatorLat;
     final oLon = c.operatorLon;
@@ -236,12 +251,18 @@ class _AirMarker extends StatelessWidget {
     required this.color,
     required this.operator,
     required this.label,
+    this.cooperativeLabel,
   });
 
   final Offset pos;
   final Color color;
   final bool operator;
   final String label;
+
+  /// v0.26.0: cooperative (RID) badge line, e.g.
+  /// `COOPERATIVE (RID · BLE)`. Null for non-RID markers (records
+  /// carry their affiliation in color + name already).
+  final String? cooperativeLabel;
 
   @override
   Widget build(BuildContext context) {
@@ -274,6 +295,21 @@ class _AirMarker extends StatelessWidget {
                   ],
                 ),
               ),
+              if (cooperativeLabel != null)
+                Text(
+                  cooperativeLabel!,
+                  textAlign: TextAlign.center,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 7.5,
+                    fontWeight: FontWeight.w700,
+                    color: color,
+                    shadows: const [
+                      Shadow(color: Colors.black, blurRadius: 3),
+                    ],
+                  ),
+                ),
             ],
           ),
         ),
