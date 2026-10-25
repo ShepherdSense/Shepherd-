@@ -240,13 +240,14 @@ List<TileCoord> tilesForBounds(
           (west, east),
         ];
   final out = <TileCoord>[];
+  final seen = <TileCoord>{};
   for (final (w, e) in ranges) {
     final topLeft = latLonToTile(north, w, zoom);
     final bottomRight = latLonToTile(south, e, zoom);
     for (var x = topLeft.x; x <= bottomRight.x; x++) {
       for (var y = topLeft.y; y <= bottomRight.y; y++) {
         final coord = TileCoord(zoom, x, y);
-        if (!out.contains(coord)) out.add(coord);
+        if (seen.add(coord)) out.add(coord);
       }
     }
   }
@@ -433,15 +434,28 @@ class TileCache {
         headers: {'User-Agent': kTileUserAgent},
       );
 
-  Future<void> _saveManifest() async {
-    try {
-      final json = {
-        for (final entry in _manifest.entries) entry.key: entry.value.toJson(),
-      };
-      await _manifestFile.writeAsString(jsonEncode(json));
-    } catch (_) {
-      // Best-effort only: losing the manifest costs LRU order, not tiles.
-    }
+  // Review fix: manifest writes are serialized and atomic. Parallel
+  // tile fetches used to call writeAsString on the same file
+  // concurrently; interleaved writes could leave corrupt JSON, and a
+  // corrupt manifest makes the next launch DELETE every cached tile.
+  Future<void> _saveChain = Future<void>.value();
+
+  Future<void> _saveManifest() {
+    final next = _saveChain.then((_) async {
+      try {
+        final json = {
+          for (final entry in _manifest.entries)
+            entry.key: entry.value.toJson(),
+        };
+        final tmp = File('${_manifestFile.path}.tmp');
+        await tmp.writeAsString(jsonEncode(json), flush: true);
+        await tmp.rename(_manifestFile.path);
+      } catch (_) {
+        // Best-effort only: losing the manifest costs LRU order, not tiles.
+      }
+    });
+    _saveChain = next;
+    return next;
   }
 
   Future<TileFetchResult?> _readCached(String key) async {
