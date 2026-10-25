@@ -223,7 +223,11 @@ RidMessage? decodeRidMessage(List<int> bytes) {
       final speedMult = flags & 0x1;
       // Direction: 0..179 in the byte, +180 when the EW flag is set;
       // the 360 result is the broadcast "unknown" marker.
+      // v0.26.0 fix-pass: with the EW flag CLEAR, a byte of 180-255
+      // is out of the valid 0-179 range and decodes to null — it
+      // must not leak through as a 180-255 degree heading.
       final dirRaw = b[2] + (ew == 1 ? 180 : 0);
+      final directionUnknown = (ew == 0 && b[2] >= 180) || dirRaw >= 360;
       final speedRaw = b[3];
       final double? speedH;
       if (speedMult == 1 && speedRaw == 255) {
@@ -243,7 +247,7 @@ RidMessage? decodeRidMessage(List<int> bytes) {
         version,
         status: status,
         heightAboveTakeoff: heightType == 0,
-        directionDeg: dirRaw >= 360 ? null : dirRaw.toDouble(),
+        directionDeg: directionUnknown ? null : dirRaw.toDouble(),
         speedHorizontalMps: speedH,
         speedVerticalMps: vs.abs() >= 63 ? null : vs,
         lat: hasPos ? latRaw * 1e-7 : null,
@@ -307,13 +311,18 @@ RidMessage? decodeRidMessage(List<int> bytes) {
 /// 3-byte header: type/version, single-message size, count).
 /// Returns the decoded member messages; malformed packs yield
 /// whatever members decode cleanly (never throws).
+/// v0.26.0 fix-pass: when called DIRECTLY, the length must be
+/// EXACT (3 + count * size) — trailing garbage is rejected, not
+/// silently ignored. (The transport cascade in
+/// [decodeRidAppData] already requires exact length before it
+/// routes a frame here, so that path is unchanged.)
 List<RidMessage> decodeRidMessagePack(List<int> bytes) {
   if (bytes.length < 3) return const [];
   if (((bytes[0] >> 4) & 0xF) != 0xF) return const [];
   final size = bytes[1];
   final count = bytes[2];
   if (size != kRidMessageSize || count < 1 || count > 9) return const [];
-  if (bytes.length < 3 + count * size) return const [];
+  if (bytes.length != 3 + count * size) return const [];
   final out = <RidMessage>[];
   for (var i = 0; i < count; i++) {
     final m = decodeRidMessage(bytes.sublist(3 + i * size, 3 + (i + 1) * size));
@@ -357,6 +366,25 @@ List<RidMessage> decodeRidAppData(List<int> bytes) {
   if (isPackAt(1)) return decodeRidMessagePack(bytes.sublist(1));
   return const [];
 }
+
+/// UI-facing label for any RID-derived record (v0.26.0 Fieldwatch
+/// borrow, item 1). RID is a COOPERATIVE broadcast: the drone chose
+/// to identify itself. This label keeps RID records visually distinct
+/// from mesh tracks, which are non-cooperative RF sensing. RID
+/// evidence is display-only identification — it never feeds
+/// detection, the tracker, or the confidence merger (see
+/// test/remote_id_never_override_test.dart).
+const String kRidCooperativeLabel = 'COOPERATIVE (RID)';
+
+/// Wi-Fi NAN Remote ID is NOT available: stock Android does not
+/// expose NAN Remote ID frames to the app, so Shepherd hears RID
+/// over BLE and Wi-Fi Beacon only. Documented, never faked.
+const String kRidWifiNanUnavailableNote =
+    'Wi-Fi NAN Remote ID unavailable on stock Android — BLE / Wi-Fi Beacon only';
+
+/// BLE 5 extended advertising is platform-dependent: whether a long
+/// RID pack arrives depends on the phone's BLE stack, not Shepherd.
+const String kRidBle5Note = 'BLE 5 extended advertising is platform-dependent';
 
 /// Marker meaning for a Remote ID operator position, from the
 /// System message's location type: the UI must not call a takeoff
@@ -407,6 +435,16 @@ class RidContact {
   /// Operator marker meaning, from the System message's location
   /// type: the UI must not call a takeoff point a live operator.
   String get operatorLabel => ridOperatorLabel(operatorLocationType);
+
+  /// UI-facing cooperative label for this contact: distinct from
+  /// mesh tracks by construction. Identity here is ASSERTED by a
+  /// cooperative broadcast, never verified (see the library honesty
+  /// contract) — a label, not a proof.
+  String get cooperativeLabel => kRidCooperativeLabel;
+
+  /// Cooperative label with the transport that carried it, e.g.
+  /// `COOPERATIVE (RID · BLE)`.
+  String get cooperativeSourceLabel => 'COOPERATIVE (RID · $sourceKind)';
 
   void absorb(RidMessage m, DateTime at) {
     messageCount++;
