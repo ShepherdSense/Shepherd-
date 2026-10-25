@@ -186,6 +186,15 @@ class Tracker {
     // estimate — far sharper than a link-midpoint average.
     final linkList = pairs.values.toList();
     final maxDip = linkList.map((p) => p.dip).reduce(math.max);
+    // Review fix: scoreAt divides by maxDip; a non-positive or
+    // non-finite value (e.g. a zero dip threshold with a flat poll)
+    // produced NaN scores and an arbitrary "best" point. No usable
+    // dip means nothing honest to localize.
+    if (!maxDip.isFinite || maxDip <= 0) {
+      consistencyGate?.noteMissedPoll();
+      _lastDetect = savedLastDetect;
+      return null;
+    }
 
     // Normalized pattern match: the candidate point whose *relative*
     // dip pattern across all links best matches the observed one.
