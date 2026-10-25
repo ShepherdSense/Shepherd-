@@ -36,6 +36,21 @@ void main() {
       svc.dispose();
     });
 
+    test('v0.26.0: empty/garbled FFFA service data creates no contact', () {
+      final svc = RemoteIdService();
+      svc.setEnabled(true, wifiCapable: false);
+      svc.onBleAdvertisement(
+          'AA:BB',
+          {
+            'fffa': Uint8List(0),
+            '0000fffa-0000-1000-8000-00805f9b34fb':
+                Uint8List.fromList([1, 2, 3]),
+          },
+          at: t0);
+      expect(svc.contacts, isEmpty);
+      svc.dispose();
+    });
+
     test('disabled service ignores advertisements entirely', () {
       final svc = RemoteIdService();
       svc.onBleAdvertisement(
@@ -65,6 +80,59 @@ void main() {
       expect(n, 1);
       expect(svc.contacts.single.sourceKind, 'WIFI');
       expect(svc.contacts.single.serial, '1581F5FHJ229R00N3K7P');
+      svc.dispose();
+    });
+
+    test('v0.26.0: malformed rows are skipped, valid rows still land',
+        () async {
+      final svc = RemoteIdService(
+          wifiSource: () async => [
+                // Non-numeric beacon element: skipped, must not throw.
+                {
+                  'bssid': 'aa:bb:cc:dd:ee:01',
+                  'ridBeacon': ['not-a-byte', ...vec.basicIdBytes],
+                },
+                // Empty beacon: skipped.
+                {'bssid': 'aa:bb:cc:dd:ee:02', 'ridBeacon': <int>[]},
+                // Garbled beacon (decodes to nothing): not counted.
+                {
+                  'bssid': 'aa:bb:cc:dd:ee:03',
+                  'ridBeacon': [1, 2, 3]
+                },
+                // Non-string BSSID (v0.26.0 fix-pass): SKIPPED,
+                // not ingested under a shared 'wifi:unknown' key
+                // that would merge distinct drones into one contact.
+                {
+                  'bssid': 12345,
+                  'ridBeacon': [0x05, ...vec.basicIdBytes],
+                },
+                // Empty-string BSSID: skipped for the same reason.
+                {
+                  'bssid': '',
+                  'ridBeacon': [0x05, ...vec.basicIdBytes],
+                },
+                // Valid row: still lands, proving the skips above
+                // did not take the poll down.
+                {
+                  'bssid': 'aa:bb:cc:dd:ee:04',
+                  'ridBeacon': [0x05, ...vec.basicIdBytes],
+                },
+              ]);
+      svc.setEnabled(true, wifiCapable: false);
+      final n = await svc.pollWifiOnce(at: t0);
+      expect(n, 1);
+      expect(svc.contacts, hasLength(1));
+      expect(svc.contacts.single.sourceKey, 'wifi:aa:bb:cc:dd:ee:04');
+      expect(svc.contacts.single.serial, '1581F5FHJ229R00N3K7P');
+      svc.dispose();
+    });
+
+    test('v0.26.0: throwing survey source is a soft no-op', () async {
+      final svc = RemoteIdService(
+          wifiSource: () async => throw StateError('survey exploded'));
+      svc.setEnabled(true, wifiCapable: false);
+      expect(await svc.pollWifiOnce(at: t0), 0);
+      expect(svc.contacts, isEmpty);
       svc.dispose();
     });
 
