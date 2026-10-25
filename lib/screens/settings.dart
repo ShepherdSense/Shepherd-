@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 
 import '../services/discovery.dart';
+import '../services/remote_id.dart';
 import '../services/adaptive_baseline.dart';
 import '../services/radio_driver.dart';
 import '../services/recorder.dart';
@@ -74,6 +75,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late final TextEditingController _droneCloudEoUrl;
   late final TextEditingController _droneCloudIrUrl;
   late bool _remoteIdEnabled;
+  late bool _phoneTierEnabled;
+  late bool _deviceSignaturesEnabled;
+  late String _tileSourceId;
   late String _droneStreamSource;
   late bool _autoConnectSilvusUsb;
   late bool _sdrAutoStation;
@@ -174,6 +178,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _trustedSources = TextEditingController(text: s.trustedSources);
     _friendlySerials = TextEditingController(text: s.friendlySerials);
     _remoteIdEnabled = s.remoteIdEnabled;
+    _phoneTierEnabled = s.phoneTierEnabled;
+    _deviceSignaturesEnabled = s.deviceSignaturesEnabled;
+    _tileSourceId = s.tileSourceId;
     _droneEoUrl = TextEditingController(text: s.droneEoUrl);
     _droneIrUrl = TextEditingController(text: s.droneIrUrl);
     _droneCloudEoUrl = TextEditingController(text: s.droneCloudEoUrl);
@@ -406,6 +413,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
           : _cotEmitterPrefix.text.trim(),
       friendlySerials: _friendlySerials.text,
       remoteIdEnabled: _remoteIdEnabled,
+      phoneTierEnabled: _phoneTierEnabled,
+      deviceSignaturesEnabled: _deviceSignaturesEnabled,
+      tileSourceId: _tileSourceId,
       droneEoUrl: _droneEoUrl.text.trim().isEmpty
           ? 'rtsp://192.168.42.10:5554/subject'
           : _droneEoUrl.text.trim(),
@@ -714,6 +724,89 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 'e.g. http://192.168.1.50/shot.jpg'),
           ],
         ]),
+        _section('Phone tier, signatures & offline maps', [
+          SwitchListTile(
+            title: Text('PHONE-ONLY TIER',
+                style: SentryType.rowValue(SentryColors.onDark)),
+            subtitle: Text(
+              'WHEN ON, THE DASHBOARD SHOWS THE PHONE-ONLY BANNER '
+              '— BUT ONLY WHEN NO MESH/SDR HARDWARE IS ATTACHED. '
+              'MESH USERS SEE ZERO CHANGE FROM THIS DEFAULT-ON '
+              'SWITCH. LABELS ARE ALWAYS PHONE-ONLY / PHONE-RANGE '
+              '(TENS OF METERS, NOT AREA COVERAGE). (THIS SWITCH '
+              'CONTROLS ONLY THE BANNER; HUNT IS REACHED FROM ITS '
+              'OWN BUTTON AND IS NOT GATED BY THIS SWITCH.)',
+              style: SentryType.section(10).copyWith(height: 1.6),
+            ),
+            value: _phoneTierEnabled,
+            onChanged: (v) => setState(() => _phoneTierEnabled = v),
+          ),
+          SwitchListTile(
+            title: Text('DEVICE SIGNATURE LIBRARY',
+                style: SentryType.rowValue(SentryColors.onDark)),
+            subtitle: Text(
+              'MATCH PHONE-VISIBLE WI-FI / BLE OBSERVATIONS AGAINST '
+              'A SIGNATURE CATALOG. EVERY MATCH IS A HYPOTHESIS — '
+              'NOT IDENTITY. USER-ADDED ENTRIES COME FROM '
+              'device_signatures.json IN THE APP DOCUMENTS '
+              'DIRECTORY AND ARE LABELED USER-ADDED. DEFAULT OFF.',
+              style: SentryType.section(10).copyWith(height: 1.6),
+            ),
+            value: _deviceSignaturesEnabled,
+            onChanged: (v) =>
+                setState(() => _deviceSignaturesEnabled = v),
+          ),
+          const SizedBox(height: 10),
+          DropdownButtonFormField<String>(
+            initialValue: widget.state.tileSources
+                    .any((s) => s.id == _tileSourceId)
+                ? _tileSourceId
+                : widget.state.selectedTileSource.id,
+            dropdownColor: SentryColors.surface2,
+            style: SentryType.rowValue(SentryColors.onDark),
+            decoration: const InputDecoration(
+                labelText: 'OFFLINE MAP TILE SOURCE (KEYLESS ONLY)'),
+            items: [
+              for (final s in widget.state.tileSources)
+                DropdownMenuItem(
+                  value: s.id,
+                  child: Text(s.displayName),
+                ),
+            ],
+            onChanged: (v) =>
+                setState(() => _tileSourceId = v ?? 'osm_standard'),
+          ),
+          const SizedBox(height: 10),
+          Text(
+            'CATALOG: ${widget.state.deviceSignatures.builtIn.length} '
+            'BUILT-IN + '
+            '${widget.state.deviceSignatures.userSignatures.length} '
+            'USER-ADDED = '
+            '${widget.state.deviceSignatures.merged.length} MERGED. '
+            'MISSING device_signatures.json MEANS BUILT-IN ONLY — '
+            'THAT IS NORMAL, NOT AN ERROR.',
+            style: SentryType.section(10).copyWith(height: 1.6),
+          ),
+          if (widget.state.deviceSignatureWarnings.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            for (final w in widget.state.deviceSignatureWarnings)
+              Text(
+                'SIGNATURE WARNING: ${w.toUpperCase()}',
+                style: SentryType.section(10).copyWith(
+                  height: 1.6,
+                  color: SentryColors.orange,
+                ),
+              ),
+          ],
+          const SizedBox(height: 10),
+          OutlinedButton(
+            onPressed: () async {
+              await widget.state.loadUserSignatures();
+              if (mounted) setState(() {});
+            },
+            child: const Text('RELOAD USER SIGNATURES'),
+          ),
+        ]),
         _section('Record & replay', [
           _recordRow(),
           const SizedBox(height: 10),
@@ -860,7 +953,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
               'ADVERTISEMENTS AND WI-FI BEACONS — RECEIVE-ONLY. CIVIL '
               'DRONES ONLY: MILITARY D-MODEL AIRFRAMES (X10D) MAY '
               'BROADCAST NOTHING, SO NO CONTACT NEVER MEANS NO DRONE. '
-              'DEFAULT OFF.',
+              'DEFAULT OFF. '
+              '${kRidWifiNanUnavailableNote.toUpperCase()}. '
+              '${kRidBle5Note.toUpperCase()}.',
               style: SentryType.section(10).copyWith(height: 1.6),
             ),
             value: _remoteIdEnabled,
