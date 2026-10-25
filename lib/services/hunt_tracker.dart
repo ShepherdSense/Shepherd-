@@ -328,21 +328,31 @@ class SensorsPlusStepSource implements StepSource {
   /// (second call is a no-op).
   void start() {
     if (_subscription != null) return;
-    _subscription = accelerometerEventStream().listen(
-      (event) {
-        final magnitude = math.sqrt(
-          event.x * event.x + event.y * event.y + event.z * event.z,
-        );
-        if (_detector.onMagnitude(magnitude, event.timestamp)) {
-          _controller.add(event.timestamp);
-        }
-      },
-      onError: (Object error) {
-        lastError = error.toString();
-        _subscription = null;
-      },
-      cancelOnError: true,
-    );
+    // Review fix: on platforms without motion sensors (e.g. the
+    // Windows runner) creating the stream can throw synchronously;
+    // that must degrade to "no steps" + lastError, never crash the
+    // Hunt session start.
+    try {
+      _subscription = accelerometerEventStream().listen(
+        (event) {
+          final magnitude = math.sqrt(
+            event.x * event.x + event.y * event.y + event.z * event.z,
+          );
+          if (_detector.onMagnitude(magnitude, event.timestamp) &&
+              !_controller.isClosed) {
+            _controller.add(event.timestamp);
+          }
+        },
+        onError: (Object error) {
+          lastError = error.toString();
+          _subscription = null;
+        },
+        cancelOnError: true,
+      );
+    } catch (e) {
+      lastError = e.toString();
+      _subscription = null;
+    }
   }
 
   @override
