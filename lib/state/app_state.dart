@@ -1,9 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../theme.dart';
@@ -46,6 +48,10 @@ import '../services/airframe_identity.dart';
 import '../services/simulated.dart';
 import '../services/remote_id.dart';
 import '../services/remote_id_service.dart';
+import '../services/device_signatures.dart';
+import '../services/hunt_tracker.dart';
+import '../services/offline_map_source.dart';
+import '../services/phone_tier.dart';
 import '../services/device_autoconnect.dart';
 
 /// Short display ID: strips the driver namespace (`silvus:90550` → `90550`).
@@ -132,6 +138,9 @@ class AppSettings {
     this.sdrEnbLon,
     this.sdrEnbCenterMhz,
     this.sdrAutoStation = false,
+    this.phoneTierEnabled = true,
+    this.deviceSignaturesEnabled = false,
+    this.tileSourceId = 'osm_standard',
   });
 
   String radioIp;
@@ -295,6 +304,23 @@ class AppSettings {
   /// source (no tower database on-device) and always stays manual.
   bool sdrAutoStation;
 
+  /// Phone-only tier master switch (v0.26.0, Fieldwatch borrow).
+  /// Default true, but the tier ONLY activates when no mesh/SDR
+  /// hardware is attached (see [AppState.phoneTier]) — mesh users
+  /// see zero change from this default.
+  bool phoneTierEnabled;
+
+  /// Device-signature library master switch (v0.26.0). Default
+  /// false, per the builder suggestion: signature matches are
+  /// HYPOTHESES, never identity, and stay opt-in.
+  bool deviceSignaturesEnabled;
+
+  /// Selected keyless tile source id (v0.26.0 offline-maps
+  /// pattern). Default 'osm_standard' (OpenStreetMap Standard).
+  /// Unknown ids fall back to the default via [selectTileSource];
+  /// keyed providers are never built in.
+  String tileSourceId;
+
   TripwireConfig get tripwireConfig => TripwireConfig(
         baselineWindow: baselineWindow,
         dipThreshold: dipThreshold,
@@ -347,6 +373,9 @@ class AppSettings {
         'sdrEnbLon': sdrEnbLon,
         'sdrEnbCenterMhz': sdrEnbCenterMhz,
         'sdrAutoStation': sdrAutoStation,
+        'phoneTierEnabled': phoneTierEnabled,
+        'deviceSignaturesEnabled': deviceSignaturesEnabled,
+        'tileSourceId': tileSourceId,
       };
 
   void applyJson(Map<String, dynamic> j) {
@@ -459,6 +488,12 @@ class AppSettings {
     if (cotRadius is num) {
       cotCoincidenceRadiusM = cotRadius.clamp(5.0, 500.0).toDouble();
     }
+    final pt = j['phoneTierEnabled'];
+    if (pt is bool) phoneTierEnabled = pt;
+    final ds = j['deviceSignaturesEnabled'];
+    if (ds is bool) deviceSignaturesEnabled = ds;
+    final tsid = j['tileSourceId'];
+    if (tsid is String && tsid.isNotEmpty) tileSourceId = tsid;
     double? lat(String k) {
       final v = j[k];
       if (v is num) {
@@ -544,6 +579,9 @@ class AppState extends ChangeNotifier {
     _initCameraDriver();
     _wireSkydio();
     _radiosReady = _loadRadios();
+    // v0.26.0: user signatures load in the background; missing
+    // file = built-in catalog only, never a boot failure.
+    unawaited(loadUserSignatures());
     // Fire-and-forget: events simply carry no AI label until it lands.
     DisturbanceClassifier.load().then((c) => _classifier = c);
     TrackStitcher.load().then((s) => _stitcher = s);
@@ -1873,6 +1911,194 @@ class AppState extends ChangeNotifier {
   /// scan via its advertisement hook plus the Android Wi-Fi survey.
   final RemoteIdService remoteId = RemoteIdService();
 
+  // ---- v0.26.0 Fieldwatch-borrow integration (additive, opt-in) --
+  // Nothing here touches detection, the tracker, the merger, the
+  // gateway, CoT, or ZMeta: these are identification / proximity /
+  // display layers only, and every one degrades to off when its
+  // input is missing.
+
+  /// Merged device-signature catalog: built-in entries plus any
+  /// user-added entries from device_signatures.json. Starts
+  /// built-in only; [loadUserSignatures] refreshes it from disk.
+  /// Matches are HYPOTHESES, never identity (see
+  /// device_signatures.dart). The catalog loads regardless of the
+  /// [AppSettings.deviceSignaturesEnabled] switch; screens gate
+  /// DISPLAY on that switch.
+  DeviceSignatureCatalog deviceSignatures =
+      const DeviceSignatureCatalog();
+
+  /// User-signature load problems, surfaced in Settings (never
+  /// silent, never a crash). Empty means the user file was absent,
+  /// empty, or fully valid.
+  List<String> get deviceSignatureWarnings =>
+      deviceSignatures.userLoadWarnings;
+
+  /// Loads user-added signatures from `device_signatures.json` in
+  /// the app documents directory and merges them over the built-in
+  /// catalog via [DeviceSignatureCatalog.fromUserJsonText]. A
+  /// missing file means built-in only (no warning — absence is the
+  /// normal state). A malformed file degrades to built-in only
+  /// with a surfaced warning. Never throws.
+  Future<void> loadUserSignatures() async {
+    try {
+      final dir = await getApplicationDocumentsDirectory();
+      final file = File('${dir.path}/device_signatures.json');
+      if (!await file.exists()) {
+        if (deviceSignatures.userSignatures.isNotEmpty ||
+            deviceSignatures.userLoadWarnings.isNotEmpty) {
+          deviceSignatures = const DeviceSignatureCatalog();
+          if (!_disposed) notifyListeners();
+        }
+        return;
+      }
+      final text = await file.readAsString();
+      deviceSignatures =
+          DeviceSignatureCatalog.fromUserJsonText(text);
+    } catch (e) {
+      // Unreadable file degrades to built-in only with a reason,
+      // never to a crash and never to silently dropped entries.
+      deviceSignatures = DeviceSignatureCatalog(userLoadWarnings: [
+        'User signatures ignored: could not read '
+            'device_signatures.json ($e) — built-in catalog only.',
+      ]);
+    }
+    if (!_disposed) notifyListeners();
+  }
+
+  /// Phone-only tier, evaluated LIVE from actual driver state —
+  /// not from a stored flag. The tier is active only when the
+  /// [AppSettings.phoneTierEnabled] switch is on AND no mesh/SDR
+  /// hardware is attached:
+  /// - mesh: a Silvus/MPU5/L3Harris/Meshtastic/sim poller, or
+  ///   simulated mode itself (the sim mesh is the active picture,
+  ///   so the phone banner never flickers over it before Start);
+  /// - SDR: an SDR-bridge or KrakenDF poller ([hasSdrDriver] plus
+  ///   the Kraken driver id);
+  /// - serial-class: an ESP32-node poller.
+  /// start()/stop() already notifyListeners, so this recomputes on
+  /// every attachment change. Sensor-bus and camera pollers are
+  /// corroboration feeds, not mesh/SDR coverage, so they neither
+  /// activate nor deactivate the tier: the tier's claim is only
+  /// ever "no mesh/SDR hardware attached", and its banner lists
+  /// phone sources only. When the switch is off, the tier
+  /// evaluates as inactive by construction (a synthetic
+  /// attached-mesh state).
+  PhoneTier get phoneTier {
+    if (!settings.phoneTierEnabled) {
+      return PhoneTier.evaluate(
+        hardware: const HardwareAttachment(meshDriverAttached: true),
+      );
+    }
+    const meshIds = {'silvus', 'mpu5', 'harris', 'meshtastic', 'sim'};
+    final pollerIds = {
+      for (final p in _pollers) p.config.driverId,
+    };
+    // v0.26.0 fix-pass: (1) a mesh driver CONFIGURED in the saved
+    // radio list deactivates the tier even when it is not polling
+    // — a mesh user who has not pressed START (or pressed STOP)
+    // must not see a false PHONE-ONLY banner; (2) until the saved
+    // list has finished loading, no attachment determination has
+    // been made at all, so the tier stays inactive rather than
+    // guessing phone-only. Simulated mode still counts as
+    // mesh-attached. (3) Source availability is passed for real:
+    // Remote ID and the signature library are available only when
+    // their switches are actually on, so the banner can never
+    // claim all five sources while one is switched off.
+    final configuredMesh = !_radiosLoaded ||
+        radioConfigs.any((c) => meshIds.contains(c.driverId));
+    return PhoneTier.evaluate(
+      hardware: HardwareAttachment(
+        meshDriverAttached:
+            settings.simulatedMode ||
+                pollerIds.any(meshIds.contains),
+        sdrAttached:
+            hasSdrDriver || pollerIds.contains('kraken'),
+        serialDriverAttached: pollerIds.contains('esp32'),
+        meshDriverConfigured: configuredMesh,
+      ),
+      sourceAvailable: {
+        PhoneScanSource.remoteId: remoteId.enabled,
+        PhoneScanSource.signatureLibrary:
+            settings.deviceSignaturesEnabled,
+      },
+    );
+  }
+
+  /// Last motion-sensor error from the current Hunt session's step
+  /// source, if any — surfaced on the Hunt screen (v0.26.0
+  /// fix-pass; previously written and read by nothing). Null when
+  /// no session is running or the sensor has not errored.
+  String? get huntSensorError {
+    final source = _huntStepSource;
+    return source is SensorsPlusStepSource ? source.lastError : null;
+  }
+
+  /// Shared bounded (50 MB LRU) tile cache for the offline-maps
+  /// pattern. Cache-first; missing tiles degrade to the honestly
+  /// labeled blank grid, never an invented map.
+  final TileCache tileCache = TileCache();
+
+  /// All built-in keyless tile sources (OSM + USGS only).
+  List<TileSource> get tileSources => defaultTileSources;
+
+  /// Selected tile source for the current [AppSettings.tileSourceId];
+  /// unknown ids fall back to OpenStreetMap Standard.
+  TileSource get selectedTileSource =>
+      selectTileSource(settings.tileSourceId);
+
+  /// Current Hunt session, if one is running. Created by
+  /// [startHuntSession], ended by [endHuntSession]. The session
+  /// itself is proximity-only: its loudest cell is never a
+  /// position fix.
+  HuntTracker? huntSession;
+
+  /// Step source owned by the current Hunt session (kept beside
+  /// the tracker because [HuntTracker.dispose] only cancels its
+  /// step subscription — the sensor subscription itself is closed
+  /// here in [endHuntSession]).
+  StepSource? _huntStepSource;
+
+  /// Starts a Hunt session (disposing any previous one first) and
+  /// starts its motion-sensor step source. Callbacks are the
+  /// screen's to wire: onBeep → system click + flash, onVibrate →
+  /// haptics. There is no audio plugin in this build, so the beep
+  /// is a system click, not a dedicated tone — documented in the
+  /// Hunt screen header.
+  HuntTracker startHuntSession({
+    void Function(HuntFeedback feedback)? onBeep,
+    void Function(HuntFeedback feedback)? onVibrate,
+    void Function(HuntFeedback feedback)? onFeedback,
+  }) {
+    final previous = huntSession;
+    huntSession = null;
+    unawaited(previous?.dispose());
+    unawaited(_huntStepSource?.dispose());
+    final stepSource = SensorsPlusStepSource();
+    _huntStepSource = stepSource;
+    stepSource.start();
+    final session = HuntTracker(
+      stepSource: stepSource,
+      onBeep: onBeep,
+      onVibrate: onVibrate,
+      onFeedback: onFeedback,
+    );
+    huntSession = session;
+    notifyListeners();
+    return session;
+  }
+
+  /// Ends the current Hunt session and closes its step source.
+  /// Safe to call with no session running.
+  Future<void> endHuntSession() async {
+    final session = huntSession;
+    huntSession = null;
+    final stepSource = _huntStepSource;
+    _huntStepSource = null;
+    await session?.dispose();
+    await stepSource?.dispose();
+    if (!_disposed) notifyListeners();
+  }
+
   /// Last field-local position per mesh node id — Class A motion
   /// evidence (a registry-matched node whose position moves in 3D).
   final Map<String, ({double x, double y, double h})> _nodePosTrail = {};
@@ -2017,6 +2243,10 @@ class AppState extends ChangeNotifier {
     // (start() also does this when polling resumes). In AUTO station
     // mode this is what kicks the first GPS fix.
     applySdrStationFromSettings();
+    // v0.26.0: a settings save refreshes the user-signature catalog
+    // so warnings in Settings stay current after the operator edits
+    // device_signatures.json (or toggles the library on).
+    unawaited(loadUserSignatures());
     notifyListeners();
     if (wasPolling) start();
   }
@@ -3866,6 +4096,9 @@ class AppState extends ChangeNotifier {
     }
     _pollers.clear();
     wifi.stop();
+    // v0.26.0: a running Hunt session owns a motion-sensor
+    // subscription; close it with the app state, not on next launch.
+    unawaited(endHuntSession());
     try {
       _cameraDriver.dispose();
     } catch (_) {}
