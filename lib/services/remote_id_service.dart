@@ -19,6 +19,7 @@ library;
 
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import 'remote_id.dart';
@@ -61,34 +62,86 @@ class RemoteIdService {
     if (!enabled) return;
     for (final entry in serviceData.entries) {
       if (!isRidServiceUuid(entry.key)) continue;
-      tracker.ingestAppData(entry.value,
+      // v0.26.0 fix: decode first so empty/garbled service data
+      // neither creates a contact nor fires a spurious update.
+      final messages = decodeRidAppData(entry.value);
+      if (messages.isEmpty) continue;
+      tracker.ingest(messages,
           sourceKey: 'ble:$deviceId',
           sourceKind: 'BLE',
           at: at ?? DateTime.now());
-      onUpdate?.call();
+      // A throwing refresh hook must never break the scan path:
+      // log-and-continue (v0.26.0 fix-pass).
+      try {
+        onUpdate?.call();
+      } catch (e) {
+        debugPrint('RemoteIdService: onUpdate hook threw (BLE): $e');
+      }
     }
   }
 
   /// One Wi-Fi survey pass: pull rows, ingest any `ridBeacon`
   /// payloads (bytes begin at the ODID message counter, i.e. the
-  /// app-data form the decoder accepts). Returns frames ingested.
+  /// app-data form the decoder accepts). Returns frames that
+  /// actually produced RID messages.
+  ///
+  /// v0.26.0 fixes (malformed survey rows must degrade, never
+  /// crash the poll loop): a throwing survey source is a soft
+  /// no-op like a null return; a row with a non-string BSSID or a
+  /// non-numeric beacon element is skipped, not cast — the old
+  /// `as` casts threw and took the whole poll (and, on the timer
+  /// path, an unhandled async error) down with one bad row.
   Future<int> pollWifiOnce({DateTime? at}) async {
     if (!enabled) return 0;
-    final rows = await _wifiSource();
+    List<Map<dynamic, dynamic>>? rows;
+    try {
+      rows = await _wifiSource();
+    } catch (_) {
+      return 0;
+    }
     if (rows == null) return 0;
     var n = 0;
     for (final row in rows) {
-      final raw = row['ridBeacon'];
-      if (raw is! List || raw.isEmpty) continue;
-      final bytes = raw.map((e) => (e as num).toInt() & 0xFF).toList();
-      final bssid = (row['bssid'] as String?) ?? 'unknown';
-      tracker.ingestAppData(bytes,
-          sourceKey: 'wifi:$bssid',
-          sourceKind: 'WIFI',
-          at: at ?? DateTime.now());
-      n++;
+      try {
+        final raw = row['ridBeacon'];
+        if (raw is! List || raw.isEmpty) continue;
+        final bytes = <int>[];
+        var malformed = false;
+        for (final e in raw) {
+          if (e is num) {
+            bytes.add(e.toInt() & 0xFF);
+          } else {
+            malformed = true;
+            break;
+          }
+        }
+        if (malformed) continue;
+        // v0.26.0 fix-pass: rows whose BSSID is not a non-empty
+        // String are SKIPPED, not ingested under a shared
+        // 'wifi:unknown' key — collapsing every such row into one
+        // source key merged distinct drones into one contact.
+        final bssid = row['bssid'];
+        if (bssid is! String || bssid.isEmpty) continue;
+        final messages = decodeRidAppData(bytes);
+        if (messages.isEmpty) continue;
+        tracker.ingest(messages,
+            sourceKey: 'wifi:$bssid',
+            sourceKind: 'WIFI',
+            at: at ?? DateTime.now());
+        n++;
+      } catch (_) {
+        continue;
+      }
     }
-    if (n > 0) onUpdate?.call();
+    if (n > 0) {
+      // A throwing refresh hook must never break the timer path:
+      // log-and-continue (v0.26.0 fix-pass).
+      try {
+        onUpdate?.call();
+      } catch (e) {
+        debugPrint('RemoteIdService: onUpdate hook threw (Wi-Fi): $e');
+      }
+    }
     return n;
   }
 
