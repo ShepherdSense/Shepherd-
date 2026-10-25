@@ -641,9 +641,16 @@ class AirframeClassifier {
       }
     }
     if (e.altM != null && !r.hasTelemetryPosition) r.altM = e.altM;
-    if (e.operatorLat != null) r.operatorLat = e.operatorLat;
-    if (e.operatorLon != null) r.operatorLon = e.operatorLon;
-    r.operatorLocationType = e.operatorLocationType;
+    // v0.26.0 fix-pass: operator fields are gated exactly like
+    // lat/lon/alt above — a broadcast operator position must never
+    // overwrite a cooperative feed's operator position on a
+    // telemetry-driven record (the old unconditional overwrite
+    // was the observer-overwrite hole).
+    if (!r.hasTelemetryPosition) {
+      if (e.operatorLat != null) r.operatorLat = e.operatorLat;
+      if (e.operatorLon != null) r.operatorLon = e.operatorLon;
+      r.operatorLocationType = e.operatorLocationType;
+    }
     if (e.courseDeg != null && !r.hasTelemetryPosition) {
       r.courseDeg = e.courseDeg;
     }
