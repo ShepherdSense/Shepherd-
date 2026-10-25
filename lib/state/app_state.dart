@@ -4080,6 +4080,14 @@ class AppState extends ChangeNotifier {
     _disposed = true;
     _watchdog?.cancel();
     _watchdog = null;
+    // Review fix: these periodic timers were never cancelled on
+    // dispose and kept firing (phone-fix refresh, heartbeat, and the
+    // Remote ID Wi-Fi poll) against a disposed AppState.
+    _zmetaFixTimer?.cancel();
+    _zmetaFixTimer = null;
+    _zmetaHeartbeatTimer?.cancel();
+    _zmetaHeartbeatTimer = null;
+    remoteId.dispose();
     _autoConnect?.stop();
     _autoConnect = null;
     _zmeta?.close();
