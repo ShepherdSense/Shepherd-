@@ -276,14 +276,69 @@ void main() {
       expect(tr.contacts(t0).single.operatorLabel, 'TAKEOFF POINT');
     });
 
-    test('stale contacts prune; separate sources stay separate', () {
-      final tr = RemoteIdTracker(staleAfter: const Duration(seconds: 30));
+    test('v0.26.0: default 90 s stale horizon pins expiry', () {
+      final tr = RemoteIdTracker(); // default staleAfter = 90 s
       tr.ingestAppData(basicIdBytes,
           sourceKey: 'ble:AA', sourceKind: 'BLE', at: t0);
-      tr.ingestAppData(basicIdBytes,
-          sourceKey: 'ble:BB', sourceKind: 'BLE', at: t0);
-      expect(tr.contacts(t0).length, 2);
-      expect(tr.contacts(t0.add(const Duration(seconds: 31))), isEmpty);
+      expect(tr.contacts(t0.add(const Duration(seconds: 89))), hasLength(1));
+      expect(tr.contacts(t0.add(const Duration(seconds: 91))), isEmpty);
     });
+  });
+
+  group('v0.26.0 malformed-frame regressions', () {
+    test('bad type nibbles decode to null, never throw', () {
+      for (final type in [6, 7, 8, 9, 10, 11, 12, 13, 14, 15]) {
+        final bytes = List<int>.filled(25, 0);
+        bytes[0] = (type << 4) | 2;
+        expect(decodeRidMessage(bytes), isNull,
+            reason: 'type nibble $type must not decode');
+        expect(decodeRidAppData(bytes), isEmpty);
+      }
+    });
+
+    test('oversized and zero pack counts yield nothing', () {
+      final over = <int>[0xF2, 25, 10];
+      for (var i = 0; i < 10; i++) {
+        over.addAll(basicIdBytes);
+      }
+      expect(decodeRidMessagePack(over), isEmpty);
+      expect(decodeRidAppData(over), isEmpty);
+      expect(decodeRidMessagePack(const [0xF2, 25, 0]), isEmpty);
+      expect(decodeRidAppData(const [0xF2, 25, 0]), isEmpty);
+    });
+
+    test('pack claiming more members than present yields nothing', () {
+      final short = <int>[0xF2, 25, 2, ...basicIdBytes];
+      expect(decodeRidMessagePack(short), isEmpty);
+      expect(decodeRidAppData(short), isEmpty);
+    });
+
+    test('empty and single-byte service data yield nothing', () {
+      expect(decodeRidAppData(const []), isEmpty);
+      expect(decodeRidAppData(const [0x07]), isEmpty);
+    });
+
+    test('cooperative labeling is distinct from mesh tracks', () {
+      final t0 = DateTime.utc(2026, 10, 21, 12);
+      final tr = RemoteIdTracker();
+      tr.ingestAppData(basicIdBytes,
+          sourceKey: 'ble:AA', sourceKind: 'BLE', at: t0);
+      final c = tr.contacts(t0).single;
+      expect(c.cooperativeLabel, 'COOPERATIVE (RID)');
+      expect(kRidCooperativeLabel, 'COOPERATIVE (RID)');
+      expect(c.cooperativeSourceLabel, 'COOPERATIVE (RID · BLE)');
+      expect(c.cooperativeLabel, isNot(contains('mesh')));
+    });
+  });
+
+  test('stale contacts prune; separate sources stay separate', () {
+    final t0 = DateTime.utc(2026, 10, 21, 12);
+    final tr = RemoteIdTracker(staleAfter: const Duration(seconds: 30));
+    tr.ingestAppData(basicIdBytes,
+        sourceKey: 'ble:AA', sourceKind: 'BLE', at: t0);
+    tr.ingestAppData(basicIdBytes,
+        sourceKey: 'ble:BB', sourceKind: 'BLE', at: t0);
+    expect(tr.contacts(t0).length, 2);
+    expect(tr.contacts(t0.add(const Duration(seconds: 31))), isEmpty);
   });
 }
