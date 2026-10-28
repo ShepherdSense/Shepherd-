@@ -926,6 +926,115 @@ class WppIdpAssessment {
   final String note;
 }
 
+/// One LoRa preamble PMR reading from the bridge's EXPERIMENTAL PMR
+/// monitor (`pmr` UDP event; see pmr_monitor_spec.md). PMR is the
+/// dechirp-domain peak-to-mean ratio of a detected preamble: a LOW
+/// PMR on an otherwise present preamble is CONSISTENT WITH preamble
+/// interference — it is never a confirmed jamming verdict, never an
+/// identification, and never evidence about position. Readings are
+/// ALERTS ONLY: app_state must never feed them into the tripwire,
+/// the confidence merger, tracks, or any veto. The `experimental`
+/// flag is REQUIRED: a `pmr` packet without it is rejected, so a
+/// future non-experimental PMR format can never be silently treated
+/// as this experimental one.
+class PmrReading {
+  PmrReading({
+    required this.radio,
+    required this.channelMhz,
+    required this.pmrDb,
+    required this.nChirps,
+    required this.toneOffHz,
+    required this.thresholdDb,
+    required this.marginDb,
+    required this.alert,
+    required this.t,
+  });
+
+  final String radio;
+  final double channelMhz;
+  final double pmrDb;
+  final int nChirps;
+
+  /// Dechirped tone offset in Hz. Mixes the true frequency offset
+  /// with the monitor's symbol-alignment offset (up to +/-16 bins =
+  /// +/-15.6 kHz): a COARSE channel identifier only, NEVER a CFO
+  /// measurement. See pmr_monitor_spec.md.
+  final double toneOffHz;
+
+  /// Operator-set alert threshold in dB, or null (report-only: the
+  /// monitor never alerts without one).
+  final double? thresholdDb;
+
+  /// pmrDb - thresholdDb, or null when report-only. Negative means
+  /// the reading is below threshold (alerting).
+  final double? marginDb;
+
+  /// True only when a threshold is set AND pmrDb falls below it.
+  final bool alert;
+  final DateTime t;
+
+  /// Parse a decoded bridge datagram. Null for wrong kinds/versions,
+  /// a missing `experimental` flag, and malformed packets (never
+  /// throws).
+  static PmrReading? tryParse(Map<String, dynamic> j) {
+    try {
+      if (j['v'] != 1 || j['kind'] != 'pmr') return null;
+      if (j['experimental'] != true) return null;
+      double asDouble(String k) => (j[k] as num).toDouble();
+      double? asNullableDouble(String k) {
+        final v = j[k];
+        if (v == null) return null;
+        return (v as num).toDouble();
+      }
+
+      final pmr = asDouble('pmr_db');
+      final tone = asDouble('tone_off_hz');
+      final thr = asNullableDouble('threshold_db');
+      if (!pmr.isFinite || !tone.isFinite) return null;
+      if (thr != null && !thr.isFinite) return null;
+      // Alert and margin are RECOMPUTED here, never trusted from the
+      // wire: a lying or stale bridge must not make the display
+      // self-contradictory (alert true while pmr is above threshold).
+      final alert = thr != null && pmr < thr;
+      final mar = thr == null ? null : pmr - thr;
+      return PmrReading(
+        radio: '${j['radio']}',
+        channelMhz: asDouble('channel_mhz'),
+        pmrDb: pmr,
+        nChirps: (j['n_chirps'] as num).toInt(),
+        toneOffHz: tone,
+        thresholdDb: thr,
+        marginDb: mar,
+        alert: alert,
+        t: DateTime.fromMillisecondsSinceEpoch(
+            ((j['t'] as num).toDouble() * 1000).round()),
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Display wording. The honesty contract, enforced here so no UI
+  /// can soften it: "consistent with", never "confirmed"; the
+  /// EXPERIMENTAL tag is always present.
+  String get displayLabel {
+    final base = 'EXPERIMENTAL PMR ${pmrDb.toStringAsFixed(1)} dB '
+        '($nChirps chirps, ${channelMhz.toStringAsFixed(1)} MHz)';
+    if (thresholdDb == null) return '$base — report-only, no threshold set';
+    final m = marginDb;
+    final mStr = m == null
+        ? ''
+        : ' (margin ${m >= 0 ? '+' : ''}${m.toStringAsFixed(1)} dB)';
+    if (alert) {
+      return '$base — ALERT: below threshold '
+          '${thresholdDb!.toStringAsFixed(1)} dB$mStr — consistent with '
+          'preamble interference, NOT a confirmed jamming verdict';
+    }
+    return '$base — above threshold '
+        '${thresholdDb!.toStringAsFixed(1)} dB$mStr';
+  }
+}
+
 class SdrDriver extends RadioDriver {
   SdrDriver({required this.host, required this.port});
 
@@ -982,6 +1091,14 @@ class SdrDriver extends RadioDriver {
   /// WPP-IDP observation window (120 s, like the ELRS/Doppler paths).
   static const Duration wppIdpWindow = Duration(seconds: 120);
 
+  /// Recent EXPERIMENTAL PMR preamble readings, oldest-first.
+  /// Bounded; pruned to [pmrWindow] in _handle. Alerts only: never
+  /// a tripwire input, never fused into tracks, never a veto.
+  final List<PmrReading> _pmrReadings = [];
+
+  /// PMR observation window (120 s, like the other additive paths).
+  static const Duration pmrWindow = Duration(seconds: 120);
+
   /// Operator-configured station data for the Doppler correlator
   /// (field-local meters, x east / y north): the SDR radio's position
   /// and the LTE eNB's position. Null until configured — the
@@ -1012,6 +1129,19 @@ class SdrDriver extends RadioDriver {
   /// Recent WPP-IDP Doppler-line detections. Read-only: pruning
   /// happens in _handle, never here.
   List<WppIdpDoppler> get recentWppIdp => List.unmodifiable(_wppIdp);
+
+  /// Recent EXPERIMENTAL PMR readings. Read-only: pruning happens
+  /// in _handle, never here. Alerts only, never tripwire input.
+  List<PmrReading> get recentPmrReadings =>
+      List.unmodifiable(_pmrReadings);
+
+  /// Most recent alerting PMR reading, or null when none is alerting.
+  PmrReading? get latestPmrAlert {
+    for (var i = _pmrReadings.length - 1; i >= 0; i--) {
+      if (_pmrReadings[i].alert) return _pmrReadings[i];
+    }
+    return null;
+  }
 
   Future<void> _ensureSocket() async {
     if (_socket != null) return;
@@ -1076,6 +1206,22 @@ class SdrDriver extends RadioDriver {
         final cutoff =
             DateTime.now().subtract(DopplerCorrelator.agreementWindow);
         _dopplerRefs.removeWhere((e) => e.t.isBefore(cutoff));
+        _lastDataAt = DateTime.now();
+      }
+      return;
+    }
+    // EXPERIMENTAL PMR readings: additive, same transport. Alerts
+    // only — they are stored for the monitor section and never
+    // converted into LinkSamples anywhere in this file.
+    if (j['kind'] == 'pmr') {
+      final r = PmrReading.tryParse(j);
+      if (r != null) {
+        _pmrReadings.add(r);
+        if (_pmrReadings.length > 300) {
+          _pmrReadings.removeRange(0, _pmrReadings.length - 300);
+        }
+        final cutoff = DateTime.now().subtract(pmrWindow);
+        _pmrReadings.removeWhere((e) => e.t.isBefore(cutoff));
         _lastDataAt = DateTime.now();
       }
       return;
