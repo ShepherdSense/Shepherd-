@@ -4,13 +4,13 @@
 
 Shepherd turns the RF links of a mesh radio network into a sensing field. When an object crosses a link, the link's signal dips; Shepherd polls each radio's telemetry, tracks every link against a rolling baseline, and flags disturbances as crossing events — then fuses them into tracks with estimated size, distance, speed, and heading. No cameras, no tags, nothing worn or carried. Just the RF field itself.
 
-Built by **Draco**.
+Built by **ShepherdSense**.
 
-**Try it in your browser:** [Shepherd web sim](https://thedracospark-prog.github.io/Shepherd-/sim/) — the real app running on simulated radios. No install, no hardware; place as many nodes as you like.
+**Try it in your browser:** [Shepherd web sim](https://ShepherdSense.github.io/Shepherd-/sim/) — the real app running on simulated radios. No install, no hardware; place as many nodes as you like.
 
 ## Download
 
-**Latest Shepherd source (ZIP):** [Download ZIP](https://github.com/thedracospark-prog/Shepherd-/archive/refs/heads/main.zip) — always the newest commit on main. Unzip it, then build with `build_exe.bat` (Windows) or `build_apk.bat` (Android) as described under Install below. For sensor-node firmware and installer tools, see Field Kit below.
+**Latest Shepherd source (ZIP):** [Download ZIP](https://github.com/ShepherdSense/Shepherd-/archive/refs/heads/main.zip) — always the newest commit on main. Unzip it, then build with `build_exe.bat` (Windows) or `build_apk.bat` (Android) as described under Install below. For sensor-node firmware and installer tools, see Field Kit below.
 
 
 > **Status note — v0.17.0:** the v0.17.0 features (adaptive baseline, RTI imaging weights, ESP32 CSI pipeline, Doppler refinement, WPP-IDP passive radar, validation benches) are implemented and tested in CI, but **field validation is still pending** — they have not yet been proven against live targets. Treat v0.17.0 capabilities as experimental until field-tested.
