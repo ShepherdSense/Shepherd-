@@ -184,6 +184,7 @@ from collections import deque
 
 import elrs_detect
 import doppler_detect
+import pmr_monitor
 import wpp_idp_detect
 
 try:
@@ -195,6 +196,9 @@ UDP_PORT_DEFAULT = 49161
 SAMPLE_RATE = 4_000_000      # Pluto/USRP/Soapy-practical; RTL-SDR uses 2.4e6
 CAPTURE_N = 16384
 MIN_CAPTURE_N = 4096         # shorter captures are treated as a failed read
+PMR_CAPTURES = 8             # consecutive captures per PMR stare block
+                             # (~33 ms @ 4 MSPS, ~55 ms @ 2.4 MSPS: a few
+                             # preambles per block)
 SEG_N = 2048                 # Welch segment length (averaging lowers variance)
 USABLE_FRAC = 0.8            # central fraction of the sample rate we trust
 BEACON_S = 3.0
@@ -1498,6 +1502,22 @@ def main():
                     help="node motion state carried on wpp_idp_doppler "
                     "events (Shepherd must not merge moving-node lines "
                     "into track confidence)")
+    ap.add_argument("--pmr", action="store_true",
+                    help="EXPERIMENTAL: run the LoRa preamble PMR "
+                    "monitor on stare captures (stare mode only; "
+                    "see pmr_monitor.py). Alerts only, never a "
+                    "tripwire input. RX-only DSP.")
+    ap.add_argument("--pmr-threshold", type=float, default=None,
+                    help="PMR alert threshold in dB (PMR below it "
+                    "alerts; unset = report-only, never alerts). "
+                    "No default: paper numbers are simulation-only "
+                    "and must NOT be used as thresholds — derive "
+                    "one from real hardware baselines first.")
+    ap.add_argument("--pmr-channel", type=float, default=915.0,
+                    help="declared backhaul channel in MHz (default "
+                    "915.0 = gateway US915 default; use 433.0 for "
+                    "AS433). The monitor runs on the actual stare "
+                    "center; a mismatch only warns.")
     ap.add_argument("--sweeps", type=int, default=0,
                     help="run N sweeps then exit (0 = run forever)")
     args = ap.parse_args()
@@ -1590,6 +1610,21 @@ def main():
     lte = None if args.no_lte else LteIlluminatorDetector()
     nr = Nr5gAdapter()
     print(nr.status_line(backend))
+    # PMR preamble monitor (EXPERIMENTAL, stare-only, RX-only DSP).
+    # Stare mode only: it needs consecutive captures on one channel.
+    if args.pmr and not args.stare:
+        sys.exit("--pmr needs --stare <mhz> (stare mode only)")
+    if args.pmr and args.bands:
+        sys.exit("--pmr needs --stare; --bands overrides --stare")
+    else:
+        pmr = (pmr_monitor.PmrMonitor(threshold_db=args.pmr_threshold)
+               if args.pmr else None)
+    if pmr is not None:
+        thr = ("unset (report-only)" if args.pmr_threshold is None
+               else f"{args.pmr_threshold:g} dB")
+        print(f"[bridge] pmr: EXPERIMENTAL preamble PMR monitor on "
+              f"stare captures (declared backhaul channel "
+              f"{args.pmr_channel:g} MHz; threshold {thr})")
     # LTE450 gate: default sweeps never include it, but if a plan or
     # custom list ever does, it stays off without an explicit
     # operator opt-in (flag, or an explicit --bands/--stare listing).
@@ -1765,6 +1800,49 @@ def main():
                         if now - last_warn > 60.0:
                             last_warn = now
                             print(f"[bridge] wpp-idp detector error: {ex}")
+                # PMR preamble monitor (EXPERIMENTAL, RX-only DSP;
+                # alerts only, never a tripwire input). Stare-only:
+                # consecutive captures on the backhaul channel feed
+                # the monitor, which finds LoRa preambles and reports
+                # their dechirp-domain PMR. Runs AFTER the band chain
+                # so band-energy packets (the RSS-anomaly input) keep
+                # flowing. The SX1276 gateway exposes no IQ, so this
+                # runs here on the SDR, not on the gateway chip.
+                if pmr is not None and _stare_derived:
+                    if abs(center - args.pmr_channel) > 1.0:
+                        if now - last_warn > 60.0:
+                            last_warn = now
+                            print(f"[bridge] pmr: stare {center:g} MHz "
+                                  f"!= declared backhaul channel "
+                                  f"{args.pmr_channel:g} MHz; readings "
+                                  f"carry the actual stare center")
+                    try:
+                        parts = []
+                        for _ in range(PMR_CAPTURES):
+                            c = backend.capture(CAPTURE_N)
+                            if c is None or len(c) < MIN_CAPTURE_N:
+                                break
+                            parts.append(c)
+                        if parts:
+                            stream = np.concatenate(parts)
+                            t_end = time.time()
+                            for r in pmr.observe(stream,
+                                                 backend.sample_rate,
+                                                 t_end):
+                                pkt = {"v": 1, "kind": "pmr",
+                                       "radio": radio,
+                                       "channel_mhz": center,
+                                       "experimental": True,
+                                       **r}
+                                emit(pkt)
+                                print(f"[bridge] pmr: {r['pmr_db']:.1f} dB "
+                                      f"({r['n_chirps']} chirps, "
+                                      f"tone {r['tone_off_hz']:+.0f} Hz"
+                                      f"{' ALERT' if r['alert'] else ''})")
+                    except Exception as ex:  # DSP must never kill the sweep
+                        if now - last_warn > 60.0:
+                            last_warn = now
+                            print(f"[bridge] pmr monitor error: {ex}")
             sweeps_done += 1
             now = time.time()
             if now - last_beacon >= BEACON_S:
