@@ -2396,6 +2396,21 @@ class AppState extends ChangeNotifier {
     _pollers.add(_DriverPoller(config: config, driver: driver));
   }
 
+  /// Test seam: attach a driver directly (bypasses radio persistence
+  /// and polling) so monitor-section getters can be tested.
+  @visibleForTesting
+  void attachDriverForTest(RadioDriver driver) {
+    _addPoller(
+      RadioConfig(
+        driverId: driver.driverId,
+        address: 'test',
+        label: 'TEST',
+        pollInterval: 1.0,
+      ),
+      driver,
+    );
+  }
+
   /// The session recorder. Toggle from Settings; records raw samples.
   final RecordingService recorder = RecordingService();
 
@@ -3197,6 +3212,35 @@ class AppState extends ChangeNotifier {
             (a.rcsMismatch ? ' — RCS MISMATCH FLAGGED' : ''));
       }
     }
+    return lines;
+  }
+
+  /// EXPERIMENTAL PMR monitor lines for the evidence sheet's monitor
+  /// section (readings log + alert lines). Alerts first, then recent
+  /// readings, capped so the section stays readable. This getter is
+  /// the ONLY place PMR surfaces in the app: PMR is deliberately NOT
+  /// wired into the confidence merger, the tripwire, tracks, or any
+  /// veto. A low PMR is consistent with preamble interference, never
+  /// a confirmed jamming verdict — the display wording in
+  /// [PmrReading.displayLabel] enforces that.
+  List<String> get pmrMonitorLines {
+    final now = DateTime.now();
+    final alerts = <String>[];
+    final readings = <String>[];
+    for (final p in _pollers) {
+      final d = p.driver;
+      if (d is! SdrDriver) continue;
+      for (final r in d.recentPmrReadings) {
+        if (now.difference(r.t) > SdrDriver.pmrWindow) continue;
+        if (r.alert) {
+          alerts.add(r.displayLabel);
+        } else {
+          readings.add(r.displayLabel);
+        }
+      }
+    }
+    final lines = <String>[...alerts, ...readings];
+    if (lines.length > 12) return lines.sublist(0, 12);
     return lines;
   }
 
