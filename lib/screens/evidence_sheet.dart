@@ -95,6 +95,15 @@ class EvidenceSheet extends StatelessWidget {
               'Doppler-line detections are estimates — R&D logging, not '
               'identification.',
             ),
+            _evidenceSection(
+              state,
+              'PMR MONITOR (EXPERIMENTAL)',
+              state.pmrMonitorLines,
+              'Experimental preamble-jamming monitor: PMR readings only, '
+              'never a confirmed jamming verdict. Report-only unless a '
+              'threshold is set; a low PMR is consistent with preamble '
+              'interference, not proof of jamming.',
+            ),
             _bearingRow(window),
             const SizedBox(height: 12),
             Text('DEVIATION HISTORY (60s window)', style: SentryType.section()),
