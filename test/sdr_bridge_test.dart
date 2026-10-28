@@ -1,5 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:shepherd/services/radio_driver.dart';
+import 'package:shepherd/state/app_state.dart';
 
 Map<String, dynamic> bandPacket({
   double energy = -52.3,
@@ -336,6 +338,144 @@ void _elrsTests() {
             now.subtract(const Duration(minutes: 10))),
       ];
       expect(GeminiCorrelator.correlate(chirps, now), isEmpty);
+    });
+  });
+
+  group('PmrReading.tryParse (EXPERIMENTAL monitor)', () {
+    Map<String, dynamic> pmrPacket({
+      double pmr = 16.0,
+      double? threshold,
+      double? margin,
+      bool alert = false,
+      bool experimental = true,
+      String kind = 'pmr',
+      int v = 1,
+    }) =>
+        {
+          'v': v,
+          'kind': kind,
+          'radio': 'rtlsdr0',
+          'channel_mhz': 915.0,
+          'experimental': experimental,
+          'pmr_db': pmr,
+          'n_chirps': 11,
+          'tone_off_hz': 37109.4,
+          'threshold_db': threshold,
+          'margin_db': margin,
+          'alert': alert,
+          't': 1729123456.789,
+        };
+
+    test('parses a report-only reading (no threshold, never alerts)', () {
+      final r = PmrReading.tryParse(pmrPacket());
+      expect(r, isNotNull);
+      expect(r!.radio, 'rtlsdr0');
+      expect(r.channelMhz, 915.0);
+      expect(r.pmrDb, 16.0);
+      expect(r.nChirps, 11);
+      expect(r.thresholdDb, isNull);
+      expect(r.marginDb, isNull);
+      expect(r.alert, isFalse);
+      expect(r.displayLabel, contains('EXPERIMENTAL'));
+      expect(r.displayLabel, contains('report-only'));
+    });
+
+    test('parses an alerting reading with threshold and margin', () {
+      // Margin is RECOMPUTED from pmr and threshold (wire value
+      // ignored); 8.1 - 12.0 differs from the literal -3.9 by 1 ULP,
+      // hence closeTo.
+      final r = PmrReading.tryParse(
+          pmrPacket(pmr: 8.1, threshold: 12.0, margin: -3.9, alert: true))!;
+      expect(r.alert, isTrue);
+      expect(r.thresholdDb, 12.0);
+      expect(r.marginDb, closeTo(-3.9, 1e-9));
+      expect(r.displayLabel, contains('ALERT'));
+      expect(r.displayLabel, contains('consistent with'));
+      expect(r.displayLabel, contains('NOT a confirmed jamming verdict'));
+    });
+
+    test('recomputes alert/margin, ignoring contradictory wire values', () {
+      // Wire claims alert=true, but pmr is ABOVE threshold: the
+      // display must be self-consistent (no alert, positive margin).
+      final r = PmrReading.tryParse(
+          pmrPacket(pmr: 16.0, threshold: 12.0, margin: -3.9, alert: true))!;
+      expect(r.alert, isFalse);
+      expect(r.marginDb, closeTo(4.0, 1e-9));
+      expect(r.displayLabel, contains('above threshold'));
+      // And the reverse: wire claims no alert, but pmr is BELOW.
+      final r2 = PmrReading.tryParse(
+          pmrPacket(pmr: 8.1, threshold: 12.0, margin: 3.9, alert: false))!;
+      expect(r2.alert, isTrue);
+      expect(r2.marginDb, closeTo(-3.9, 1e-9));
+      expect(r2.displayLabel, contains('ALERT'));
+    });
+
+    test('rejects pmr packets without the experimental flag', () {
+      expect(PmrReading.tryParse(pmrPacket(experimental: false)), isNull);
+      final noFlag = pmrPacket()..remove('experimental');
+      expect(PmrReading.tryParse(noFlag), isNull);
+    });
+
+    test('rejects wrong kinds, versions, NaN; never throws', () {
+      expect(PmrReading.tryParse(pmrPacket(kind: 'band')), isNull);
+      expect(PmrReading.tryParse(pmrPacket(v: 2)), isNull);
+      expect(PmrReading.tryParse(pmrPacket(pmr: double.nan)), isNull);
+      expect(PmrReading.tryParse({}), isNull);
+      expect(PmrReading.tryParse({'v': 1, 'kind': 'pmr'}), isNull);
+    });
+
+    test('driver stores pmr readings and surfaces the latest alert', () {
+      final d = SdrDriver(host: '127.0.0.1', port: 49161);
+      expect(d.recentPmrReadings, isEmpty);
+      expect(d.latestPmrAlert, isNull);
+      // Current timestamps: _handle prunes readings older than the
+      // 120 s window on arrival, so fixed 2024-era stamps would vanish.
+      final nowSec =
+          DateTime.now().millisecondsSinceEpoch / 1000.0;
+      d.datagramForTest(
+          '{"v":1,"kind":"pmr","radio":"rtlsdr0","channel_mhz":915.0,'
+          '"experimental":true,"pmr_db":16.0,"n_chirps":11,'
+          '"tone_off_hz":1000.0,"threshold_db":null,"margin_db":null,'
+          '"alert":false,"t":$nowSec}');
+      d.datagramForTest(
+          '{"v":1,"kind":"pmr","radio":"rtlsdr0","channel_mhz":915.0,'
+          '"experimental":true,"pmr_db":8.1,"n_chirps":10,'
+          '"tone_off_hz":1000.0,"threshold_db":12.0,"margin_db":-3.9,'
+          '"alert":true,"t":${nowSec + 1}}');
+      expect(d.recentPmrReadings, hasLength(2));
+      expect(d.latestPmrAlert, isNotNull);
+      expect(d.latestPmrAlert!.pmrDb, 8.1);
+      // A pmr datagram never becomes a tripwire link sample.
+      expect(d.latestBands, isEmpty);
+    });
+  });
+
+  group('AppState.pmrMonitorLines (EXPERIMENTAL monitor)', () {
+    test('alerts first, then readings, capped at 12', () {
+      SharedPreferences.setMockInitialValues({});
+      final state = AppState();
+      final d = SdrDriver(host: '127.0.0.1', port: 49161);
+      state.attachDriverForTest(d);
+      final nowSec = DateTime.now().millisecondsSinceEpoch / 1000.0;
+      String pkt(double pmr, double? thr, double t) =>
+          '{"v":1,"kind":"pmr","radio":"rtlsdr0","channel_mhz":915.0,'
+          '"experimental":true,"pmr_db":$pmr,"n_chirps":11,'
+          '"tone_off_hz":1000.0,"threshold_db":${thr ?? 'null'},'
+          '"margin_db":null,"alert":false,"t":$t}';
+      // 12 report-only readings first, then 2 alerts: the lines must
+      // still lead with the alerts and cap at 12 total.
+      for (var i = 0; i < 12; i++) {
+        d.datagramForTest(pkt(16.0, null, nowSec + i));
+      }
+      d.datagramForTest(pkt(8.1, 12.0, nowSec + 20));
+      d.datagramForTest(pkt(7.5, 12.0, nowSec + 21));
+      final lines = state.pmrMonitorLines;
+      expect(lines, hasLength(12));
+      expect(lines[0], contains('ALERT'));
+      expect(lines[1], contains('ALERT'));
+      for (final l in lines.sublist(2)) {
+        expect(l, contains('report-only'));
+      }
     });
   });
 }
