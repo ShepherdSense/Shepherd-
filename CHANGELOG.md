@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.27.0 — 2026-10-28 — PMR preamble-jamming monitor (EXPERIMENTAL)
+
+Live-data gateway jamming monitor for the LoRa backhaul, from Herrera-Loera et al., Sensors 2026, 26(19), 6123 (a simulation-only paper — its numbers are NOT thresholds here). The SDR bridge stares at the backhaul channel (SF7/125 kHz) and computes a dechirp-domain peak-to-mean ratio (PMR) per preamble: dechirp each preamble symbol against an ideal reference, DFT, dominant-bin magnitude / mean spectral magnitude, averaged over the preamble upchirps. PMR is a separate decision alongside the RSS-anomaly + gap/sync-failure alerts — never fused, never a tripwire input, never vetoing. Report-only until live traffic sets a real threshold (no sim-derived threshold baked in); pass `--pmr-threshold` to enable alerting. See `docs/pmr_monitor_spec.md` for the statistic, limits, and live-test procedure. RX-only throughout; gateway .ino and node firmware untouched. Verified in this workspace: `flutter analyze` clean, full suite 583/583; bridge suites 103/103.
+
 ## v0.26.1 — 2026-10-25 — review-fix pass (from a PC-side static review of v0.26.0)
 
 Small, behavior-preserving fix set; no features, no gateway/CoT/ZMeta changes, no detection-path changes. Verified in this workspace: `flutter analyze` clean, full suite 576/576 (573 v0.26.0 baseline + 3 new v0.26.1 tests).
