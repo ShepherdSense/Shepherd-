@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../models/link_sample.dart';
+import '../services/build_age.dart';
 import '../services/health.dart';
 import '../services/phone_tier.dart';
 import '../services/radio_driver.dart';
@@ -46,6 +47,13 @@ class DashboardScreen extends StatelessWidget {
           padding: const EdgeInsets.all(12),
           children: [
             _alertPanel(disturbed),
+            // v0.27.1: soft build-age banner — visible ONLY once the
+            // build is 90+ days old. A nudge to update, never a
+            // lockout: sensing and alerts run exactly as before.
+            if (buildAgeWarning(now: DateTime.now()) != null) ...[
+              const SizedBox(height: 12),
+              _buildAgeBanner(),
+            ],
             // v0.26.0: phone-tier banner — visible ONLY when the tier
             // is actually active (switch on + no mesh/SDR hardware
             // attached). Mesh users never see it. Labels verbatim
@@ -233,6 +241,31 @@ class DashboardScreen extends StatelessWidget {
                 label: Text(state.alertsEnabled ? 'ALERTS ON' : 'MUTED'),
               ),
             ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// v0.27.1 soft build-age banner. Amber, plain text, no button and
+  /// no dismiss — it stays until the build is updated, which is the
+  /// point. It never touches detection, health, or the alert panel.
+  Widget _buildAgeBanner() {
+    final warning = buildAgeWarning(now: DateTime.now())!;
+    return SentryPanel(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'BUILD AGE',
+            style: SentryType.section().copyWith(
+              color: SentryColors.amber,
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            warning,
+            style: SentryType.section(10).copyWith(height: 1.6),
           ),
         ],
       ),
