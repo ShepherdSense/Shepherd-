@@ -32,7 +32,7 @@ mover, localized two independent ways. The integration has three parts:
   built**: GeoChat hit alerts + SA beacons, two-key operator gate, UDP
   multicast / unicast / TCP / TLS to TAK endpoints. Kujhad fleet protocol for
   node coordination; RNS/Reticulum transport with ATAK forwarder.
-- **Shepherd** (MIT): device-free RF sensing — tracks objects moving through
+- **Shepherd** (GPLv3): device-free RF sensing — tracks objects moving through
   the mesh's RF field via link disturbances. Sees RF-silent targets (fiber-optic
   FPV, RF-quiet terminal phase) that Predator's stack cannot see. CoT emit is
   spec'd (`docs/shepherd_cot_output_spec.md`) but unbuilt; CoT ingest is new.
@@ -43,10 +43,9 @@ credentials, no polling, no version coupling, works phone-to-phone on one
 device or across a LAN, and is symmetric with the emit path both sides already
 speak. The API stays a future option; CoT is the contract.
 
-**License boundary (load-bearing):** Predator is GPL-3.0; Shepherd is MIT. The
-two programs communicate over the CoT wire protocol only — separate processes,
-no shared code, no linking. The GPL stays on Predator's side of the wire.
-Nothing in this spec combines the codebases.
+**License:** Both sides are now GPL-3.0 — Predator is GPL-3.0 and Shepherd is GPLv3. The
+two programs still communicate over the CoT wire protocol only — separate processes,
+no shared code, no linking. Nothing in this spec combines the codebases.
 
 ## Contract (bilateral — both sides build to this)
 
@@ -155,7 +154,7 @@ table — the old spec's `SHEPHERD <trackId>` with a space is superseded).
   of Shepherd, not a gap. The merger must not penalize tracks without it.
 - Affiliation stays unknown on our side, always. No hostile/friendly
   assertions, no weapon-cueing language, no fire-control-quality claims.
-- License boundary: no shared code, no linking, wire protocol only.
+- No shared code, no linking, wire protocol only — the separation is architectural, not a license boundary.
 
 ## Test plan
 1. **XML golden tests** (emit): known track → byte-exact CoT event (modulo
@@ -177,7 +176,7 @@ table — the old spec's `SHEPHERD <trackId>` with a space is superseded).
    Shepherd's map and ATAK side by side.
 
 ## Out of scope
-- Merging the codebases (GPL boundary — never).
+- Merging the codebases — never.
 - An ATAK plugin for feed switching (native filters cover it; revisit only if
   operators report the filters insufficient).
 - Predator REST API ingestion (future option; CoT is the contract).
