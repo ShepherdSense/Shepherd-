@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-11-05 — License change to GPLv3
+
+Shepherd is now licensed under GPLv3 (see LICENSE), replacing MIT from this version onward. Versions already released under MIT remain MIT — the change applies to future versions only. Copyright (c) 2026 Draco. No code changes in this entry.
+
 ## v0.27.0 — 2026-10-28 — PMR preamble-jamming monitor (EXPERIMENTAL)
 
 Live-data gateway jamming monitor for the LoRa backhaul, from Herrera-Loera et al., Sensors 2026, 26(19), 6123 (a simulation-only paper — its numbers are NOT thresholds here). The SDR bridge stares at the backhaul channel (SF7/125 kHz) and computes a dechirp-domain peak-to-mean ratio (PMR) per preamble: dechirp each preamble symbol against an ideal reference, DFT, dominant-bin magnitude / mean spectral magnitude, averaged over the preamble upchirps. PMR is a separate decision alongside the RSS-anomaly + gap/sync-failure alerts — never fused, never a tripwire input, never vetoing. Report-only until live traffic sets a real threshold (no sim-derived threshold baked in); pass `--pmr-threshold` to enable alerting. See `docs/pmr_monitor_spec.md` for the statistic, limits, and live-test procedure. RX-only throughout; gateway .ino and node firmware untouched. Verified in this workspace: `flutter analyze` clean, full suite 583/583; bridge suites 103/103.
