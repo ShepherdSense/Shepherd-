@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.27.1 — 2026-11-05 — Soft build-age warning
+
+- **Soft build-age warning** — once a build is 90+ days old, the dashboard shows an amber BUILD AGE banner ("THIS BUILD IS N DAYS OLD — PLEASE UPDATE TO THE LATEST SHEPHERD"). A nudge only: sensing, detection, and alerts are unaffected, nothing ever locks or shuts down. Build date lives in `lib/services/build_age.dart` and must be updated at every version bump. No network check; the device clock is the only input.
+- **License: GPLv3** — see the 2026-11-05 entry below; this version ships under GPLv3.
+
+Verified in this workspace: `flutter analyze` clean, full suite 589/589 (583 v0.27.0 baseline + 6 new build-age tests).
+
 ## 2026-11-05 — License change to GPLv3
 
 Shepherd is now licensed under GPLv3 (see LICENSE), replacing MIT from this version onward. Versions already released under MIT remain MIT — the change applies to future versions only. Copyright (c) 2026 Draco. No code changes in this entry.
