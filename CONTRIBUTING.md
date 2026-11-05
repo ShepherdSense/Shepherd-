@@ -1,6 +1,6 @@
 # Contributing to Shepherd
 
-Thanks for wanting to help. Shepherd is MIT-licensed — fork the repo,
+Thanks for wanting to help. Shepherd is GPLv3-licensed — fork the repo,
 branch, and open a pull request. Small, focused PRs merge fastest.
 
 ## What we're looking for
@@ -31,5 +31,5 @@ transmits to disrupt.
 - Keep the dark-mode, minimal UI language; advanced settings go behind
   the gear.
 
-By contributing, you agree your work is licensed under the repo's MIT
+By contributing, you agree your work is licensed under the repo's GPLv3
 license.
