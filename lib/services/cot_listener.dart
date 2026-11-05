@@ -15,8 +15,8 @@
 ///  - never subtractive: coincidences carry boost >= 0 only;
 ///  - stale emitters (older than windowSeconds) contribute nothing.
 ///
-/// License boundary (load-bearing): Predator is GPL-3.0, Shepherd is
-/// MIT. This file speaks the CoT wire protocol only — no Predator
+/// License: Both sides are now GPL-3.0 — Predator is GPL-3.0 and Shepherd is
+/// GPLv3. This file speaks the CoT wire protocol only — no Predator
 /// code, no shared code, no linking.
 library;
 
